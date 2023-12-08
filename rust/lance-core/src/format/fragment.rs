@@ -227,6 +227,7 @@ impl From<&Fragment> for pb::DataFragment {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RowAddress(u64);
 
 impl RowAddress {
@@ -278,6 +279,8 @@ impl std::fmt::Display for RowAddress {
         write!(f, "({}, {})", self.fragment_id(), self.row_id())
     }
 }
+
+// type RowAddressMap<V> = HashMap<u64, V, ahash::RandomState>;
 
 #[cfg(test)]
 mod tests {
