@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
+use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::logical_expr::{AggregateFunction, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -535,6 +536,16 @@ impl Scanner {
     pub(crate) async fn try_into_dfstream(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         execute_plan(plan)
+    }
+
+    /// Load into a RecordBatch.
+    pub async fn try_collect_batch(&self) -> Result<RecordBatch> {
+        let mut stream = self.try_into_stream().await?;
+        let mut batches = vec![];
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        Ok(concat_batches(&self.schema()?, &batches)?)
     }
 
     /// Scan and return the number of matching rows

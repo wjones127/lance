@@ -536,20 +536,20 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow_array::types::{Float64Type, Int32Type};
     use arrow_array::RecordBatchIterator;
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::io::exec::testing::TestingExec;
 
-    #[tokio::test]
-    async fn knn_flat_search() {
+    fn make_test_data() -> Vec<RecordBatch> {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("key", DataType::Int32, false),
             ArrowField::new(
@@ -563,7 +563,7 @@ mod tests {
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
 
-        let batches: Vec<RecordBatch> = (0..20)
+        (0..20)
             .map(|i| {
                 RecordBatch::try_new(
                     schema.clone(),
@@ -583,8 +583,10 @@ mod tests {
                 )
                 .unwrap()
             })
-            .collect();
+            .collect()
+    }
 
+    async fn write_test_data(batches: Vec<RecordBatch>) -> (Dataset, TempDir) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -593,15 +595,23 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
+        let schema = batches[0].schema();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        (dataset, test_dir)
+    }
+
+    #[tokio::test]
+    async fn knn_flat_search() {
+        let batches = make_test_data();
+
         let vector_arr = batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(reader, test_uri, Some(write_params))
-            .await
-            .unwrap();
+        let (dataset, _test_dir) = write_test_data(batches).await;
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
             .nearest("vector", as_primitive_array(&q), 10)
@@ -680,5 +690,41 @@ mod tests {
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn test_knn_flat_filter_distance() {
+        let batches = make_test_data();
+
+        let vector_arr = batches[0].column_by_name("vector").unwrap();
+        let q = as_fixed_size_list_array(&vector_arr).value(5);
+
+        let (dataset, _test_dir) = write_test_data(batches).await;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", as_primitive_array(&q), 10)
+            .unwrap();
+        let all_results = scanner.try_collect_batch().await.unwrap();
+        let near_results = scanner
+            .filter("_distance < 0.1")
+            .unwrap()
+            .try_collect_batch()
+            .await
+            .unwrap();
+
+        assert!(all_results.num_rows() > near_results.num_rows());
+        assert!(
+            as_primitive_array::<Float64Type>(near_results[DIST_COL].as_ref())
+                .values()
+                .iter()
+                .all(|d| d < &0.1)
+        );
+
+        let all_keys = as_primitive_array::<Int32Type>(all_results["key"].as_ref()).values();
+        let near_keys = as_primitive_array::<Int32Type>(near_results["key"].as_ref()).values();
+        for (near_key, all_key) in near_keys.iter().zip(all_keys) {
+            assert_eq!(near_key, all_key);
+        }
     }
 }
