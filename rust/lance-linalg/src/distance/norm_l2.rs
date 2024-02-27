@@ -176,6 +176,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use num_traits::FromPrimitive;
+    use crate::test_utils::artibrary_f16_vector;
 
     use super::*;
 
@@ -214,5 +215,18 @@ mod tests {
         do_norm_l2_test::<f16>();
         do_norm_l2_test::<f32>();
         do_norm_l2_test::<f64>();
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_l2_norm_f32_vs_f16(ref f16_data in artibrary_f16_vector(4..4048)){
+            // Any finite f16 vector can have a finite f32 l2 norm.
+            let f32_data = f16_data.iter().cloned().map(|val| val.to_f32()).collect::<Vec<f32>>();
+
+            let f32_result = f32_data.as_slice().norm_l2();
+            let f16_result = f16_data.as_slice().norm_l2();
+
+            assert_relative_eq!(f32_result, f16_result as f32, max_relative = 1e-6);
+        }
     }
 }

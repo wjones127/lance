@@ -34,7 +34,7 @@ use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, FromPrimitive};
 
-use super::dot::dot;
+use super::{dot::dot, Normalize};
 use super::norm_l2::norm_l2;
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -46,6 +46,7 @@ use crate::{Error, Result};
 pub trait Cosine: super::dot::Dot
 where
     Self::Native: AsPrimitive<f64> + AsPrimitive<f32>,
+    for<'a> &'a [Self::Native]: Normalize<Self::Native>,
     <Self::Native as FloatToArrayType>::ArrowType: Cosine + super::dot::Dot,
 {
     /// Cosine distance between two vectors.
@@ -54,7 +55,7 @@ where
     where
         <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
     {
-        let x_norm = norm_l2(x);
+        let x_norm = x.norm_l2();
         Self::cosine_fast(x, x_norm, other)
     }
 
@@ -363,6 +364,8 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use crate::test_utils::arbitrary_f16_vectors;
+    use crate::distance::Normalize;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -406,5 +409,24 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 2).collect::<Vec<_>>();
         assert_relative_eq!(d[0], 0.0);
         assert_relative_eq!(d[0], 0.0);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_cosine_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
+            assert_eq!(f16_x.len(), f16_y.len());
+
+            // Cosine is only valid for non-zero vectors.
+            proptest::prop_assume!(f16_x.as_slice().norm_l2() > 1e-6);
+            proptest::prop_assume!(f16_y.as_slice().norm_l2() > 1e-6);
+
+            let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();            
+
+            let f32_result = Float32Type::cosine(&f32_x, &f32_y);
+            let f16_result = Float16Type::cosine(&f16_x, &f16_y);
+
+            assert_relative_eq!(f32_result, f16_result, max_relative = 1e-6);
+        }
     }
 }

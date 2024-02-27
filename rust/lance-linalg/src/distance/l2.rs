@@ -80,23 +80,23 @@ pub fn l2_scalar<T: Float + Sum + AddAssign + AsPrimitive<f32>, const LANES: usi
             .iter()
             .zip(y_chunks.remainder())
             .map(|(&x, &y)| {
-                let diff = x - y;
+                let diff = x.as_() - y.as_();
                 diff * diff
             })
             .sum()
     } else {
-        T::zero()
+        0_f32
     };
 
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [0_f32; LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            let diff = x[i] - y[i];
+            let diff = x[i].as_() - y[i].as_();
             sums[i] += diff * diff;
         }
     }
 
-    (s + sums.iter().copied().sum()).as_()
+    s + sums.into_iter().sum::<f32>()
 }
 
 impl L2 for BFloat16Type {
@@ -287,6 +287,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use crate::test_utils::arbitrary_f16_vectors;
 
     #[test]
     fn test_euclidean_distance() {
@@ -383,5 +384,21 @@ mod tests {
 
         let d = l2_distance_batch(q.values(), values.values(), 32).collect::<Vec<_>>();
         assert_relative_eq!(0.319_357_84, d[0]);
+    }
+
+
+    proptest::proptest! {
+        #[test]
+        fn test_l2_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
+            assert_eq!(f16_x.len(), f16_y.len());
+
+            let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();            
+
+            let f32_result = Float32Type::l2(&f32_x, &f32_y);
+            let f16_result = Float16Type::l2(&f16_x, &f16_y);
+
+            assert_relative_eq!(f32_result, f16_result as f32, max_relative = 1e-6);
+        }
     }
 }
