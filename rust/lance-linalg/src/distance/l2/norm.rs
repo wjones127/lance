@@ -14,7 +14,7 @@
 
 use std::iter::Sum;
 
-use half::f16;
+use half::{bf16, f16};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 #[allow(unused_imports)]
@@ -39,17 +39,26 @@ pub trait L2Norm: L2 {
 pub fn norm_l2_impl<T: Float + Sum + AsPrimitive<f32>, const LANES: usize>(vector: &[T]) -> f32 {
     let chunks = vector.chunks_exact(LANES);
     let sum = if chunks.remainder().is_empty() {
-        T::zero()
+        0.0_f32
     } else {
-        chunks.remainder().iter().map(|&v| v.powi(2)).sum::<T>()
+        chunks
+            .remainder()
+            .iter()
+            .map(|&v| v.as_().powi(2))
+            .sum::<f32>()
     };
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [0.0_f32; LANES];
     for chunk in chunks {
         for i in 0..LANES {
-            sums[i] = sums[i].add(chunk[i].powi(2));
+            sums[i] += chunk[i].as_().powi(2);
         }
     }
-    (sum + sums.iter().copied().sum::<T>()).sqrt().as_()
+    (sum + sums.iter().copied().sum::<f32>()).sqrt()
+}
+
+#[inline]
+pub fn norm_l2_bf16(vector: &[bf16]) -> f32 {
+    norm_l2_impl::<bf16, 16>(vector)
 }
 
 #[cfg(feature = "fp16kernels")]
@@ -143,4 +152,22 @@ pub fn norm_l2_f32(vector: &[f32]) -> f32 {
         // Fallback to scalar
         norm_l2_impl::<f32, 16>(vector)
     }
+}
+
+#[inline]
+pub fn norm_l2_f64(vector: &[f64]) -> f32 {
+    const LANES: usize = 8;
+    let chunks = vector.chunks_exact(LANES);
+    let sum = if chunks.remainder().is_empty() {
+        0.0_f64
+    } else {
+        chunks.remainder().iter().map(|&v| v.powi(2)).sum::<f64>()
+    };
+    let mut sums = [0.0_f64; LANES];
+    for chunk in chunks {
+        for i in 0..LANES {
+            sums[i] += chunk[i].powi(2);
+        }
+    }
+    (sum + sums.iter().copied().sum::<f64>()).sqrt() as f32
 }

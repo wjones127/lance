@@ -28,13 +28,11 @@ pub mod cosine;
 pub mod dot;
 pub mod hamming;
 pub mod l2;
-// pub mod norm_l2;
 
 pub use cosine::*;
 pub use dot::*;
 pub use l2::*;
 use lance_arrow::FloatToArrayType;
-// pub use norm_l2::*;
 
 use crate::Result;
 

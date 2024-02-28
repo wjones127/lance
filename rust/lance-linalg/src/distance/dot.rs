@@ -29,7 +29,7 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::real::Real;
-use num_traits::AsPrimitive;
+use num_traits::{AsPrimitive, Float, NumCast};
 
 use crate::simd::{
     f32::{f32x16, f32x8},
@@ -75,7 +75,8 @@ pub fn dot<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T]) -> f32
 where
     T::ArrowType: Dot,
 {
-    T::ArrowType::dot(from, to)
+    let val = T::ArrowType::dot(from, to);
+    NumCast::from(val).unwrap()
 }
 
 /// Negative dot distance.
@@ -84,18 +85,24 @@ pub fn dot_distance<T: FloatToArrayType + Neg<Output = T>>(from: &[T], to: &[T])
 where
     T::ArrowType: Dot,
 {
-    T::ArrowType::dot(from, to).neg()
+    let val = T::ArrowType::dot(from, to).neg();
+    NumCast::from(val).unwrap()
 }
 
 /// Dot product
 pub trait Dot: ArrowFloatType {
+    /// Dot product output type. Usually this is f32, but it can be f64 for f64 inputs.
+    type Output: Float;
+
     /// Dot product.
-    fn dot(x: &[Self::Native], y: &[Self::Native]) -> f32;
+    fn dot(x: &[Self::Native], y: &[Self::Native]) -> Self::Output;
 }
 
 impl Dot for BFloat16Type {
+    type Output = f32;
+
     #[inline]
-    fn dot(x: &[bf16], y: &[bf16]) -> f32 {
+    fn dot(x: &[bf16], y: &[bf16]) -> Self::Output {
         dot_scalar::<bf16, 32>(x, y)
     }
 }
@@ -117,6 +124,8 @@ mod kernel {
 }
 
 impl Dot for Float16Type {
+    type Output = f32;
+
     #[inline]
     fn dot(x: &[f16], y: &[f16]) -> f32 {
         match *FP16_SIMD_SUPPORT {
@@ -142,6 +151,8 @@ impl Dot for Float16Type {
 }
 
 impl Dot for Float32Type {
+    type Output = f32;
+
     #[inline]
     fn dot(x: &[f32], y: &[f32]) -> f32 {
         // Manually unrolled 8 times to get enough registers.
@@ -198,9 +209,31 @@ impl Dot for Float32Type {
 }
 
 impl Dot for Float64Type {
+    type Output = f64;
+
     #[inline]
-    fn dot(x: &[f64], y: &[f64]) -> f32 {
-        dot_scalar::<f64, 8>(x, y)
+    fn dot(x: &[f64], y: &[f64]) -> f64 {
+        const LANES: usize = 8;
+        let x_chunks = x.chunks_exact(LANES);
+        let y_chunks = y.chunks_exact(LANES);
+        let sum = if x_chunks.remainder().is_empty() {
+            0.0_f64
+        } else {
+            x_chunks
+                .remainder()
+                .iter()
+                .zip(y_chunks.remainder().iter())
+                .map(|(&x, &y)| x * y)
+                .sum::<f64>()
+        };
+        // Use known size to allow LLVM to kick in auto-vectorization.
+        let mut sums = [0.0_f64; LANES];
+        for (x, y) in x_chunks.zip(y_chunks) {
+            for i in 0..LANES {
+                sums[i] += x[i] * y[i];
+            }
+        }
+        sum + sums.iter().copied().sum::<f64>()
     }
 }
 
@@ -281,7 +314,9 @@ pub fn dot_distance_arrow_batch(
 mod tests {
 
     use super::*;
-    use crate::test_utils::arbitrary_f16_vectors;
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
     use approx::assert_relative_eq;
     use num_traits::FromPrimitive;
 
@@ -303,30 +338,60 @@ mod tests {
 
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
-        assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
+        assert_eq!(Float64Type::dot(&x, &y) as f32, dot(&x, &y));
+    }
+
+    /// Reference implementation of dot product.
+    fn dot_scalar_ref(x: &[f64], y: &[f64]) -> f32 {
+        x.iter().zip(y.iter()).map(|(&x, &y)| x * y).sum::<f64>() as f32
+    }
+
+    // Accuracy of dot product depends on the size of the components
+    // of the vector.
+    fn max_error(x: &[f64], y: &[f64]) -> f32 {
+        let dot = x
+            .iter()
+            .cloned()
+            .zip(y.iter().cloned())
+            .map(|(x, y)| x.abs() * y.abs())
+            .sum::<f64>();
+        (1e-6_f64 * dot) as f32
+    }
+
+    fn do_dot_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    where
+        T::ArrowType: Dot,
+    {
+        let f64_x = x.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+        let f64_y = y.iter().map(|&v| v.as_()).collect::<Vec<f64>>();
+
+        let expected = dot_scalar_ref(&f64_x, &f64_y);
+        let result = dot(x, y);
+
+        let max_error = max_error(&f64_x, &f64_y);
+
+        assert_relative_eq!(expected, result, epsilon = max_error);
     }
 
     proptest::proptest! {
         #[test]
-        fn test_dot_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
-            assert_eq!(f16_x.len(), f16_y.len());
+        fn test_dot_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            do_dot_test(&x, &y);
+        }
 
-            // Accuracy of dot product depends on the size of the components
-            // of the vector.
-            fn max_error(x: &[f16], y: &[f16]) -> f32 {
-                let x_abs = x.iter().cloned().map(f16::abs).collect::<Vec<f16>>();
-                let y_abs = y.iter().cloned().map(f16::abs).collect::<Vec<f16>>();
-                let dot = x_abs.into_iter().zip(y_abs.into_iter()).map(|(x, y)| x.to_f32() * y.to_f32()).sum::<f32>();
-                1e-6_f32 * dot
-            }
+        #[test]
+        fn test_dot_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            do_dot_test(&x, &y);
+        }
 
-            let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
-            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+        #[test]
+        fn test_dot_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            do_dot_test(&x, &y);
+        }
 
-            let f32_result = Float32Type::dot(&f32_x, &f32_y);
-            let f16_result = Float16Type::dot(&f16_x, &f16_y);
-
-            assert_relative_eq!(f32_result, f16_result, epsilon = max_error(&f16_x, &f16_y));
+        #[test]
+        fn test_dot_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            do_dot_test(&x, &y);
         }
     }
 }

@@ -32,7 +32,7 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatToArrayType};
 #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
-use num_traits::{AsPrimitive, FromPrimitive};
+use num_traits::{AsPrimitive, FromPrimitive, NumCast};
 
 use super::{dot::dot, norm_l2, Dot, L2};
 use crate::simd::{
@@ -236,10 +236,13 @@ fn cosine_scalar<T: AsPrimitive<f64> + FromPrimitive + FloatToArrayType>(
 where
     <T as FloatToArrayType>::ArrowType: super::dot::Dot,
 {
-    let y_sq = dot(y, y);
-    let xy = dot(x, y);
+    // Convert to f64 for overflow protection. If T is f64, then this is a no-op.
+    // TODO: is it faster to use the L2Norm kernels for y_sq?
+    let y_sq: f64 = NumCast::from(T::ArrowType::dot(y, y)).unwrap();
+    let xy: f64 = NumCast::from(T::ArrowType::dot(x, y)).unwrap();
+    let x_norm = x_norm as f64;
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    1.0 - xy / (x_norm * y_sq.sqrt())
+    (1.0 - xy / x_norm / y_sq.sqrt()) as f32
 }
 
 #[inline]
@@ -252,10 +255,12 @@ pub(crate) fn cosine_scalar_fast<T: FloatToArrayType>(
 where
     T::ArrowType: Cosine,
 {
-    let xy = dot(x, y);
+    // Convert to f64 for overflow protection. If T is f64, then this is a no-op.
+    let xy: f64 = NumCast::from(T::ArrowType::dot(x, y)).unwrap();
+    let x_norm = x_norm as f64;
+    let y_norm = y_norm as f64;
     // 1 - xy / (sqrt(x_sq) * sqrt(y_sq))
-    // use f64 for overflow protection.
-    1.0 - (xy / (x_norm * y_norm))
+    (1.0 - (xy / (x_norm * y_norm))) as f32
 }
 
 /// Cosine distance function between two vectors.
@@ -347,9 +352,12 @@ pub fn cosine_distance_arrow_batch(
 mod tests {
     use super::*;
 
-    use crate::test_utils::arbitrary_f16_vectors;
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+    };
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
+    use proptest::prop_assume;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -395,22 +403,59 @@ mod tests {
         assert_relative_eq!(d[0], 0.0);
     }
 
+    /// Reference implementation of cosine distance.
+    fn cosine_ref(x: &[f64], y: &[f64]) -> f64 {
+        let xy = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| xi * yi)
+            .sum::<f64>();
+        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f64>().sqrt() as f32 as f64;
+        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f64>().sqrt();
+        1.0 - xy / x_sq / y_sq
+    }
+
+    fn do_cosine_test<T: FloatToArrayType>(x: &[T], y: &[T])
+    where
+        T::ArrowType: Cosine,
+    {
+        let x_f64 = x.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+        let y_f64 = y.iter().map(|&v| v.as_()).collect::<Vec<_>>();
+
+        let expected = cosine_ref(&x_f64, &y_f64);
+        let result = T::ArrowType::cosine(x, y) as f64;
+
+        assert_relative_eq!(result, expected, max_relative = 1e-5);
+    }
+
     proptest::proptest! {
         #[test]
-        fn test_cosine_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
-            assert_eq!(f16_x.len(), f16_y.len());
+        fn test_cosine_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
+            // Cosine requires non-zero vectors
+            prop_assume!(norm_l2(&x) > 1e-6);
+            prop_assume!(norm_l2(&y) > 1e-6);
+            do_cosine_test(&x, &y);
+        }
 
-            // Cosine is only valid for non-zero vectors.
-            proptest::prop_assume!(norm_l2(f16_x.as_slice()) > 1e-6);
-            proptest::prop_assume!(norm_l2(f16_y.as_slice()) > 1e-6);
+        #[test]
+        fn test_cosine_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-6);
+            prop_assume!(norm_l2(&y) > 1e-6);
+            do_cosine_test(&x, &y);
+        }
 
-            let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
-            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+        #[test]
+        fn test_cosine_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-10);
+            prop_assume!(norm_l2(&y) > 1e-10);
+            do_cosine_test(&x, &y);
+        }
 
-            let f32_result = Float32Type::cosine(&f32_x, &f32_y);
-            let f16_result = Float16Type::cosine(&f16_x, &f16_y);
-
-            assert_relative_eq!(f32_result, f16_result, max_relative = 1e-6);
+        #[test]
+        fn test_cosine_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
+            prop_assume!(norm_l2(&x) > 1e-20);
+            prop_assume!(norm_l2(&y) > 1e-20);
+            do_cosine_test(&x, &y);
         }
     }
 }
