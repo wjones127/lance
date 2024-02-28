@@ -23,6 +23,7 @@ use lance_arrow::{ArrowFloatType, FloatArray, FloatType};
 use num_traits::{AsPrimitive, Float, FromPrimitive, ToPrimitive};
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
+use crate::distance::L2;
 use crate::kernels::normalize;
 use crate::{Error, Result};
 
@@ -199,22 +200,6 @@ impl<T: ArrowFloatType> MatrixView<T> {
         }
     }
 
-    pub fn normalize(&self) -> Self {
-        let data = self
-            .data
-            .as_slice()
-            .chunks(self.num_columns)
-            .flat_map(normalize)
-            .collect::<Vec<_>>();
-        let data = Arc::new(data.into());
-        Self {
-            data,
-            num_columns: self.num_columns,
-            transpose: self.transpose,
-        }
-        // todo!("normalize")
-    }
-
     /// Dot multiply
     #[cfg(feature = "opq")]
     pub fn dot(&self, rhs: &Self) -> Result<Self> {
@@ -309,6 +294,23 @@ impl<T: ArrowFloatType> MatrixView<T> {
         MatrixRowIter {
             data: self,
             cur_idx: 0,
+        }
+    }
+}
+
+impl<T: ArrowFloatType + L2> MatrixView<T> {
+    pub fn normalize(&self) -> Self {
+        let data = self
+            .data
+            .as_slice()
+            .chunks(self.num_columns)
+            .flat_map(normalize)
+            .collect::<Vec<_>>();
+        let data = Arc::new(data.into());
+        Self {
+            data,
+            num_columns: self.num_columns,
+            transpose: self.transpose,
         }
     }
 }

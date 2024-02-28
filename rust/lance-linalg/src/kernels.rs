@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::iter::Sum;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow_array::{
@@ -24,8 +23,10 @@ use arrow_array::{
     Array, ArrowNumericType, GenericStringArray, OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType};
+use lance_arrow::FloatToArrayType;
 use num_traits::{bounds::Bounded, Float, Num};
 
+use crate::distance::{norm_l2, L2};
 use crate::Result;
 
 /// Argmax on a [PrimitiveArray].
@@ -125,8 +126,11 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
 /// L2 normalize a vector.
 ///
 /// Returns an iterator of normalized values.
-pub fn normalize<T: Float + Sum>(v: &[T]) -> impl Iterator<Item = T> + '_ {
-    let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>().sqrt();
+pub fn normalize<T: FloatToArrayType>(v: &[T]) -> impl Iterator<Item = T> + '_
+where
+    T::ArrowType: L2,
+{
+    let l2_norm = T::from(norm_l2(v)).unwrap();
     v.iter().map(move |&x| x / l2_norm)
 }
 

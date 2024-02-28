@@ -24,8 +24,7 @@ use num_traits::Float;
 use rand::Rng;
 
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_linalg::distance::norm_l2;
-use lance_linalg::distance::norm_l2::Normalize;
+use lance_linalg::distance::{norm_l2_f16, norm_l2_f32, norm_l2_impl};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
@@ -61,7 +60,7 @@ where
                     target
                         .as_slice()
                         .chunks_exact(DIMENSION)
-                        .map(norm_l2)
+                        .map(|chunk| norm_l2_impl::<T::Native, 16>(chunk))
                         .collect::<Vec<_>>(),
                 );
             });
@@ -75,12 +74,12 @@ fn bench_distance(c: &mut Criterion) {
         .map(bf16::from_bits)
         .take(TOTAL * DIMENSION)
         .collect::<Vec<_>>();
-    c.bench_function("norm_l2(bf16, auto-vectorization)", |b| {
+    c.bench_function("NormL2(bf16, auto-vectorization)", |b| {
         b.iter(|| {
             black_box(
                 target
                     .chunks(DIMENSION)
-                    .map(|x| x.norm_l2())
+                    .map(|x| norm_l2_impl::<bf16, 16>(x))
                     .collect::<Vec<_>>(),
             )
         });
@@ -90,13 +89,13 @@ fn bench_distance(c: &mut Criterion) {
 
     let target: Float16Array =
         generate_random_array_with_seed::<Float16Type>(TOTAL * DIMENSION, [42; 32]);
-    c.bench_function("norm_l2(f16, SIMD)", |b| {
+    c.bench_function("NormL2(f16, SIMD)", |b| {
         b.iter(|| {
             black_box(
                 target
                     .values()
                     .chunks_exact(DIMENSION)
-                    .map(|arr| arr.norm_l2())
+                    .map(norm_l2_f16)
                     .collect::<Vec<_>>(),
             )
         });
@@ -106,13 +105,13 @@ fn bench_distance(c: &mut Criterion) {
     // 1M of 1024 D vectors. 4GB in memory.
     let target: Float32Array =
         generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, [42; 32]);
-    c.bench_function("norm_l2(f32, SIMD)", |b| {
+    c.bench_function("NormL2(f32, SIMD)", |b| {
         b.iter(|| {
             black_box(
                 target
                     .values()
                     .chunks_exact(DIMENSION)
-                    .map(|arr| arr.norm_l2())
+                    .map(norm_l2_f32)
                     .collect::<Vec<_>>(),
             )
         });

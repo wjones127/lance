@@ -50,23 +50,23 @@ fn dot_scalar<T: Real + Sum + AddAssign + AsPrimitive<f32>, const LANES: usize>(
     let x_chunks = to.chunks_exact(LANES);
     let y_chunks = from.chunks_exact(LANES);
     let sum = if x_chunks.remainder().is_empty() {
-        T::zero()
+        0.0_f32
     } else {
         x_chunks
             .remainder()
             .iter()
             .zip(y_chunks.remainder().iter())
-            .map(|(&x, &y)| x * y)
-            .sum::<T>()
+            .map(|(&x, &y)| x.as_() * y.as_())
+            .sum::<f32>()
     };
     // Use known size to allow LLVM to kick in auto-vectorization.
-    let mut sums = [T::zero(); LANES];
+    let mut sums = [0.0_f32; LANES];
     for (x, y) in x_chunks.zip(y_chunks) {
         for i in 0..LANES {
-            sums[i] += x[i] * y[i];
+            sums[i] += x[i].as_() * y[i].as_();
         }
     }
-    (sum + sums.iter().copied().sum::<T>()).as_()
+    sum + sums.iter().copied().sum::<f32>()
 }
 
 /// Dot product.
@@ -281,6 +281,8 @@ pub fn dot_distance_arrow_batch(
 mod tests {
 
     use super::*;
+    use crate::test_utils::arbitrary_f16_vectors;
+    use approx::assert_relative_eq;
     use num_traits::FromPrimitive;
 
     #[test]
@@ -302,5 +304,29 @@ mod tests {
         let x: Vec<f64> = (20..40).map(|v| f64::from_i32(v).unwrap()).collect();
         let y: Vec<f64> = (120..140).map(|v| f64::from_i32(v).unwrap()).collect();
         assert_eq!(Float64Type::dot(&x, &y), dot(&x, &y));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_dot_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
+            assert_eq!(f16_x.len(), f16_y.len());
+
+            // Accuracy of dot product depends on the size of the components
+            // of the vector.
+            fn max_error(x: &[f16], y: &[f16]) -> f32 {
+                let x_abs = x.iter().cloned().map(f16::abs).collect::<Vec<f16>>();
+                let y_abs = y.iter().cloned().map(f16::abs).collect::<Vec<f16>>();
+                let dot = x_abs.into_iter().zip(y_abs.into_iter()).map(|(x, y)| x.to_f32() * y.to_f32()).sum::<f32>();
+                1e-6_f32 * dot
+            }
+
+            let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
+
+            let f32_result = Float32Type::dot(&f32_x, &f32_y);
+            let f16_result = Float16Type::dot(&f16_x, &f16_y);
+
+            assert_relative_eq!(f32_result, f16_result, epsilon = max_error(&f16_x, &f16_y));
+        }
     }
 }

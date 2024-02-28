@@ -28,13 +28,13 @@ pub mod cosine;
 pub mod dot;
 pub mod hamming;
 pub mod l2;
-pub mod norm_l2;
+// pub mod norm_l2;
 
 pub use cosine::*;
 pub use dot::*;
 pub use l2::*;
 use lance_arrow::FloatToArrayType;
-pub use norm_l2::*;
+// pub use norm_l2::*;
 
 use crate::Result;
 
@@ -68,7 +68,7 @@ impl DistanceType {
     /// Returns the distance function between two vectors.
     pub fn func<T: FloatToArrayType>(&self) -> DistanceFunc<T>
     where
-        T::ArrowType: L2 + Cosine + Dot,
+        T::ArrowType: Cosine, // Cosine implies L2 and Dot
     {
         match self {
             Self::L2 => l2,

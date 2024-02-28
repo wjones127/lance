@@ -34,8 +34,7 @@ use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{AsPrimitive, FromPrimitive};
 
-use super::{dot::dot, Normalize};
-use super::norm_l2::norm_l2;
+use super::{dot::dot, norm_l2, Dot, L2};
 use crate::simd::{
     f32::{f32x16, f32x8},
     FloatSimd, SIMD,
@@ -43,37 +42,23 @@ use crate::simd::{
 use crate::{Error, Result};
 
 /// Cosine Distance
-pub trait Cosine: super::dot::Dot
-where
-    Self::Native: AsPrimitive<f64> + AsPrimitive<f32>,
-    for<'a> &'a [Self::Native]: Normalize<Self::Native>,
-    <Self::Native as FloatToArrayType>::ArrowType: Cosine + super::dot::Dot,
-{
+pub trait Cosine: Dot + L2 {
     /// Cosine distance between two vectors.
     #[inline]
-    fn cosine(x: &[Self::Native], other: &[Self::Native]) -> f32
-    where
-        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
-    {
-        let x_norm = x.norm_l2();
+    fn cosine(x: &[Self::Native], other: &[Self::Native]) -> f32 {
+        let x_norm = norm_l2(x);
         Self::cosine_fast(x, x_norm, other)
     }
 
     /// Fast cosine function, that assumes that the norm of the first vector is already known.
     #[inline]
-    fn cosine_fast(x: &[Self::Native], x_norm: f32, y: &[Self::Native]) -> f32
-    where
-        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: super::dot::Dot,
-    {
+    fn cosine_fast(x: &[Self::Native], x_norm: f32, y: &[Self::Native]) -> f32 {
         cosine_scalar(x, x_norm, y)
     }
 
     /// Cosine between two vectors, with the L2 norms of both vectors already known.
     #[inline]
-    fn cosine_with_norms(x: &[Self::Native], x_norm: f32, y_norm: f32, y: &[Self::Native]) -> f32
-    where
-        <<Self as ArrowFloatType>::Native as FloatToArrayType>::ArrowType: Cosine,
-    {
+    fn cosine_with_norms(x: &[Self::Native], x_norm: f32, y_norm: f32, y: &[Self::Native]) -> f32 {
         cosine_scalar_fast(x, x_norm, y, y_norm)
     }
 
@@ -276,7 +261,7 @@ where
 /// Cosine distance function between two vectors.
 pub fn cosine_distance<T: FloatToArrayType>(from: &[T], to: &[T]) -> f32
 where
-    T::ArrowType: Cosine,
+    T::ArrowType: Cosine + L2,
 {
     T::ArrowType::cosine(from, to)
 }
@@ -362,10 +347,9 @@ pub fn cosine_distance_arrow_batch(
 mod tests {
     use super::*;
 
+    use crate::test_utils::arbitrary_f16_vectors;
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
-    use crate::test_utils::arbitrary_f16_vectors;
-    use crate::distance::Normalize;
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
@@ -417,11 +401,11 @@ mod tests {
             assert_eq!(f16_x.len(), f16_y.len());
 
             // Cosine is only valid for non-zero vectors.
-            proptest::prop_assume!(f16_x.as_slice().norm_l2() > 1e-6);
-            proptest::prop_assume!(f16_y.as_slice().norm_l2() > 1e-6);
+            proptest::prop_assume!(norm_l2(f16_x.as_slice()) > 1e-6);
+            proptest::prop_assume!(norm_l2(f16_y.as_slice()) > 1e-6);
 
             let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
-            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();            
+            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
 
             let f32_result = Float32Type::cosine(&f32_x, &f32_y);
             let f16_result = Float16Type::cosine(&f16_x, &f16_y);

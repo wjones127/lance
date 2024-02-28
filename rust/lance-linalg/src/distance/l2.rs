@@ -38,6 +38,11 @@ use crate::simd::{
 };
 use crate::{Error, Result};
 
+/// Exported for benchmarking purposes
+pub use norm::{norm_l2_f16, norm_l2_f32, norm_l2_impl};
+
+mod norm;
+
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2: ArrowFloatType {
@@ -51,6 +56,9 @@ pub trait L2: ArrowFloatType {
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
         Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v)))
     }
+
+    /// Optimized Self::l2(x, 0).
+    fn norm_l2(x: &[Self::Native]) -> f32;
 }
 
 #[inline]
@@ -59,6 +67,18 @@ where
     T::ArrowType: L2,
 {
     T::ArrowType::l2(from, to)
+}
+
+/// Normalize a vector.
+///
+/// The parameters must be cache line aligned. For example, from
+/// Arrow Arrays, i.e., Float32Array
+#[inline]
+pub fn norm_l2<T: FloatToArrayType>(vector: &[T]) -> f32
+where
+    T::ArrowType: L2,
+{
+    T::ArrowType::norm_l2(vector)
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -105,6 +125,11 @@ impl L2 for BFloat16Type {
         // TODO: add SIMD support
         l2_scalar::<bf16, 16>(x, y)
     }
+
+    #[inline]
+    fn norm_l2(x: &[Self::Native]) -> f32 {
+        norm::norm_l2_impl::<bf16, 16>(x)
+    }
 }
 
 #[cfg(feature = "fp16kernels")]
@@ -146,6 +171,11 @@ impl L2 for Float16Type {
             _ => l2_scalar::<f16, 16>(x, y),
         }
     }
+
+    #[inline]
+    fn norm_l2(x: &[Self::Native]) -> f32 {
+        norm::norm_l2_f16(x)
+    }
 }
 
 impl L2 for Float32Type {
@@ -173,6 +203,10 @@ impl L2 for Float32Type {
             _ => Box::new(y.chunks_exact(dimension).map(|v| Self::l2(x, v))),
         }
     }
+
+    fn norm_l2(x: &[Self::Native]) -> f32 {
+        norm::norm_l2_f32(x)
+    }
 }
 
 impl L2 for Float64Type {
@@ -180,6 +214,11 @@ impl L2 for Float64Type {
     fn l2(x: &[f64], y: &[f64]) -> f32 {
         // TODO: add SIMD support
         l2_scalar::<f64, 8>(x, y)
+    }
+
+    #[inline]
+    fn norm_l2(x: &[Self::Native]) -> f32 {
+        norm::norm_l2_impl::<f64, 8>(x)
     }
 }
 
@@ -285,9 +324,10 @@ pub fn l2_distance_arrow_batch(
 mod tests {
     use super::*;
 
+    use crate::test_utils::{arbitrary_f16_vectors, artibrary_f16_vector};
     use approx::assert_relative_eq;
     use arrow_array::Float32Array;
-    use crate::test_utils::arbitrary_f16_vectors;
+    use num_traits::FromPrimitive;
 
     #[test]
     fn test_euclidean_distance() {
@@ -386,19 +426,65 @@ mod tests {
         assert_relative_eq!(0.319_357_84, d[0]);
     }
 
-
     proptest::proptest! {
         #[test]
         fn test_l2_f32_vs_f16((f16_x, f16_y) in arbitrary_f16_vectors(4..4048)) {
             assert_eq!(f16_x.len(), f16_y.len());
 
             let f32_x = f16_x.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
-            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();            
+            let f32_y = f16_y.iter().cloned().map(f16::to_f32).collect::<Vec<f32>>();
 
             let f32_result = Float32Type::l2(&f32_x, &f32_y);
             let f16_result = Float16Type::l2(&f16_x, &f16_y);
 
-            assert_relative_eq!(f32_result, f16_result as f32, max_relative = 1e-6);
+            assert_relative_eq!(f32_result, f16_result, max_relative = 1e-6);
+        }
+    }
+
+    fn do_norm_l2_test<T: L2>() {
+        let data = (1..=37)
+            .map(|v| T::Native::from_i32(v).unwrap())
+            .collect::<Vec<T::Native>>();
+
+        let result = norm_l2(data.as_slice());
+        assert_relative_eq!(
+            result as f64,
+            (1..=37)
+                .map(|v| f64::from_i32(v * v).unwrap())
+                .sum::<f64>()
+                .sqrt(),
+            max_relative = 1.0,
+        );
+
+        let not_aligned = norm_l2(&data[2..]);
+        assert_relative_eq!(
+            not_aligned as f64,
+            (3..=37)
+                .map(|v| f64::from_i32(v * v).unwrap())
+                .sum::<f64>()
+                .sqrt(),
+            max_relative = 1.0,
+        );
+    }
+
+    #[test]
+    fn test_norm_l2() {
+        do_norm_l2_test::<BFloat16Type>();
+        do_norm_l2_test::<Float16Type>();
+        do_norm_l2_test::<Float32Type>();
+        do_norm_l2_test::<Float64Type>();
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_l2_norm_f32_vs_f16(ref f16_data in artibrary_f16_vector(4..4048)){
+            // Any finite f16 vector can have a finite f32 l2 norm.
+            let f32_data = f16_data.iter().cloned().map(|val| val.to_f32()).collect::<Vec<f32>>();
+
+            let f32_result = norm_l2(f32_data.as_slice());
+            let f16_result = norm_l2(f16_data.as_slice());
+
+            assert_relative_eq!(f32_result, f16_result, max_relative = 1e-6);
         }
     }
 }
