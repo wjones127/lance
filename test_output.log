@@ -1,0 +1,1390 @@
+   Compiling psm v0.1.26
+   Compiling zstd-sys v2.0.15+zstd.1.5.7
+   Compiling futures-executor v0.3.31
+   Compiling ring v0.17.14
+   Compiling arrow-data v55.1.0
+   Compiling rustix v1.0.7
+   Compiling aws-lc-sys v0.29.0
+   Compiling tempfile v3.20.0
+   Compiling tower v0.5.2
+   Compiling aws-smithy-async v1.2.5
+   Compiling hyper v1.6.0
+   Compiling h2 v0.3.26
+   Compiling async-lock v3.4.0
+   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.2
+   Compiling protobuf-src v2.1.1+27.1
+   Compiling blake3 v1.8.2
+   Compiling prost-derive v0.12.6
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling async-channel v2.3.1
+   Compiling icu_collections v2.0.0
+   Compiling flate2 v1.1.1
+   Compiling xattr v1.5.0
+   Compiling futures v0.3.31
+   Compiling async-executor v1.13.2
+   Compiling measure_time v0.8.3
+   Compiling lance-linalg v0.30.1 (/home/will/Documents/lance/rust/lance-linalg)
+   Compiling kv-log-macro v1.0.7
+   Compiling env_filter v0.1.3
+   Compiling tracing-log v0.2.0
+   Compiling inferno v0.11.21
+   Compiling lzma-sys v0.1.20
+   Compiling object_store v0.12.1
+   Compiling datafusion-common-runtime v47.0.0
+   Compiling icu_locale_core v2.0.0
+   Compiling blocking v1.6.1
+   Compiling aws-smithy-runtime-api v1.8.0
+   Compiling tar v0.4.44
+   Compiling prost-build v0.13.5
+   Compiling stacker v0.1.21
+   Compiling env_logger v0.11.8
+   Compiling tracing-subscriber v0.3.19
+   Compiling recursive v0.1.1
+   Compiling tower-http v0.6.6
+   Compiling criterion v0.5.1
+   Compiling rstest v0.23.0
+   Compiling sqlparser v0.55.0
+   Compiling moka v0.12.10
+   Compiling test-log v0.2.17
+   Compiling arrow-array v55.1.0
+   Compiling icu_provider v2.0.0
+   Compiling icu_normalizer v2.0.0
+   Compiling icu_properties v2.0.1
+   Compiling hyper-util v0.1.14
+   Compiling pbjson-types v0.7.0
+   Compiling lance-encoding v0.30.1 (/home/will/Documents/lance/rust/lance-encoding)
+   Compiling substrait v0.55.1
+   Compiling lance-file v0.30.1 (/home/will/Documents/lance/rust/lance-file)
+   Compiling lance-table v0.30.1 (/home/will/Documents/lance/rust/lance-table)
+   Compiling lance-index v0.30.1 (/home/will/Documents/lance/rust/lance-index)
+   Compiling aws-smithy-http v0.62.1
+   Compiling aws-credential-types v1.2.3
+   Compiling aws-smithy-observability v0.1.3
+   Compiling prost v0.12.6
+   Compiling aws-types v1.3.7
+   Compiling prost-types v0.12.6
+   Compiling aws-smithy-checksums v0.63.3
+   Compiling tracing-chrome v0.7.2
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.0.3
+   Compiling url v2.5.4
+   Compiling arrow-select v55.1.0
+   Compiling arrow-arith v55.1.0
+   Compiling arrow-row v55.1.0
+   Compiling polling v3.8.0
+   Compiling async-io v2.4.1
+   Compiling prost-build v0.12.6
+   Compiling hyper v0.14.32
+   Compiling pprof v0.14.0
+   Compiling arrow-ipc v55.1.0
+   Compiling async-global-executor v2.4.1
+   Compiling arrow-cast v55.1.0
+   Compiling arrow-ord v55.1.0
+   Compiling arrow-string v55.1.0
+   Compiling async-std v1.13.1
+   Compiling rustls v0.21.12
+   Compiling rustls v0.23.27
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling aws-sigv4 v1.3.2
+   Compiling arrow-csv v55.1.0
+   Compiling arrow-json v55.1.0
+   Compiling rustls-webpki v0.103.3
+   Compiling arrow v55.1.0
+   Compiling tokio-rustls v0.24.1
+   Compiling lance-arrow v0.30.1 (/home/will/Documents/lance/rust/lance-arrow)
+   Compiling zstd-safe v7.2.4
+   Compiling hyper-rustls v0.24.2
+   Compiling datafusion-common v47.0.0
+   Compiling zstd v0.13.3
+   Compiling tantivy-sstable v0.3.0
+   Compiling tantivy-columnar v0.3.0
+   Compiling lance-testing v0.30.1 (/home/will/Documents/lance/rust/lance-testing)
+   Compiling parquet v55.1.0
+   Compiling lance-datagen v0.30.1 (/home/will/Documents/lance/rust/lance-datagen)
+   Compiling tantivy v0.22.0
+   Compiling ureq v2.12.1
+   Compiling tfrecord v0.15.0
+   Compiling datafusion-expr-common v47.0.0
+   Compiling lz4 v1.28.1
+   Compiling datafusion-physical-expr-common v47.0.0
+   Compiling datafusion-functions-aggregate-common v47.0.0
+   Compiling datafusion-functions-window-common v47.0.0
+   Compiling aws-lc-rs v1.13.1
+   Compiling datafusion-expr v47.0.0
+   Compiling tokio-rustls v0.26.2
+   Compiling hyper-rustls v0.27.6
+   Compiling aws-smithy-http-client v1.0.3
+   Compiling reqwest v0.12.19
+   Compiling datafusion-macros v47.0.0
+   Compiling object_store v0.11.2
+   Compiling aws-smithy-runtime v1.8.3
+   Compiling aws-runtime v1.5.7
+   Compiling aws-sdk-sts v1.72.0
+   Compiling aws-sdk-sso v1.71.0
+   Compiling aws-sdk-ssooidc v1.72.0
+   Compiling aws-sdk-dynamodb v1.78.0
+   Compiling aws-sdk-s3 v1.90.0
+   Compiling datafusion-sql v47.0.0
+   Compiling datafusion-physical-expr v47.0.0
+   Compiling datafusion-execution v47.0.0
+   Compiling datafusion-functions v47.0.0
+   Compiling aws-config v1.6.3
+   Compiling datafusion-physical-plan v47.0.0
+   Compiling datafusion-functions-aggregate v47.0.0
+   Compiling datafusion-functions-window v47.0.0
+   Compiling datafusion-optimizer v47.0.0
+   Compiling datafusion-functions-nested v47.0.0
+   Compiling lance-core v0.30.1 (/home/will/Documents/lance/rust/lance-core)
+   Compiling datafusion-session v47.0.0
+   Compiling datafusion-physical-optimizer v47.0.0
+   Compiling datafusion-datasource v47.0.0
+   Compiling datafusion-catalog v47.0.0
+   Compiling lance-io v0.30.1 (/home/will/Documents/lance/rust/lance-io)
+   Compiling datafusion-datasource-parquet v47.0.0
+   Compiling datafusion-functions-table v47.0.0
+   Compiling datafusion-datasource-json v47.0.0
+   Compiling datafusion-catalog-listing v47.0.0
+   Compiling datafusion-datasource-csv v47.0.0
+   Compiling datafusion v47.0.0
+   Compiling datafusion-substrait v47.0.0
+   Compiling lance-datafusion v0.30.1 (/home/will/Documents/lance/rust/lance-datafusion)
+   Compiling lance v0.30.1 (/home/will/Documents/lance/rust/lance)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 28s
+     Running unittests src/lib.rs (target/debug/deps/lance-86bc8fe11f1b0647)
+
+running 561 tests
+test arrow::json::test::test_complex_types_to_json ... ok
+test arrow::json::test::test_data_type_to_json ... ok
+test arrow::json::test::test_metadata_roundtrip ... ok
+test arrow::json::test::test_schema_to_json ... ok
+test datafusion::logical_plan::tests::test_dataset_logicalplan_projection_pd ... ok
+test dataset::cleanup::tests::cleanup_failed_commit_data_file ... ok
+test datafusion::logical_plan::tests::test_dataset_logicalplan_struct_fields ... ok
+test dataset::fragment::tests::test_fragment_scan_v2 ... ok
+test dataset::fragment::tests::test_iops_read_small ... ok
+test dataset::fragment::tests::test_fragment_scan::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::fragment::tests::test_fragment_scan::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::create_from_file_v2 ... ok
+test dataset::fragment::tests::test_fragment_count::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::fragment::tests::test_fragment_count::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_row_id_reader ... ok
+test datafusion::dataframe::tests::test_table_provider ... ok
+test dataset::cleanup::tests::cleanup_around_tagged_old_versions ... ok
+test dataset::fragment::tests::test_write_batch_size ... ok
+test dataset::fragment::write::tests::test_fragment_write_default_schema ... ok
+test dataset::fragment::tests::test_fragment_take_indices::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::fragment::tests::test_fragment_take_rows::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::fragment::tests::test_recommit_from_file ... ok
+test dataset::fragment::write::tests::test_fragment_write_validation ... ok
+test dataset::fragment::write::tests::test_write_fragments_validation ... ok
+test dataset::fragment::write::tests::test_write_fragments_default_schema ... ok
+test dataset::fragment::write::tests::test_fragment_write_with_schema ... ok
+test dataset::hash_joiner::tests::test_reject_invalid ... ok
+test dataset::optimize::remapping::tests::test_missing_ids ... ok
+test dataset::optimize::remapping::tests::test_missing_indices ... ok
+test dataset::optimize::tests::test_candidate_bin ... ok
+test dataset::hash_joiner::tests::test_joiner_collect ... ok
+test dataset::fragment::write::tests::test_write_fragments_with_options ... ok
+test dataset::fragment::tests::test_shuffled_columns ... ok
+test dataset::fragment::tests::test_fragment_take_range_deletions::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_all_good::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_all_good::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_fragment_take_range_deletions::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::cleanup::tests::cleanup_error_when_tagged_old_versions ... ok
+test dataset::fragment::tests::test_fragment_take_indices::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_out_of_range ... ok
+test dataset::fragment::tests::test_fragment_take_rows::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::optimize::tests::test_compact_empty::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_empty::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::cleanup::tests::can_recover_delete_failure ... ok
+test dataset::optimize::tests::test_compact_deletions::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_deletions::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_merge_fragment::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_append_new_columns::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_append_new_columns::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_distributed::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_2_true ... ok
+test dataset::fragment::tests::test_rowid_rowaddr_only ... ok
+test dataset::optimize::tests::test_compact_distributed::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::optimize::tests::test_compact_distributed::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::optimize::tests::test_compact_distributed::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_1_false ... ok
+test dataset::fragment::tests::test_merge_fragment::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::cleanup::tests::clean_old_delete_files ... ok
+test dataset::optimize::tests::test_concurrent_compactions_with_defer_index_remap ... ok
+test dataset::index::frag_reuse::tests::test_cleanup_frag_reuse_index ... ok
+test dataset::optimize::tests::test_concurrent_cleanup_and_compaction_rebase_compaction ... ok
+test dataset::refs::tests::test_err_ref::r_01_____ ... ok
+test dataset::refs::tests::test_err_ref::r_02______ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_03____ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_04____ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_05_____ ... ok
+test dataset::refs::tests::test_err_ref::r_06___deeply_nested_ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_07___nested__ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_08___nested_ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_09___nestedref__ ... ok
+test dataset::refs::tests::test_err_ref::r_10___ref___ ... ok
+test dataset::refs::tests::test_err_ref::r_11___ref_lock__ ... ok
+test dataset::refs::tests::test_err_ref::r_12___ref___ ... ok
+test dataset::refs::tests::test_err_ref::r_13___ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_14___ref_ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_15___ref___ ... ok
+test dataset::refs::tests::test_err_ref::r_16___ref___ ... ok
+test dataset::refs::tests::test_err_ref::r_17____ref__ ... ok
+test dataset::refs::tests::test_err_ref::r_18___ref___ ... ok
+test dataset::refs::tests::test_err_ref::r_19___ref__ref__ ... ok
+test dataset::refs::tests::test_ok_ref::r_1___ref__ ... ok
+test dataset::refs::tests::test_ok_ref::r_2___ref_with_dashes__ ... ok
+test dataset::refs::tests::test_ok_ref::r_3___ref_extension__ ... ok
+test dataset::refs::tests::test_ok_ref::r_4___ref_with_underscores__ ... ok
+test dataset::refs::tests::test_ok_ref::r_5___v1_2_3_rc4__ ... ok
+test dataset::optimize::tests::test_concurrent_cleanup_and_compaction_rebase_cleanup ... ok
+test dataset::optimize::tests::test_compact_many::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_many::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::rowids::test::test_empty_dataset_rowids ... ok
+test dataset::rowids::test::test_must_set_on_creation ... ok
+test dataset::rowids::test::test_new_row_ids ... ok
+test dataset::optimize::tests::test_compact_data_files::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_compact_data_files::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::rowids::test::test_delete_with_row_ids::with_scalar_index_2_false ... ok
+test dataset::rowids::test::test_row_ids_overwrite ... ok
+test dataset::rowids::test::test_row_ids_update ... ok
+test dataset::rowids::test::test_row_ids_append ... ok
+test dataset::rowids::test::test_scan_row_ids ... ok
+test dataset::rowids::test::test_delete_with_row_ids::with_scalar_index_1_true ... ok
+test dataset::optimize::tests::test_read_bitmap_index_with_defer_index_remap ... ok
+test dataset::fragment::tests::test_range_scan_deletions::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::fragment::tests::test_range_scan_deletions::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::optimize::tests::test_remap_index_after_compaction ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false::index_params_2_VectorIndexParams__with_ivf_hnsw_sq_params_MetricType__L2_IvfBui ... ok
+test dataset::optimize::tests::test_read_label_list_index_with_defer_index_remap ... ok
+test dataset::optimize::tests::test_concurrent_compaction_reindex_reindex_commit_first ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true::index_params_2_VectorIndexParams__with_ivf_hnsw_sq_params_MetricType__L2_IvfBui ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false::index_params_2_VectorIndexParams__with_ivf_hnsw_sq_params_MetricType__L2_IvfBui ... ok
+test dataset::scanner::test::test_column_casting_function::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_count_plan ... ok
+test dataset::scanner::test::test_column_casting_function::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_count_rows_with_filter::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_count_rows_with_filter::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::optimize::tests::test_concurrent_compaction_reindex_compaction_commit_first ... ok
+test dataset::scanner::test::test_dynamic_projection::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_dynamic_projection::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_filter_on_large_utf8::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_batch_size ... ok
+test dataset::scanner::test::test_filter_on_large_utf8::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::optimize::tests::test_defer_index_remap ... ok
+test dataset::scanner::test::test_filter_with_regex::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_filter_parsing ... ok
+test dataset::scanner::test::test_filter_proj_bug ... ok
+test dataset::scanner::test::test_filter_with_regex::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false::index_params_1_VectorIndexParams__ivf_pq_2_8_2_MetricType__L2_2_ ... ok
+test dataset::optimize::tests::test_defer_index_remap_multiple_compactions ... ok
+test dataset::scanner::test::test_knn_filter_new_data::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false::build_index_1_false ... ok
+test dataset::scanner::test::test_inexact_scalar_index_plans ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true::build_index_1_false ... ok
+test dataset::scanner::test::test_knn_filter_new_data::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false::build_index_1_false ... ok
+test dataset::scanner::test::test_fast_search_plan ... ok
+test dataset::scanner::test::test_index_take_batch_size ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true::build_index_1_false ... ok
+test dataset::scanner::test::test_knn_with_filter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_knn_with_filter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_with_filter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_knn_with_filter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false::build_index_2_true ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true::build_index_2_true ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true::index_params_1_VectorIndexParams__ivf_pq_2_8_2_MetricType__L2_2_ ... ok
+test dataset::scanner::test::test_knn_filter_new_data::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false::build_index_2_true ... ok
+test dataset::scanner::test::test_knn_filter_new_data::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_knn_nodes::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true::build_index_2_true ... ok
+test dataset::scanner::test::test_knn_with_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_with_new_data::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_with_new_data::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_knn_with_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_limit::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_limit::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_only_row_id::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_local_object_store ... ok
+test dataset::scanner::test::test_only_row_id::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_ann_with_deletion::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_late_materialization::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_knn_with_new_data::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_late_materialization::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true::index_params_2_VectorIndexParams__with_ivf_hnsw_sq_params_MetricType__L2_IvfBui ... ok
+test dataset::scanner::test::test_project_nested::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_project_nested::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::cleanup::tests::cleanup_old_index ... ok
+test dataset::scanner::test::test_refine_factor::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_refine_factor::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_refine_factor::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_refine_factor::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_knn_with_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::cleanup::tests::do_not_cleanup_newer_data ... ok
+test dataset::scanner::test::test_scan_order::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_knn_with_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_scan_order::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true::index_params_1_VectorIndexParams__ivf_pq_2_8_2_MetricType__L2_2_ ... ok
+test dataset::scanner::test::test_scan_sort::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::scanner::test::test_scan_sort::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::cleanup::tests::dont_cleanup_in_progress_write ... ok
+test dataset::scanner::test::test_ann_prefilter::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false::index_params_1_VectorIndexParams__ivf_pq_2_8_2_MetricType__L2_2_ ... ok
+test dataset::scanner::test::test_sort_multi_columns::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::optimize::test::test_sql_to_all_null_transform ... ok
+test dataset::scanner::test::test_sort_multi_columns::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_scan_unordered_with_row_id ... ok
+test dataset::schema_evolution::test::test_add_column_all_nulls_legacy ... ok
+test dataset::schema_evolution::test::test_add_column_all_nulls ... ok
+test dataset::schema_evolution::test::test_append_columns_udf::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::test::test_append_columns_udf::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::schema_evolution::test::test_append_columns_udf_cache ... ok
+test dataset::schema_evolution::test::test_append_columns_exprs ... ok
+test dataset::schema_evolution::test::test_drop_add_columns::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::test::test_drop_add_columns::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_knn_with_new_data::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_2_true ... ok
+test dataset::schema_evolution::test::test_drop_columns::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::test::test_new_column_sql_to_all_nulls_transform_optimizer ... ok
+test dataset::schema_evolution::test::test_drop_columns::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::schema_evolution::test::test_new_column_sql_to_all_nulls_transform_optimizer_legacy ... ok
+test dataset::take::test::take_scan_dataset::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::test::test_rename_columns::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::schema_evolution::test::test_rename_columns::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::take::test::take_scan_dataset::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::take::test::test_take::data_storage_version_2_LanceFileVersion__Stable::enable_move_stable_row_ids_1_false ... ok
+test dataset::take::test::test_take::data_storage_version_1_LanceFileVersion__Legacy::enable_move_stable_row_ids_2_true ... ok
+test dataset::take::test::test_take::data_storage_version_1_LanceFileVersion__Legacy::enable_move_stable_row_ids_1_false ... ok
+test dataset::take::test::test_take::data_storage_version_2_LanceFileVersion__Stable::enable_move_stable_row_ids_2_true ... ok
+test dataset::optimize::tests::test_read_btree_index_with_defer_index_remap ... ok
+test dataset::take::test::test_take_rows_out_of_bound::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::take::test::test_take_rows_out_of_bound::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::take::test::test_take_rows_with_row_ids::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::take::test::test_take_rows_with_row_ids::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::take::test::test_take_rows::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::take::test::test_take_with_deletion ... ok
+test dataset::take::test::test_take_with_projection::data_storage_version_1_LanceFileVersion__Legacy::enable_move_stable_row_ids_1_false ... ok
+test dataset::take::test::test_take_with_projection::data_storage_version_1_LanceFileVersion__Legacy::enable_move_stable_row_ids_2_true ... ok
+test dataset::take::test::test_take_with_projection::data_storage_version_2_LanceFileVersion__Stable::enable_move_stable_row_ids_1_false ... ok
+test dataset::take::test::test_take_with_projection::data_storage_version_2_LanceFileVersion__Stable::enable_move_stable_row_ids_2_true ... ok
+test dataset::take::test::test_take_rows::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::append_dataset::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::append_dataset::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::append_dictionary::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::append_dictionary::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_bad_field_name::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_bad_field_name::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::concurrent_create ... ok
+test dataset::tests::test_bfloat16_roundtrip::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::overwrite_dataset::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::overwrite_dataset::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_bfloat16_roundtrip::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_create_and_fill_empty_dataset::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_create_and_fill_empty_dataset::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_create_fts_index_with_empty_strings ... ok
+test dataset::tests::test_create_fts_index_with_empty_table ... ok
+test dataset::tests::test_create_dataset::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_create_dataset::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::scanner::test::test_scan_planning_io::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::cleanup::tests::dont_clean_index_data_files ... ok
+test dataset::tests::test_create_scalar_index::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_1_false ... ok
+test dataset::tests::test_create_scalar_index::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_2_true ... ok
+test dataset::tests::test_create_scalar_index::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::tests::test_create_with_empty_iter::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_create_with_empty_iter::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_datafile_partial_replacement ... ok
+test dataset::tests::test_datafile_replacement ... ok
+test dataset::tests::test_datafile_replacement_error ... ok
+test dataset::tests::test_dataset_uri_roundtrips ... ok
+test dataset::tests::test_create_scalar_index::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::tests::test_delete::data_storage_version_1_LanceFileVersion__Legacy::with_scalar_index_1_false ... ok
+test dataset::tests::test_delete::data_storage_version_1_LanceFileVersion__Legacy::with_scalar_index_2_true ... ok
+test dataset::tests::test_delete::data_storage_version_2_LanceFileVersion__Stable::with_scalar_index_1_false ... ok
+test dataset::tests::test_fast_count_rows::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_fast_count_rows::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_delete::data_storage_version_2_LanceFileVersion__Stable::with_scalar_index_2_true ... ok
+test dataset::tests::test_fix_v0_10_5_corrupt_schema ... ok
+test dataset::tests::test_fix_v0_21_0_corrupt_fragment_bitmap ... ok
+test dataset::tests::test_fix_v0_8_0_broken_migration ... ok
+test dataset::tests::test_create_int8_index::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_fts_fuzzy_query ... ok
+test dataset::cleanup::tests::auto_cleanup_old_versions ... ok
+test dataset::cleanup::tests::cleanup_recent_verified_files ... ok
+test dataset::tests::test_create_index::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_create_int8_index::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_insert_balanced_subschemas ... ok
+test dataset::cleanup::tests::cleanup_unreferenced_data_files ... ok
+test dataset::tests::test_fts_accented_chars ... ok
+test dataset::tests::test_insert_nested_subschemas ... ok
+test dataset::tests::test_insert_subschema ... ok
+test dataset::tests::test_fts_rank ... ok
+test dataset::cleanup::tests::dont_cleanup_recent_unverified_files ... ok
+test dataset::tests::test_load_manifest_iops ... ok
+test dataset::tests::test_fts_on_multiple_columns ... ok
+test dataset::tests::test_manifest_partially_fits ... ok
+test dataset::tests::test_fts_unindexed_data ... ok
+test dataset::tests::test_merge::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_1_false ... ok
+test dataset::tests::test_merge::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::tests::test_merge::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_2_true ... ok
+test dataset::scanner::test::test_scan_planning_io::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_merge::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::tests::test_large_merge::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_1_false ... ok
+test dataset::tests::test_migrate_v2_manifest_paths ... ok
+test dataset::tests::test_num_small_files::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_large_merge::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_2_true ... ok
+test dataset::tests::test_open_dataset_not_found ... ok
+test dataset::tests::test_open_nonexisting_dataset ... ok
+test dataset::tests::test_num_small_files::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_read_struct_of_dictionary_arrays ... ok
+test dataset::tests::test_overwrite_mixed_version ... ok
+test dataset::tests::test_replace_fragment_metadata_preserves_fragments ... ok
+test dataset::tests::test_merge_on_row_addr::data_storage_version_1_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::tests::test_replace_schema_metadata_preserves_fragments ... ok
+test dataset::tests::test_merge_on_row_addr::data_storage_version_1_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::tests::test_replace_dataset ... ok
+test dataset::tests::test_create_index::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_large_merge::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::tests::test_search_empty::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_search_empty::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_large_merge::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::scanner::test::test_ann_with_deletion::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_ann_with_deletion::data_storage_version_1_LanceFileVersion__Legacy::stable_row_ids_1_false ... ok
+test dataset::tests::test_restore::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_self_dataset_append::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_self_dataset_append_schema_different::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_merge_on_row_id::data_storage_version_1_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test dataset::tests::test_restore::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_self_dataset_append_schema_different::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_self_dataset_append::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_session_store_registry ... ok
+test dataset::tests::test_strict_overwrite ... ok
+test dataset::tests::test_update_config ... ok
+test dataset::tests::test_v0_7_5_migration ... ok
+test dataset::tests::test_v2_manifest_path_commit ... ok
+test dataset::schema_evolution::test::test_cast_column::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::schema_evolution::test::test_cast_column::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_tag::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::tests::test_v2_manifest_path_create ... ok
+test dataset::transaction::tests::test_rewrite_fragments ... ok
+test dataset::updater::tests::test_add_blanks ... ok
+test dataset::updater::tests::test_restore_deletes ... ok
+test dataset::tests::test_merge_on_row_id::data_storage_version_1_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::tests::test_write_manifest::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::tests::test_write_manifest::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::write::commit::tests::test_commit_batch ... ok
+test dataset::tests::test_tag::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::write::commit::tests::test_commit_iops ... ok
+test dataset::tests::test_write_params::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::write::commit::tests::test_reuse_session ... ok
+test dataset::tests::test_fts_index_with_large_string ... ok
+test dataset::tests::test_write_params::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::write::merge_insert::tests::subcols::test_errors_on_bad_schema ... ok
+test dataset::write::merge_insert::tests::subcols::test_delete_not_supported ... ok
+test dataset::write::merge_insert::tests::subcols::test_merge_insert_subcols::scalar_index_1_false::insert_1_false ... ok
+test dataset::write::merge_insert::tests::subcols::test_merge_insert_subcols::scalar_index_1_false::insert_2_true ... ok
+test dataset::write::merge_insert::tests::subcols::test_merge_insert_subcols::scalar_index_2_true::insert_1_false ... ok
+test dataset::write::merge_insert::tests::subcols::test_merge_insert_subcols::scalar_index_2_true::insert_2_true ... ok
+test dataset::tests::test_fts_index_with_string ... ok
+test dataset::tests::test_v0_8_14_invalid_index_fragment_bitmap::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test dataset::blob::tests::test_take_blobs ... ok
+test dataset::write::tests::test_chunking_large_batches ... ok
+test dataset::write::tests::test_chunking_small_batches ... ok
+test dataset::tests::test_v0_8_14_invalid_index_fragment_bitmap::data_storage_version_2_LanceFileVersion__Stable ... ok
+test dataset::write::tests::test_file_v1_schema_order ... ok
+test dataset::blob::tests::test_take_blob_id_not_exist ... ok
+test dataset::write::tests::test_file_write_version ... ok
+test dataset::write::update::tests::test_update_all::version_1_LanceFileVersion__Legacy ... ok
+test dataset::blob::tests::test_take_blob_not_blob_col ... ok
+test dataset::write::update::tests::test_update_conditional::version_1_LanceFileVersion__Legacy ... ok
+test dataset::write::commit::tests::test_commit_conflict_iops::use_cache_1_true ... ok
+test dataset::write::update::tests::test_update_all::version_2_LanceFileVersion__V2_0 ... ok
+test dataset::blob::tests::test_take_blobs_by_indices ... ok
+test dataset::write::update::tests::test_update_validation ... ok
+test dataset::write::tests::test_file_size ... ok
+test dataset::write::update::tests::test_update_conditional::version_2_LanceFileVersion__V2_0 ... ok
+test dataset::write::commit::tests::test_commit_conflict_iops::use_cache_2_false ... ok
+test dataset::write::merge_insert::tests::test_merge_insert_updates_indices ... ok
+test dataset::write::update::tests::test_update_concurrency ... ok
+test dataset::scanner::test::test_ann_with_deletion::data_storage_version_2_LanceFileVersion__Stable::stable_row_ids_2_true ... ok
+test index::tests::test_create_bitmap_index ... ok
+test index::tests::test_index_created_at_timestamp ... ok
+test index::prefilter::test::test_deletion_mask_stable_row_id ... ok
+test index::tests::test_index_statistics_updated_at ... ok
+test index::tests::test_index_statistics_updated_at_none_when_no_created_at ... ok
+test dataset::write::merge_insert::tests::test_basic_merge::version_1_LanceFileVersion__Legacy ... ok
+test index::prefilter::test::test_deletion_mask ... ok
+test index::tests::test_load_indices ... FAILED
+test dataset::write::merge_insert::tests::test_basic_merge::version_2_LanceFileVersion__V2_0 ... ok
+test dataset::write::merge_insert::tests::test_upsert_concurrent_full_frag ... ok
+test index::tests::test_create_index_too_small_for_pq ... ok
+test index::tests::test_optimize_ivf_pq_up_to_date ... ok
+test index::tests::test_drop_index ... ok
+test index::vector::fixture_test::test::test_ivf_residual_handling ... ok
+test index::tests::test_optimize_fts::with_position_1_false ... ok
+test dataset::write::merge_insert::tests::test_merge_insert_large_concurrent ... ok
+test dataset::write::merge_insert::tests::test_indexed_merge_insert ... ok
+test index::tests::test_optimize_fts::with_position_2_true ... ok
+test index::tests::test_remap_empty ... ok
+test dataset::scanner::test::test_plans::data_storage_version_2_LanceFileVersion__Stable::stable_row_id_1_false ... ok
+test dataset::optimize::tests::test_stable_row_indices ... ok
+test dataset::scanner::test::test_plans::data_storage_version_2_LanceFileVersion__Stable::stable_row_id_2_true ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_1_ivf_pq_l2::index_version_2_IndexFileVersion__V3 ... ok
+test dataset::optimize::tests::test_read_ngram_index_with_defer_index_remap ... FAILED
+test index::vector::ivf::tests::test_create_index_nulls::case_3_ivf_flat::index_version_1_IndexFileVersion__Legacy ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_3_ivf_flat::index_version_2_IndexFileVersion__V3 ... ok
+test dataset::scanner::test::test_secondary_index_scans::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_ids_2_true ... ok
+test dataset::optimize::tests::test_read_ivf_pq_index_v3_with_defer_index_remap ... ok
+test dataset::scanner::test::test_secondary_index_scans::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_ids_2_true ... ok
+test dataset::scanner::test::test_secondary_index_scans::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_ids_1_false ... ok
+test dataset::scanner::test::test_secondary_index_scans::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_ids_1_false ... ok
+test dataset::write::merge_insert::tests::test_merge_insert_concurrency::case_2_timeout ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_5_ivf_hnsw_sq::index_version_1_IndexFileVersion__Legacy ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_5_ivf_hnsw_sq::index_version_2_IndexFileVersion__V3 ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_dot ... ok
+test dataset::write::merge_insert::tests::test_merge_insert_concurrency::case_1_all_success ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_4_ivf_hnsw_pq::index_version_1_IndexFileVersion__Legacy ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_with_centroids ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_f16_with_codebook ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_with_invalid_num_sub_vectors ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_f16 ... ok
+test index::vector::ivf::tests::test_index_lifecycle_nulls ... ok
+test index::vector::ivf::tests::test_create_ivf_pq_cosine ... ok
+test index::tests::test_recreate_index ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_4_ivf_hnsw_pq::index_version_2_IndexFileVersion__V3 ... ok
+test dataset::optimize::tests::test_read_inverted_index_with_defer_index_remap ... ok
+test index::vector::ivf::tests::test_create_ivf_hnsw_pq ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_flat::case_1 ... ok
+test index::vector::ivf::tests::test_create_ivf_hnsw_with_empty_partition ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_flat::case_3 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_flat::case_4 ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_2_ivf_pq_dot::index_version_2_IndexFileVersion__V3 ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_2_ivf_pq_dot::index_version_1_IndexFileVersion__Legacy ... ok
+test index::vector::ivf::tests::test_build_ivf_model_l2 ... ok
+test index::vector::ivf::tests::test_build_ivf_model_cosine ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_flat::case_1 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq::case_3 ... ok
+test dataset::tests::test_search_empty_after_delete::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_2_true ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq::case_2 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_1 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_flat::case_3 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_flat::case_2 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq_4bit::case_1 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq::case_1 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_3 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_sq::case_2 ... ok
+test index::vector::ivf::v2::tests::test_flat_knn ... ok
+test index::vector::ivf::v2::tests::test_index_stats::index_1__VectorIndexParams__ivf_flat_4_DistanceType__Hamming__IndexType_ ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_2 ... ok
+test index::vector::ivf::v2::tests::test_index_stats::index_2__VectorIndexParams__ivf_pq_4_8_8_DistanceType__L2_10__IndexType_ ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_6 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_sq::case_1 ... ok
+test index::vector::ivf::v2::tests::test_index_stats::index_3__VectorIndexParams__with_ivf_hnsw_sq_params_DistanceType__Cosine ... ok
+test index::vector::ivf::v2::tests::test_pq_storage_backwards_compat ... ok
+test index::vector::pq::tests::test_build_pq_model_cosine ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq::case_2 ... ok
+test index::vector::pq::tests::test_filter_on_empty_pq_code ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_1_99::sample_size_1_10 ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_1_99::sample_size_2_100 ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_2_100::sample_size_1_10 ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_2_100::sample_size_2_100 ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_3_102::sample_size_1_10 ... ok
+test index::vector::utils::tests::test_random_ranges::num_rows_3_102::sample_size_2_100 ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_1___update_full__::other_1___update_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_1___update_full__::other_2___update_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_1___update_full__::other_3___delete_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_1___update_full__::other_4___delete_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_2___update_partial__::other_1___update_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_2___update_partial__::other_2___update_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_2___update_partial__::other_3___delete_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_2___update_partial__::other_4___delete_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_3___delete_full__::other_1___update_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_3___delete_full__::other_2___update_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_3___delete_full__::other_3___delete_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_3___delete_full__::other_4___delete_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_4___delete_partial__::other_1___update_full__ ... ok
+test index::vector::pq::tests::test_build_pq_model_l2 ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq_4bit::case_2 ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_4___delete_partial__::other_3___delete_full__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicts ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_4___delete_partial__::other_2___update_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_conflicting_rebase::ours_4___delete_partial__::other_4___delete_partial__ ... ok
+test io::commit::conflict_resolver::tests::test_non_conflicting_rebase_delete_update ... ok
+test io::commit::conflict_resolver::tests::test_non_overlapping_rebase_delete_update ... ok
+test io::commit::dynamodb::test::test_dataset_can_onboard_external_store ... FAILED
+test io::commit::dynamodb::test::test_can_create_dataset_with_external_store ... FAILED
+test io::commit::dynamodb::test::test_concurrent_commits_are_okay ... FAILED
+test io::commit::dynamodb::test::test_out_of_sync_dataset_can_recover ... FAILED
+test io::commit::dynamodb::test::test_store ... FAILED
+test io::commit::external_manifest::test::test_can_create_dataset_with_external_store ... ok
+test io::commit::external_manifest::test::test_dataset_can_onboard_external_store ... ok
+test io::commit::s3_test::test_concurrent_writers ... FAILED
+test io::commit::s3_test::test_ddb_open_iops ... FAILED
+test io::commit::tests::test_bad_concurrent_config_writes ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_sq::case_3 ... ok
+test io::commit::tests::test_concurrent_writes ... ok
+test io::commit::tests::test_custom_commit ... ok
+test io::commit::tests::test_fix_schema ... ok
+test io::commit::tests::test_good_concurrent_config_writes ... ok
+test io::commit::tests::test_rename_commit_handler ... ok
+test io::commit::tests::test_roundtrip_transaction_file ... ok
+test io::commit::tests::test_unsafe_commit_handler ... ok
+test io::exec::filtered_read::tests::test_batch_size ... ok
+test io::exec::filtered_read::tests::test_dv_range_filter ... ok
+test io::exec::filtered_read::tests::test_filter_no_scalar_index ... ok
+test io::exec::filtered_read::tests::test_filter_scalar_index ... ok
+test io::exec::filtered_read::tests::test_projection ... ok
+test io::exec::filtered_read::tests::test_range_no_scalar_index ... ok
+test io::exec::filtered_read::tests::test_with_deleted_rows ... ok
+test io::exec::fts::tests::execute_without_context ... ok
+test io::exec::knn::tests::knn_flat_search ... ok
+test io::exec::knn::tests::test_create_knn_flat ... ok
+test index::vector::ivf::v2::tests::test_index_with_zero_vectors ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq_4bit::case_3 ... ok
+test io::commit::tests::test_concurrent_create_index ... ok
+test io::exec::knn::tests::test_dataset_too_small::num_deltas_2_20 ... FAILED
+test io::exec::knn::tests::test_multivector_score ... ok
+test io::commit::external_manifest::test::test_out_of_sync_dataset_can_recover ... ok
+test io::exec::knn::tests::test_fewer_than_k_results::num_deltas_2_20 ... FAILED
+test io::exec::knn::tests::test_no_max_nprobes::num_deltas_2_20 ... FAILED
+test index::vector::ivf::v2::tests::test_migrate_v1_to_v3 ... ok
+test io::exec::knn::tests::test_no_prefilter_results::num_deltas_2_20 ... FAILED
+test index::vector::ivf::v2::tests::test_index_stats_empty_partition ... ok
+test io::exec::projection::tests::test_project_node ... ok
+test io::exec::pushdown_scan::test::test_codepath_options ... ok
+test io::exec::pushdown_scan::test::test_empty_result ... ok
+test io::exec::pushdown_scan::test::test_nested_filter ... ok
+test io::exec::pushdown_scan::test::test_null_batch ... ok
+test io::exec::pushdown_scan::test::test_predicate_combinations ... ok
+test io::exec::pushdown_scan::test::test_retrieve_just_row_id ... ok
+test io::exec::pushdown_scan::test::test_with_deletions ... ok
+test io::exec::pushdown_scan::test::test_with_row_id ... ok
+test io::exec::rowids::test::test_address_style_ids ... ok
+test io::exec::rowids::test::test_invalid_schema ... ok
+test io::exec::knn::tests::test_some_max_nprobes::num_deltas_2_20 ... FAILED
+test io::exec::rowids::test::test_row_ids_with_nulls ... ok
+test io::exec::rowids::test::test_row_ids_no_nulls ... ok
+test io::exec::rowids::test::test_stats ... ok
+test io::exec::scalar_index::tests::no_context_scalar_index ... ok
+test io::exec::scan::tests::no_context_scan ... ok
+test io::exec::take::tests::no_context_take ... ok
+test io::exec::take::tests::test_simple_take::take_input_1_TakeInput__Ids ... ok
+test io::exec::scalar_index::tests::test_materialize_index_exec ... ok
+test io::exec::take::tests::test_simple_take::take_input_2_TakeInput__Addrs ... ok
+test io::exec::take::tests::test_take_no_row_addr ... ok
+test io::exec::take::tests::test_simple_take::take_input_3_TakeInput__IdsAndAddrs ... ok
+test io::exec::take::tests::test_take_order ... ok
+test io::exec::take::tests::test_take_schema ... ok
+test io::exec::take::tests::test_with_new_children ... ok
+test io::exec::take::tests::test_take_struct ... ok
+test session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_1_LanceFileVersion__Legacy ... FAILED
+test io::exec::utils::tests::test_replay ... ok
+test session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_2_LanceFileVersion__Stable ... FAILED
+test utils::future::tests::test_spawn_prereq ... ok
+test session::tests::test_disable_index_cache ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq::case_1 ... ok
+test io::exec::knn::tests::test_dataset_too_small::num_deltas_1_1 ... ok
+test utils::test::tests::test_make_fragment::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test utils::test::tests::test_make_schema::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test utils::test::tests::test_make_schema::data_storage_version_2_LanceFileVersion__Stable ... ok
+test utils::test::tests::test_make_fragment::data_storage_version_2_LanceFileVersion__Stable ... ok
+test utils::test::tests::test_make_hostile::data_storage_version_2_LanceFileVersion__Stable ... ok
+test io::exec::knn::tests::test_fewer_than_k_results::num_deltas_1_1 ... ok
+test utils::test::tests::test_make_hostile::data_storage_version_1_LanceFileVersion__Legacy ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_5 ... ok
+test io::exec::knn::tests::test_no_max_nprobes::num_deltas_1_1 ... ok
+test io::exec::knn::tests::test_no_prefilter_results::num_deltas_1_1 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_flat::case_2 ... ok
+test index::vector::ivf::tests::test_create_index_nulls::case_1_ivf_pq_l2::index_version_1_IndexFileVersion__Legacy ... ok
+test index::vector::ivf::tests::test_check_cosine_normalization ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_v3::case_4 ... ok
+test io::exec::knn::tests::test_some_max_nprobes::num_deltas_1_1 ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_4bit::case_2 ... ok
+test index::vector::ivf::io::tests::test_merge_multiple_indices ... ok
+test index::vector::ivf::tests::remap_ivf_pq_index ... FAILED
+test index::append::tests::test_append_index ... ok
+test index::tests::test_index_statistics_updated_at_multiple_deltas ... ok
+test dataset::scanner::test::test_plans::data_storage_version_1_LanceFileVersion__Legacy::stable_row_id_1_false ... ok
+test index::append::tests::test_query_delta_indices::index_params_1_VectorIndexParams__ivf_pq_2_8_4_MetricType__L2_2_ ... ok
+test dataset::scanner::test::test_plans::data_storage_version_1_LanceFileVersion__Legacy::stable_row_id_2_true ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_4bit::case_3 ... ok
+test index::append::tests::test_query_delta_indices::index_params_2_VectorIndexParams__with_ivf_hnsw_sq_params_MetricType__L2_IvfBui ... ok
+test index::tests::test_optimize_ivf_hnsw_sq_delta_indices ... ok
+test index::tests::test_optimize_delta_indices ... ok
+test index::vector::ivf::v2::tests::test_build_ivf_pq_4bit::case_1 ... ok
+test index::tests::test_count_index_rows ... ok
+test dataset::tests::test_search_empty_after_delete::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_1_false ... ok
+test index::vector::ivf::v2::tests::test_create_ivf_hnsw_pq::case_3 ... ok
+test dataset::tests::test_search_empty_after_delete::data_storage_version_2_LanceFileVersion__Stable::use_stable_row_id_2_true ... ok
+test dataset::tests::test_search_empty_after_delete::data_storage_version_1_LanceFileVersion__Legacy::use_stable_row_id_1_false ... ok
+test io::commit::external_manifest::test::test_concurrent_commits_are_okay ... ok
+
+failures:
+
+---- index::tests::test_load_indices stdout ----
+
+thread 'index::tests::test_load_indices' panicked at rust/lance/src/index.rs:2195:9:
+assertion `left == right` failed
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- dataset::optimize::tests::test_read_ngram_index_with_defer_index_remap stdout ----
+
+thread 'dataset::optimize::tests::test_read_ngram_index_with_defer_index_remap' panicked at rust/lance/src/dataset/optimize.rs:3123:9:
+assertion `left == right` failed
+  left: 0
+ right: 5
+
+---- io::commit::dynamodb::test::test_dataset_can_onboard_external_store stdout ----
+
+thread 'io::commit::dynamodb::test::test_dataset_can_onboard_external_store' panicked at rust/lance/src/io/commit/dynamodb.rs:118:14:
+called `Result::unwrap()` on an `Err` value: DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:4566, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } })
+
+---- io::commit::dynamodb::test::test_can_create_dataset_with_external_store stdout ----
+
+thread 'io::commit::dynamodb::test::test_can_create_dataset_with_external_store' panicked at rust/lance/src/io/commit/dynamodb.rs:118:14:
+called `Result::unwrap()` on an `Err` value: DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:4566, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } })
+
+---- io::commit::dynamodb::test::test_concurrent_commits_are_okay stdout ----
+
+thread 'io::commit::dynamodb::test::test_concurrent_commits_are_okay' panicked at rust/lance/src/io/commit/dynamodb.rs:118:14:
+called `Result::unwrap()` on an `Err` value: DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:4566, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } })
+
+---- io::commit::dynamodb::test::test_out_of_sync_dataset_can_recover stdout ----
+
+thread 'io::commit::dynamodb::test::test_out_of_sync_dataset_can_recover' panicked at rust/lance/src/io/commit/dynamodb.rs:118:14:
+called `Result::unwrap()` on an `Err` value: DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:4566, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } })
+
+---- io::commit::dynamodb::test::test_store stdout ----
+
+thread 'io::commit::dynamodb::test::test_store' panicked at rust/lance/src/io/commit/dynamodb.rs:118:14:
+called `Result::unwrap()` on an `Err` value: DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", 127.0.0.1:4566, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" })), connection: Unknown } })
+
+---- io::commit::s3_test::test_concurrent_writers stdout ----
+
+thread 'io::commit::s3_test::test_concurrent_writers' panicked at rust/lance/src/io/commit/s3_test.rs:63:23:
+Failed to list objects in bucket: unhandled error
+
+---- io::commit::s3_test::test_ddb_open_iops stdout ----
+
+thread 'io::commit::s3_test::test_ddb_open_iops' panicked at rust/lance/src/io/commit/s3_test.rs:63:23:
+Failed to list objects in bucket: unhandled error
+
+---- io::exec::knn::tests::test_dataset_too_small::num_deltas_2_20 stdout ----
+[2025-06-27T17:10:29Z WARN  lance::dataset::write::insert] No existing dataset at /tmp/.tmplsnnbi, it will be created
+[2025-06-27T17:10:29Z INFO  lance::index::vector::ivf] Pre-computed IVF centroids is provided, skip IVF training
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] loading training data for quantizer. sample size: 65536
+[2025-06-27T17:10:29Z INFO  lance::index::vector::utils] Sample training data: retrieved 500 rows scanning full datasets
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Finished loading training data in 0.003144059 seconds
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Start to train quantizer
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Trained quantizer in 0.000007471 seconds
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] shuffle column vector over dataset
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] merging partition 1/100
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] merging partition 2/100
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] merging partition 3/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 4/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 5/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 6/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 7/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 8/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 9/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 10/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 11/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 12/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 13/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 14/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 15/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 16/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 17/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 18/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 19/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 20/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 21/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 22/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 23/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 24/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 25/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 26/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 27/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 28/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 29/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 30/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 31/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 32/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 33/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 34/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 35/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 36/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 37/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 38/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 39/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 40/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 41/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 42/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 43/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 44/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 45/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 46/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 47/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 48/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 49/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 50/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 51/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 52/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 53/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 54/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 55/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 56/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 57/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 58/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 59/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 60/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 61/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 62/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 63/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 64/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 65/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 66/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 67/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 68/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 69/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 70/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 71/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 72/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 73/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 74/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 75/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 76/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 77/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 78/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 79/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 80/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 81/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 82/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 83/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 84/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 85/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 86/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 87/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 88/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 89/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 90/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 91/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 92/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 93/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 94/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 95/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 96/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 97/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 98/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 99/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 100/100
+
+thread 'io::exec::knn::tests::test_dataset_too_small::num_deltas_2_20' panicked at rust/lance/src/index.rs:917:14:
+Fragment reuse index UUID should be set
+
+---- io::exec::knn::tests::test_fewer_than_k_results::num_deltas_2_20 stdout ----
+[2025-06-27T17:10:29Z WARN  lance::dataset::write::insert] No existing dataset at /tmp/.tmp7Kwflt, it will be created
+[2025-06-27T17:10:29Z INFO  lance::index::vector::ivf] Pre-computed IVF centroids is provided, skip IVF training
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] loading training data for quantizer. sample size: 65536
+[2025-06-27T17:10:29Z INFO  lance::index::vector::utils] Sample training data: retrieved 500 rows scanning full datasets
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Finished loading training data in 0.002750073 seconds
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Start to train quantizer
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] Trained quantizer in 0.000007719 seconds
+[2025-06-27T17:10:29Z INFO  lance::index::vector::builder] shuffle column vector over dataset
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 1/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 2/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 3/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 4/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 5/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 6/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 7/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 8/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 9/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 10/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 11/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 12/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 13/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 14/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 15/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 16/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 17/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 18/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 19/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 20/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 21/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 22/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 23/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 24/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 25/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 26/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 27/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 28/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 29/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 30/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 31/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 32/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 33/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 34/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 35/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 36/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 37/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 38/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 39/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 40/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 41/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 42/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 43/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 44/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 45/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 46/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 47/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 48/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 49/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 50/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 51/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 52/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 53/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 54/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 55/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 56/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 57/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 58/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 59/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 60/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 61/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 62/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 63/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 64/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 65/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 66/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 67/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 68/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 69/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 70/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 71/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 72/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 73/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 74/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 75/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 76/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 77/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 78/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 79/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 80/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 81/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 82/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 83/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 84/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 85/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 86/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 87/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 88/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 89/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 90/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 91/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 92/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 93/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 94/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 95/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 96/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 97/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 98/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 99/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 100/100
+
+thread 'io::exec::knn::tests::test_fewer_than_k_results::num_deltas_2_20' panicked at rust/lance/src/index.rs:917:14:
+Fragment reuse index UUID should be set
+
+---- io::exec::knn::tests::test_no_max_nprobes::num_deltas_2_20 stdout ----
+[2025-06-27T17:10:30Z WARN  lance::dataset::write::insert] No existing dataset at /tmp/.tmpkHRlbV, it will be created
+[2025-06-27T17:10:30Z INFO  lance::index::vector::ivf] Pre-computed IVF centroids is provided, skip IVF training
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] loading training data for quantizer. sample size: 65536
+[2025-06-27T17:10:30Z INFO  lance::index::vector::utils] Sample training data: retrieved 500 rows scanning full datasets
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Finished loading training data in 0.004185014 seconds
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Start to train quantizer
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Trained quantizer in 0.000008452 seconds
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] shuffle column vector over dataset
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 1/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 2/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 3/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 4/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 5/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 6/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 7/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 8/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 9/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 10/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 11/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 12/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 13/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 14/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 15/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 16/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 17/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 18/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 19/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 20/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 21/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 22/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 23/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 24/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 25/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 26/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 27/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 28/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 29/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 30/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 31/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 32/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 33/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 34/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 35/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 36/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 37/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 38/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 39/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 40/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 41/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 42/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 43/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 44/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 45/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 46/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 47/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 48/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 49/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 50/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 51/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 52/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 53/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 54/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 55/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 56/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 57/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 58/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 59/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 60/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 61/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 62/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 63/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 64/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 65/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 66/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 67/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 68/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 69/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 70/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 71/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 72/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 73/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 74/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 75/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 76/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 77/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 78/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 79/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 80/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 81/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 82/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 83/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 84/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 85/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 86/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 87/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 88/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 89/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 90/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 91/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 92/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 93/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 94/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 95/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 96/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 97/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 98/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 99/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 100/100
+
+thread 'io::exec::knn::tests::test_no_max_nprobes::num_deltas_2_20' panicked at rust/lance/src/index.rs:917:14:
+Fragment reuse index UUID should be set
+
+---- io::exec::knn::tests::test_no_prefilter_results::num_deltas_2_20 stdout ----
+[2025-06-27T17:10:30Z WARN  lance::dataset::write::insert] No existing dataset at /tmp/.tmpqiRFEp, it will be created
+[2025-06-27T17:10:30Z INFO  lance::index::vector::ivf] Pre-computed IVF centroids is provided, skip IVF training
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] loading training data for quantizer. sample size: 65536
+[2025-06-27T17:10:30Z INFO  lance::index::vector::utils] Sample training data: retrieved 500 rows scanning full datasets
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Finished loading training data in 0.005680363 seconds
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Start to train quantizer
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] Trained quantizer in 0.000009121 seconds
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] shuffle column vector over dataset
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 1/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 2/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 3/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 4/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 5/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 6/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 7/100
+[2025-06-27T17:10:30Z INFO  lance::index::vector::builder] merging partition 8/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 9/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 10/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 11/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 12/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 13/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 14/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 15/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 16/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 17/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 18/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 19/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 20/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 21/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 22/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 23/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 24/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 25/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 26/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 27/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 28/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 29/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 30/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 31/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 32/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 33/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 34/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 35/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 36/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 37/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 38/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 39/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 40/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 41/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 42/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 43/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 44/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 45/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 46/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 47/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 48/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 49/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 50/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 51/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 52/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 53/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 54/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 55/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 56/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 57/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 58/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 59/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 60/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 61/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 62/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 63/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 64/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 65/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 66/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 67/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 68/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 69/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 70/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 71/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 72/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 73/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 74/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 75/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 76/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 77/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 78/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 79/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 80/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 81/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 82/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 83/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 84/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 85/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 86/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 87/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 88/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 89/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 90/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 91/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 92/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 93/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 94/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 95/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 96/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 97/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 98/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 99/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 100/100
+
+thread 'io::exec::knn::tests::test_no_prefilter_results::num_deltas_2_20' panicked at rust/lance/src/index.rs:917:14:
+Fragment reuse index UUID should be set
+
+---- io::exec::knn::tests::test_some_max_nprobes::num_deltas_2_20 stdout ----
+[2025-06-27T17:10:31Z WARN  lance::dataset::write::insert] No existing dataset at /tmp/.tmpQM9DNi, it will be created
+[2025-06-27T17:10:31Z INFO  lance::index::vector::ivf] Pre-computed IVF centroids is provided, skip IVF training
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] loading training data for quantizer. sample size: 65536
+[2025-06-27T17:10:31Z INFO  lance::index::vector::utils] Sample training data: retrieved 500 rows scanning full datasets
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] Finished loading training data in 0.002965978 seconds
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] Start to train quantizer
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] Trained quantizer in 0.000008633 seconds
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] shuffle column vector over dataset
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 1/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 2/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 3/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 4/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 5/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 6/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 7/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 8/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 9/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 10/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 11/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 12/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 13/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 14/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 15/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 16/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 17/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 18/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 19/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 20/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 21/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 22/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 23/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 24/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 25/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 26/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 27/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 28/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 29/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 30/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 31/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 32/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 33/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 34/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 35/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 36/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 37/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 38/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 39/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 40/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 41/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 42/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 43/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 44/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 45/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 46/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 47/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 48/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 49/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 50/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 51/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 52/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 53/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 54/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 55/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 56/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 57/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 58/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 59/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 60/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 61/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 62/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 63/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 64/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 65/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 66/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 67/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 68/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 69/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 70/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 71/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 72/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 73/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 74/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 75/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 76/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 77/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 78/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 79/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 80/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 81/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 82/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 83/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 84/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 85/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 86/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 87/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 88/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 89/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 90/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 91/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 92/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 93/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 94/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 95/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 96/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 97/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 98/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 99/100
+[2025-06-27T17:10:31Z INFO  lance::index::vector::builder] merging partition 100/100
+
+thread 'io::exec::knn::tests::test_some_max_nprobes::num_deltas_2_20' panicked at rust/lance/src/index.rs:917:14:
+Fragment reuse index UUID should be set
+
+---- session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_1_LanceFileVersion__Legacy stdout ----
+
+thread 'session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_1_LanceFileVersion__Legacy' panicked at rust/lance/src/session/index_extension.rs:97:13:
+not yet implemented
+
+---- session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_2_LanceFileVersion__Stable stdout ----
+
+thread 'session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_2_LanceFileVersion__Stable' panicked at rust/lance/src/session/index_extension.rs:97:13:
+not yet implemented
+
+---- index::vector::ivf::tests::remap_ivf_pq_index stdout ----
+[2025-06-27T17:10:32Z INFO  lance::index::vector::pq] Trained PQ in: 30.045982 seconds
+[2025-06-27T17:10:32Z INFO  lance_index::vector::ivf::shuffler] Calculating IVF partitions for vectors (num_partitions=2, precomputed_partitions=false)
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Writing unsorted data to disk at tmp/.tmp77xoxk/unsorted.lance
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] with schema: Schema { fields: [Field { name: "_rowid", data_type: UInt64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "__ivf_part_id", data_type: UInt32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "__pq_code", data_type: FixedSizeList(Field { name: "item", data_type: UInt8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, 4), nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }], metadata: {"_loss": "22632448.33251953"} }
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Partition assignment progress 0/?
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] wrote partition assignment to unsorted tmp file in 151.74314ms
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Sorting unsorted data into sorted chunks (batches_per_chunk=10240 concurrent_jobs=2)
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Shuffling into memory
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Shuffle Progress 0/1
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Chunk loaded into memory and sorted, writing to disk at tmp/.tmp77xoxk/sorted_0.lance
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] Writing partition 0/2
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] created sorted chunks in 4.932838ms
+[2025-06-27T17:10:33Z INFO  lance_index::vector::ivf::shuffler] merged partitioned shuffles in 409.097µs
+[2025-06-27T17:10:33Z INFO  lance::index::vector::ivf::io] Wrote partition 0 in 0 ms
+[2025-06-27T17:10:33Z INFO  lance::index::vector::ivf::io] Wrote partition 1 in 0 ms
+[2025-06-27T17:10:33Z INFO  lance::index::vector::ivf] Built IVF partitions: 0.1584241s
+
+thread 'index::vector::ivf::tests::remap_ivf_pq_index' panicked at rust/lance/src/index.rs:998:14:
+Fragment reuse index UUID should be set
+
+
+failures:
+    dataset::optimize::tests::test_read_ngram_index_with_defer_index_remap
+    index::tests::test_load_indices
+    index::vector::ivf::tests::remap_ivf_pq_index
+    io::commit::dynamodb::test::test_can_create_dataset_with_external_store
+    io::commit::dynamodb::test::test_concurrent_commits_are_okay
+    io::commit::dynamodb::test::test_dataset_can_onboard_external_store
+    io::commit::dynamodb::test::test_out_of_sync_dataset_can_recover
+    io::commit::dynamodb::test::test_store
+    io::commit::s3_test::test_concurrent_writers
+    io::commit::s3_test::test_ddb_open_iops
+    io::exec::knn::tests::test_dataset_too_small::num_deltas_2_20
+    io::exec::knn::tests::test_fewer_than_k_results::num_deltas_2_20
+    io::exec::knn::tests::test_no_max_nprobes::num_deltas_2_20
+    io::exec::knn::tests::test_no_prefilter_results::num_deltas_2_20
+    io::exec::knn::tests::test_some_max_nprobes::num_deltas_2_20
+    session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_1_LanceFileVersion__Legacy
+    session::index_extension::test::test_vector_index_extension_roundtrip::data_storage_version_2_LanceFileVersion__Stable
+
+test result: FAILED. 544 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.93s
+
+error: test failed, to rerun pass `-p lance --lib`
