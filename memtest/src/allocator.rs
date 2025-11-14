@@ -1,24 +1,20 @@
 use crate::stats::STATS;
 use libc::{c_void, size_t};
-use std::cell::Cell;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 type MallocFn = unsafe extern "C" fn(size_t) -> *mut c_void;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type CallocFn = unsafe extern "C" fn(size_t, size_t) -> *mut c_void;
 type ReallocFn = unsafe extern "C" fn(*mut c_void, size_t) -> *mut c_void;
 
-static INIT: Once = Once::new();
-static mut REAL_MALLOC: Option<MallocFn> = None;
-static mut REAL_FREE: Option<FreeFn> = None;
-static mut REAL_CALLOC: Option<CallocFn> = None;
-static mut REAL_REALLOC: Option<ReallocFn> = None;
+static REAL_MALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static REAL_FREE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static REAL_CALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static REAL_REALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static INITIALIZING: AtomicBool = AtomicBool::new(false);
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
-
-thread_local! {
-    static IN_HOOK: Cell<bool> = const { Cell::new(false) };
-}
 
 extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const libc::c_char) -> *mut c_void;
@@ -26,29 +22,35 @@ extern "C" {
 
 /// Initialize the function pointers to the real allocation functions
 unsafe fn init_real_functions() {
-    INIT.call_once(|| {
-        // Prevent recursion during initialization
-        IN_HOOK.with(|flag| flag.set(true));
+    // If already initialized, return
+    if INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
 
-        REAL_MALLOC = Some(std::mem::transmute(dlsym(
-            RTLD_NEXT,
-            b"malloc\0".as_ptr() as *const libc::c_char,
-        )));
-        REAL_FREE = Some(std::mem::transmute(dlsym(
-            RTLD_NEXT,
-            b"free\0".as_ptr() as *const libc::c_char,
-        )));
-        REAL_CALLOC = Some(std::mem::transmute(dlsym(
-            RTLD_NEXT,
-            b"calloc\0".as_ptr() as *const libc::c_char,
-        )));
-        REAL_REALLOC = Some(std::mem::transmute(dlsym(
-            RTLD_NEXT,
-            b"realloc\0".as_ptr() as *const libc::c_char,
-        )));
+    // Try to set initializing flag
+    if INITIALIZING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Someone else is initializing, spin wait
+        while !INITIALIZED.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        return;
+    }
 
-        IN_HOOK.with(|flag| flag.set(false));
-    });
+    // We're the one initializing
+    let malloc_ptr = dlsym(RTLD_NEXT, b"malloc\0".as_ptr() as *const libc::c_char);
+    let free_ptr = dlsym(RTLD_NEXT, b"free\0".as_ptr() as *const libc::c_char);
+    let calloc_ptr = dlsym(RTLD_NEXT, b"calloc\0".as_ptr() as *const libc::c_char);
+    let realloc_ptr = dlsym(RTLD_NEXT, b"realloc\0".as_ptr() as *const libc::c_char);
+
+    REAL_MALLOC.store(malloc_ptr, Ordering::Release);
+    REAL_FREE.store(free_ptr, Ordering::Release);
+    REAL_CALLOC.store(calloc_ptr, Ordering::Release);
+    REAL_REALLOC.store(realloc_ptr, Ordering::Release);
+
+    INITIALIZED.store(true, Ordering::Release);
 }
 
 /// Store allocation size in a header before the returned pointer
@@ -61,49 +63,37 @@ const HEADER_SIZE: usize = std::mem::size_of::<AllocationHeader>();
 
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
-    // Check if we're already in a hook to prevent recursion
-    let in_hook = IN_HOOK.with(|flag| {
-        if flag.get() {
-            true
-        } else {
-            flag.set(true);
-            false
-        }
-    });
-
-    if in_hook {
-        // We're in recursion, just call the real malloc
-        init_real_functions();
-        if let Some(real_malloc) = REAL_MALLOC {
-            return real_malloc(size);
-        }
+    // If we're currently initializing, forward directly to avoid recursion
+    if INITIALIZING.load(Ordering::Acquire) && !INITIALIZED.load(Ordering::Acquire) {
+        // During initialization, dlsym might call malloc
+        // We can't use RTLD_NEXT here, so we'll just use a simple bump allocator
+        // or return null and hope dlsym handles it
         return std::ptr::null_mut();
     }
 
     init_real_functions();
 
-    let result = if let Some(real_malloc) = REAL_MALLOC {
-        let total_size = size + HEADER_SIZE;
-        let ptr = real_malloc(total_size);
+    let malloc_ptr = REAL_MALLOC.load(Ordering::Acquire);
+    if malloc_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
-        if !ptr.is_null() {
-            // Store size in header
-            let header = ptr as *mut AllocationHeader;
-            (*header).size = size;
+    let real_malloc: MallocFn = std::mem::transmute(malloc_ptr);
+    let total_size = size.saturating_add(HEADER_SIZE);
+    let ptr = real_malloc(total_size);
 
-            STATS.record_allocation(size);
+    if !ptr.is_null() {
+        // Store size in header
+        let header = ptr as *mut AllocationHeader;
+        (*header).size = size;
 
-            // Return pointer after header
-            ptr.add(HEADER_SIZE)
-        } else {
-            ptr
-        }
+        STATS.record_allocation(size);
+
+        // Return pointer after header
+        ptr.add(HEADER_SIZE)
     } else {
-        std::ptr::null_mut()
-    };
-
-    IN_HOOK.with(|flag| flag.set(false));
-    result
+        ptr
+    }
 }
 
 #[no_mangle]
@@ -112,145 +102,107 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
         return;
     }
 
-    // Check if we're already in a hook to prevent recursion
-    let in_hook = IN_HOOK.with(|flag| {
-        if flag.get() {
-            true
-        } else {
-            flag.set(true);
-            false
-        }
-    });
+    // If called during initialization, do nothing (malloc returned null anyway)
+    if INITIALIZING.load(Ordering::Acquire) && !INITIALIZED.load(Ordering::Acquire) {
+        return;
+    }
 
     init_real_functions();
 
-    if let Some(real_free) = REAL_FREE {
-        if in_hook {
-            // We're in recursion, just call the real free
-            real_free(ptr);
-            return;
-        }
-
-        // Get the actual allocation pointer (before header)
-        let actual_ptr = (ptr as *mut u8).sub(HEADER_SIZE);
-        let header = actual_ptr as *mut AllocationHeader;
-        let size = (*header).size;
-
-        STATS.record_deallocation(size);
-
-        real_free(actual_ptr as *mut c_void);
-
-        IN_HOOK.with(|flag| flag.set(false));
+    let free_ptr = REAL_FREE.load(Ordering::Acquire);
+    if free_ptr.is_null() {
+        return;
     }
+
+    let real_free: FreeFn = std::mem::transmute(free_ptr);
+
+    // Get the actual allocation pointer (before header)
+    let actual_ptr = (ptr as *mut u8).sub(HEADER_SIZE);
+    let header = actual_ptr as *mut AllocationHeader;
+    let size = (*header).size;
+
+    STATS.record_deallocation(size);
+
+    real_free(actual_ptr as *mut c_void);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn calloc(nmemb: size_t, size: size_t) -> *mut c_void {
-    let in_hook = IN_HOOK.with(|flag| {
-        if flag.get() {
-            true
-        } else {
-            flag.set(true);
-            false
-        }
-    });
-
-    if in_hook {
-        init_real_functions();
-        if let Some(real_calloc) = REAL_CALLOC {
-            return real_calloc(nmemb, size);
-        }
+    if INITIALIZING.load(Ordering::Acquire) && !INITIALIZED.load(Ordering::Acquire) {
         return std::ptr::null_mut();
     }
 
     init_real_functions();
 
-    let result = if let Some(real_calloc) = REAL_CALLOC {
-        let total_size = nmemb * size;
-        let allocation_size = total_size + HEADER_SIZE;
+    let calloc_ptr = REAL_CALLOC.load(Ordering::Acquire);
+    if calloc_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
-        let ptr = real_calloc(allocation_size, 1);
+    let real_calloc: CallocFn = std::mem::transmute(calloc_ptr);
+    let total_size = nmemb.saturating_mul(size);
+    let allocation_size = total_size.saturating_add(HEADER_SIZE);
 
-        if !ptr.is_null() {
-            let header = ptr as *mut AllocationHeader;
-            (*header).size = total_size;
+    let ptr = real_calloc(allocation_size, 1);
 
-            STATS.record_allocation(total_size);
+    if !ptr.is_null() {
+        let header = ptr as *mut AllocationHeader;
+        (*header).size = total_size;
 
-            ptr.add(HEADER_SIZE)
-        } else {
-            ptr
-        }
+        STATS.record_allocation(total_size);
+
+        ptr.add(HEADER_SIZE)
     } else {
-        std::ptr::null_mut()
-    };
-
-    IN_HOOK.with(|flag| flag.set(false));
-    result
+        ptr
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
-    let in_hook = IN_HOOK.with(|flag| {
-        if flag.get() {
-            true
-        } else {
-            flag.set(true);
-            false
-        }
-    });
-
-    if in_hook {
-        init_real_functions();
-        if let Some(real_realloc) = REAL_REALLOC {
-            return real_realloc(ptr, size);
-        }
+    if INITIALIZING.load(Ordering::Acquire) && !INITIALIZED.load(Ordering::Acquire) {
         return std::ptr::null_mut();
     }
 
     init_real_functions();
 
-    let result = if let Some(real_realloc) = REAL_REALLOC {
-        if ptr.is_null() {
-            // realloc(NULL, size) is equivalent to malloc(size)
-            // Note: This will set the flag again, but that's handled
-            IN_HOOK.with(|flag| flag.set(false));
-            return malloc(size);
-        }
+    let realloc_ptr = REAL_REALLOC.load(Ordering::Acquire);
+    if realloc_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
-        if size == 0 {
-            // realloc(ptr, 0) is equivalent to free(ptr)
-            IN_HOOK.with(|flag| flag.set(false));
-            free(ptr);
-            return std::ptr::null_mut();
-        }
+    let real_realloc: ReallocFn = std::mem::transmute(realloc_ptr);
 
-        // Get old size from header
-        let actual_ptr = (ptr as *mut u8).sub(HEADER_SIZE);
-        let old_header = actual_ptr as *mut AllocationHeader;
-        let old_size = (*old_header).size;
+    if ptr.is_null() {
+        // realloc(NULL, size) is equivalent to malloc(size)
+        return malloc(size);
+    }
 
-        // Reallocate with new size
-        let total_size = size + HEADER_SIZE;
-        let new_ptr = real_realloc(actual_ptr as *mut c_void, total_size);
+    if size == 0 {
+        // realloc(ptr, 0) is equivalent to free(ptr)
+        free(ptr);
+        return std::ptr::null_mut();
+    }
 
-        if !new_ptr.is_null() {
-            // Update header with new size
-            let new_header = new_ptr as *mut AllocationHeader;
-            (*new_header).size = size;
+    // Get old size from header
+    let actual_ptr = (ptr as *mut u8).sub(HEADER_SIZE);
+    let old_header = actual_ptr as *mut AllocationHeader;
+    let old_size = (*old_header).size;
 
-            // Record the change in allocation
-            STATS.record_deallocation(old_size);
-            STATS.record_allocation(size);
+    // Reallocate with new size
+    let total_size = size.saturating_add(HEADER_SIZE);
+    let new_ptr = real_realloc(actual_ptr as *mut c_void, total_size);
 
-            new_ptr.add(HEADER_SIZE)
-        } else {
-            new_ptr
-        }
+    if !new_ptr.is_null() {
+        // Update header with new size
+        let new_header = new_ptr as *mut AllocationHeader;
+        (*new_header).size = size;
+
+        // Record the change in allocation
+        STATS.record_deallocation(old_size);
+        STATS.record_allocation(size);
+
+        new_ptr.add(HEADER_SIZE)
     } else {
-        std::ptr::null_mut()
-    };
-
-    IN_HOOK.with(|flag| flag.set(false));
-    result
+        new_ptr
+    }
 }

@@ -27,7 +27,8 @@ impl AllocationStats {
         self.total_bytes_allocated
             .fetch_add(size as u64, Ordering::Relaxed);
 
-        let current = self.current_bytes.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+        let prev = self.current_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        let current = prev.saturating_add(size as u64);
 
         // Update peak if necessary
         let mut peak = self.peak_bytes.load(Ordering::Relaxed);
@@ -48,7 +49,13 @@ impl AllocationStats {
         self.total_deallocations.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_deallocated
             .fetch_add(size as u64, Ordering::Relaxed);
-        self.current_bytes.fetch_sub(size as u64, Ordering::Relaxed);
+
+        // Use fetch_update to perform saturating subtraction atomically
+        self.current_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(size as u64))
+            })
+            .ok();
     }
 
     pub fn reset(&self) {

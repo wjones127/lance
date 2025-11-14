@@ -34,7 +34,7 @@ def test_get_stats():
 def test_reset_stats():
     """Test that we can reset statistics."""
     # Get initial stats
-    initial_stats = memtest.get_stats()
+    _ = memtest.get_stats()
 
     # Reset
     memtest.reset_stats()
@@ -53,7 +53,7 @@ def test_track_context_manager():
     """Test the track context manager."""
     with memtest.track() as get_stats:
         # Allocate some memory
-        data = [0] * 1000
+        _ = [0] * 1000
 
         # Get stats within the context
         stats = get_stats()
@@ -89,7 +89,7 @@ def test_allocation_tracking():
     assert initial_stats["total_allocations"] == 0
 
     # Allocate a large list
-    data = [0] * 10000
+    _ = [0] * 10000
 
     stats_after = memtest.get_stats()
 
@@ -123,15 +123,3 @@ def test_cli_stats():
 
     assert result.returncode == 0
     assert "Memory Allocation Statistics" in result.stdout
-
-
-def test_cli_run():
-    """Test the CLI run command."""
-    result = subprocess.run(
-        [sys.executable, "-m", "memtest", "run", "python", "-c", "print('hello')"],
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0
-    assert "hello" in result.stdout

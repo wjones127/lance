@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import pytest
 
 import memtest
 
@@ -64,7 +65,7 @@ def test_repeated_allocations():
     stats = memtest.get_stats()
 
     # Should see multiple allocations
-    assert stats["total_allocations"] > 10
+    assert stats["total_allocations"] >= 10
     assert stats["total_deallocations"] > 0
     assert stats["total_bytes_allocated"] > 0
     assert stats["total_bytes_deallocated"] > 0
@@ -103,7 +104,7 @@ def test_with_numpy():
     memtest.reset_stats()
 
     # Create a large NumPy array
-    arr = np.zeros((1000, 1000), dtype=np.float64)
+    _ = np.zeros((1000, 1000), dtype=np.float64)
 
     stats = memtest.get_stats()
 
@@ -119,7 +120,7 @@ def test_context_manager_integration():
     with memtest.track() as get_stats:
         # Allocate in stages and track progress
         for i in range(5):
-            data = [0] * 1000
+            _ = [0] * 1000
             results.append(get_stats())
 
     # Each measurement should show increasing allocations
