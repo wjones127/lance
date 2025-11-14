@@ -61,6 +61,7 @@ tests = [
     "tensorflow; sys_platform == 'linux'",
     "tqdm",
     "datafusion>=50.1",
+    # TODO: Make memtest a dependency.
 ]
 dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
