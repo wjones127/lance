@@ -29,20 +29,7 @@ impl AllocationStats {
 
         let prev = self.current_bytes.fetch_add(size as u64, Ordering::Relaxed);
         let current = prev.saturating_add(size as u64);
-
-        // Update peak if necessary
-        let mut peak = self.peak_bytes.load(Ordering::Relaxed);
-        while current > peak {
-            match self.peak_bytes.compare_exchange_weak(
-                peak,
-                current,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(p) => peak = p,
-            }
-        }
+        self.peak_bytes.fetch_max(current, Ordering::Relaxed);
     }
 
     pub fn record_deallocation(&self, size: usize) {
@@ -66,27 +53,6 @@ impl AllocationStats {
         self.current_bytes.store(0, Ordering::Relaxed);
         self.peak_bytes.store(0, Ordering::Relaxed);
     }
-
-    pub fn get_snapshot(&self) -> StatsSnapshot {
-        StatsSnapshot {
-            total_allocations: self.total_allocations.load(Ordering::Relaxed),
-            total_deallocations: self.total_deallocations.load(Ordering::Relaxed),
-            total_bytes_allocated: self.total_bytes_allocated.load(Ordering::Relaxed),
-            total_bytes_deallocated: self.total_bytes_deallocated.load(Ordering::Relaxed),
-            current_bytes: self.current_bytes.load(Ordering::Relaxed),
-            peak_bytes: self.peak_bytes.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct StatsSnapshot {
-    pub total_allocations: u64,
-    pub total_deallocations: u64,
-    pub total_bytes_allocated: u64,
-    pub total_bytes_deallocated: u64,
-    pub current_bytes: u64,
-    pub peak_bytes: u64,
 }
 
 /// Global statistics instance

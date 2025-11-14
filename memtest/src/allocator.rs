@@ -40,10 +40,10 @@ unsafe fn init_real_functions() {
     }
 
     // We're the one initializing
-    let malloc_ptr = dlsym(RTLD_NEXT, b"malloc\0".as_ptr() as *const libc::c_char);
-    let free_ptr = dlsym(RTLD_NEXT, b"free\0".as_ptr() as *const libc::c_char);
-    let calloc_ptr = dlsym(RTLD_NEXT, b"calloc\0".as_ptr() as *const libc::c_char);
-    let realloc_ptr = dlsym(RTLD_NEXT, b"realloc\0".as_ptr() as *const libc::c_char);
+    let malloc_ptr = dlsym(RTLD_NEXT, c"malloc".as_ptr() as *const libc::c_char);
+    let free_ptr = dlsym(RTLD_NEXT, c"free".as_ptr() as *const libc::c_char);
+    let calloc_ptr = dlsym(RTLD_NEXT, c"calloc".as_ptr() as *const libc::c_char);
+    let realloc_ptr = dlsym(RTLD_NEXT, c"realloc".as_ptr() as *const libc::c_char);
 
     REAL_MALLOC.store(malloc_ptr, Ordering::Release);
     REAL_FREE.store(free_ptr, Ordering::Release);
