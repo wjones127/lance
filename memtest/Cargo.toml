@@ -13,7 +13,7 @@ arithmetic_side_effects = "deny"
 
 [lib]
 name = "memtest"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 libc = "0.2"

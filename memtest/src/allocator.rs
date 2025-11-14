@@ -1,61 +1,108 @@
 use crate::stats::STATS;
 use libc::{c_void, size_t};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-
-type MallocFn = unsafe extern "C" fn(size_t) -> *mut c_void;
-type FreeFn = unsafe extern "C" fn(*mut c_void);
-type CallocFn = unsafe extern "C" fn(size_t, size_t) -> *mut c_void;
-type ReallocFn = unsafe extern "C" fn(*mut c_void, size_t) -> *mut c_void;
-
-static REAL_MALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static REAL_FREE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static REAL_CALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static REAL_REALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static INITIALIZING: AtomicBool = AtomicBool::new(false);
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 
 extern "C" {
     #[link_name = "__libc_malloc"]
-    fn libc_malloc( size: size_t ) -> *mut c_void;
+    fn libc_malloc(size: size_t) -> *mut c_void;
     #[link_name = "__libc_calloc"]
-    fn libc_calloc( count: size_t, element_size: size_t ) -> *mut c_void;
+    fn libc_calloc(count: size_t, element_size: size_t) -> *mut c_void;
     #[link_name = "__libc_realloc"]
-    fn libc_realloc( ptr: *mut c_void, size: size_t ) -> *mut c_void;
+    fn libc_realloc(ptr: *mut c_void, size: size_t) -> *mut c_void;
     #[link_name = "__libc_free"]
-    fn libc_free( ptr: *mut c_void );
+    fn libc_free(ptr: *mut c_void);
     #[link_name = "__libc_memalign"]
-    fn libc_memalign( alignment: size_t, size: size_t ) -> *mut c_void;
+    fn libc_memalign(alignment: size_t, size: size_t) -> *mut c_void;
 }
 
-// Implementations of standard allocation functions
-// To track the size on free, we store the size at the start of the allocated block
-// and return a pointer offset by the size of u64 (8 bytes).
+// Magic number to identify our allocations
+const MAGIC: u64 = 0xDEADBEEF_CAFEBABE;
 
-fn extract(virtual_ptr: *mut c_void) -> (usize, *mut c_void) {
-    let actual_ptr = (virtual_ptr as *mut u8).sub(8) as *mut u8;
-    let size_ptr = actual_ptr as *mut u64;
-    let size = unsafe { *size_ptr } as usize;
-    (size, actual_ptr as *mut c_void)
+/// Header stored before each tracked allocation
+#[repr(C)]
+struct AllocationHeader {
+    magic: u64,
+    size: u64,
+    alignment: u64,
+    /// For aligned allocations, stores the actual pointer returned by libc_memalign
+    /// For unaligned allocations, this is unused (but present for consistent size)
+    actual_ptr: u64,
 }
 
-/// Take a allocated pointer and size, store the size, and return the adjusted pointer
-fn to_virtual(actual_ptr: *mut c_void, size: usize) -> *mut c_void {
+const HEADER_SIZE: usize = std::mem::size_of::<AllocationHeader>();
+
+/// Check if a pointer was allocated by us
+unsafe fn is_ours(virtual_ptr: *mut c_void) -> bool {
+    if virtual_ptr.is_null() {
+        return false;
+    }
+    let header_ptr = (virtual_ptr as *mut u8).sub(HEADER_SIZE) as *const AllocationHeader;
+    (*header_ptr).magic == MAGIC
+}
+
+/// Extract size, alignment, and actual pointer from a virtual pointer
+unsafe fn extract(virtual_ptr: *mut c_void) -> (usize, usize, *mut c_void) {
+    let header_ptr = (virtual_ptr as *mut u8).sub(HEADER_SIZE) as *const AllocationHeader;
+    let header = &*header_ptr;
+
+    let size = header.size as usize;
+    let alignment = header.alignment as usize;
+
+    let actual_ptr = if alignment > 0 {
+        // For aligned allocations, the actual pointer is stored in the header
+        header.actual_ptr as *mut c_void
+    } else {
+        // For unaligned allocations, the actual pointer is the header itself
+        header_ptr as *mut c_void
+    };
+
+    (size, alignment, actual_ptr)
+}
+
+/// Take an allocated pointer and size, store header, and return the adjusted pointer
+unsafe fn to_virtual(actual_ptr: *mut c_void, size: usize, alignment: usize) -> *mut c_void {
     if actual_ptr.is_null() {
         return std::ptr::null_mut();
     }
-    let ptr = actual_ptr as *mut u8;
-    unsafe {
-        *(ptr as *mut u64) = size as u64;
+
+    if alignment > 0 {
+        // For aligned allocations:
+        // 1. Find the first aligned position after we have room for the header
+        // 2. Store the header just before that position
+        // 3. Store the actual_ptr in the header so we can free it later
+
+        let actual_addr = actual_ptr as usize;
+        // Find the first address >= actual_addr + HEADER_SIZE that is aligned
+        let min_virtual_addr = actual_addr.saturating_add(HEADER_SIZE);
+        let virtual_addr = (min_virtual_addr.saturating_add(alignment).saturating_sub(1))
+            & !(alignment.saturating_sub(1));
+
+        // Write header just before the aligned virtual address
+        let header_ptr = (virtual_addr.saturating_sub(HEADER_SIZE)) as *mut AllocationHeader;
+        *header_ptr = AllocationHeader {
+            magic: MAGIC,
+            size: size as u64,
+            alignment: alignment as u64,
+            actual_ptr: actual_addr as u64,
+        };
+
+        virtual_addr as *mut c_void
+    } else {
+        // Unaligned allocation - header is at the start
+        let header_ptr = actual_ptr as *mut AllocationHeader;
+        *header_ptr = AllocationHeader {
+            magic: MAGIC,
+            size: size as u64,
+            alignment: 0,
+            actual_ptr: 0, // Unused for unaligned allocations
+        };
+        (actual_ptr as *mut u8).add(HEADER_SIZE) as *mut c_void
     }
-    ptr.add(8) as *mut c_void
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
-    to_virtual(libc_malloc(size + 8), size)
+    to_virtual(libc_malloc(size.saturating_add(HEADER_SIZE)), size, 0)
 }
 
 #[no_mangle]
@@ -64,49 +111,60 @@ pub unsafe extern "C" fn calloc(size: size_t, element_size: size_t) -> *mut c_vo
         return std::ptr::null_mut();
     };
     STATS.record_allocation(total_size);
-    to_virtual(libc_calloc(total_size + 8, 1), total_size)
+    to_virtual(
+        libc_calloc(total_size.saturating_add(HEADER_SIZE), 1),
+        total_size,
+        0,
+    )
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
-    let actual_ptr = if ptr.is_null() {
+    if ptr.is_null() {
         return;
+    }
+
+    if is_ours(ptr) {
+        // It's ours - extract size and track
+        let (size, _alignment, actual_ptr) = extract(ptr);
+        STATS.record_deallocation(size);
+        libc_free(actual_ptr);
     } else {
-        (ptr as *mut u8).sub(8) as *mut c_void
-    };
-    let (size, )
-    let size_ptr = (actual_ptr as *mut u8) as *mut u64;
-    let size = *size_ptr as size_t;
-    STATS.record_deallocation(size);
-    libc_free(actual_ptr as *mut c_void);
+        // Not ours - just free it without tracking
+        libc_free(ptr);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
-    let actual_ptr = if ptr.is_null() {
-        ptr
+    let (old_size, actual_ptr) = if ptr.is_null() || !is_ours(ptr) {
+        // Either null or not ours - don't track
+        if ptr.is_null() {
+            (0, std::ptr::null_mut())
+        } else {
+            // Not ours - just realloc without tracking
+            return libc_realloc(ptr, size);
+        }
     } else {
-        (ptr as *mut u8).sub(8) as *mut c_void
+        let (s, _align, a) = extract(ptr);
+        (s, a)
     };
-    let old_size = if !ptr.is_null() {
-        let size_ptr = (actual_ptr as *mut u8) as *mut u64;
-        *size_ptr as size_t
-    } else {
-        0
-    };
+
     STATS.record_deallocation(old_size);
     STATS.record_allocation(size);
-    let new_ptr = libc_realloc(actual_ptr, size + 8);
-    if new_ptr.is_null() {
-        return std::ptr::null_mut();
-    }
-    new_ptr.add(8) as *mut c_void
+
+    let new_ptr = libc_realloc(actual_ptr, size.saturating_add(HEADER_SIZE));
+    to_virtual(new_ptr, size, 0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memalign(alignment: size_t, size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
-    libc_memalign(alignment, size)
+    // Allocate extra space for header + padding to maintain alignment
+    // We need: header (24 bytes) + actual_ptr (8 bytes) + padding to reach alignment
+    let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
+    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    to_virtual(actual_ptr, size, alignment)
 }
 
 #[no_mangle]
@@ -115,36 +173,41 @@ pub unsafe extern "C" fn posix_memalign(
     alignment: size_t,
     size: size_t,
 ) -> i32 {
-    let ptr = libc_memalign(alignment, size);
-    if ptr.is_null() {
+    STATS.record_allocation(size);
+    let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
+    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    if actual_ptr.is_null() {
         return libc::ENOMEM;
     }
-    STATS.record_allocation(size);
-    *memptr = ptr;
+    *memptr = to_virtual(actual_ptr, size, alignment);
     0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn aligned_alloc(alignment: size_t, size: size_t) -> *mut c_void {
-    // Do we need to adjust this for alignment?
-    let effective_size = size + 8;
     STATS.record_allocation(size);
-    let size = libc_memalign(alignment, size);
+    let extra = alignment.saturating_add(HEADER_SIZE).saturating_add(8);
+    let actual_ptr = libc_memalign(alignment, size.saturating_add(extra));
+    to_virtual(actual_ptr, size, alignment)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn valloc(size: size_t) -> *mut c_void {
     STATS.record_allocation(size);
-    libc_memalign(libc::sysconf(libc::_SC_PAGESIZE) as size_t, size)
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as size_t;
+    let extra = page_size.saturating_add(HEADER_SIZE).saturating_add(8);
+    let actual_ptr = libc_memalign(page_size, size.saturating_add(extra));
+    to_virtual(actual_ptr, size, page_size)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn reallocarray( old_ptr: *mut c_void, count: size_t, element_size: size_t ) -> *mut c_void {
-    let size = count.checked_mul(element_size);
-    if size.is_none() {
+pub unsafe extern "C" fn reallocarray(
+    old_ptr: *mut c_void,
+    count: size_t,
+    element_size: size_t,
+) -> *mut c_void {
+    let Some(size) = count.checked_mul(element_size) else {
         return std::ptr::null_mut();
-    }
-    let size = size.unwrap();
-    STATS.record_allocation(size);
-    libc_realloc( old_ptr, size )
+    };
+    realloc(old_ptr, size)
 }
