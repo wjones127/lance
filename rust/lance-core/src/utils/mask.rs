@@ -3,8 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::iter;
-use std::ops::{Range, RangeBounds};
+use std::ops::{Range, RangeBounds, RangeInclusive};
 use std::{collections::BTreeMap, io::Read};
 
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
@@ -17,20 +16,22 @@ use crate::Result;
 
 use super::address::RowAddress;
 
-/// A row id mask to select or deselect particular row ids
-///
-/// If both the allow_list and the block_list are Some then the only selected
-/// row ids are those that are in the allow_list but not in the block_list
-/// (the block_list takes precedence)
-///
-/// If both the allow_list and the block_list are None (the default) then
-/// all row ids are selected
-#[derive(Clone, Debug, Default, DeepSizeOf)]
-pub struct RowIdMask {
-    /// If Some then only these row ids are selected
-    pub allow_list: Option<RowAddrTreeMap>,
-    /// If Some then these row ids are not selected.
-    pub block_list: Option<RowAddrTreeMap>,
+mod nullable;
+
+pub use nullable::{NullableRowAddrSet, NullableRowIdMask};
+
+/// A mask that selects or deselects rows based on an allow-list or block-list.
+#[derive(Clone, Debug, DeepSizeOf)]
+pub enum RowIdMask {
+    AllowList(RowAddrTreeMap),
+    BlockList(RowAddrTreeMap),
+}
+
+impl Default for RowIdMask {
+    fn default() -> Self {
+        // Empty block list means all rows are allowed
+        Self::BlockList(RowAddrTreeMap::new())
+    }
 }
 
 impl RowIdMask {
@@ -41,124 +42,68 @@ impl RowIdMask {
 
     // Create a mask that doesn't allow anything
     pub fn allow_nothing() -> Self {
-        Self {
-            allow_list: Some(RowAddrTreeMap::new()),
-            block_list: None,
-        }
+        Self::AllowList(RowAddrTreeMap::new())
     }
 
     // Create a mask from an allow list
     pub fn from_allowed(allow_list: RowAddrTreeMap) -> Self {
-        Self {
-            allow_list: Some(allow_list),
-            block_list: None,
-        }
+        Self::AllowList(allow_list)
     }
 
     // Create a mask from a block list
     pub fn from_block(block_list: RowAddrTreeMap) -> Self {
-        Self {
-            allow_list: None,
-            block_list: Some(block_list),
+        Self::BlockList(block_list)
+    }
+
+    pub fn block_list(&self) -> Option<&RowAddrTreeMap> {
+        match self {
+            Self::BlockList(block_list) => Some(block_list),
+            _ => None,
         }
     }
 
-    // If there is both a block list and an allow list then collapse into just an allow list
-    pub fn normalize(self) -> Self {
-        if let Self {
-            allow_list: Some(mut allow_list),
-            block_list: Some(block_list),
-        } = self
-        {
-            allow_list -= &block_list;
-            Self {
-                allow_list: Some(allow_list),
-                block_list: None,
-            }
-        } else {
-            self
+    pub fn allow_list(&self) -> Option<&RowAddrTreeMap> {
+        match self {
+            Self::AllowList(allow_list) => Some(allow_list),
+            _ => None,
         }
     }
 
     /// True if the row_id is selected by the mask, false otherwise
     pub fn selected(&self, row_id: u64) -> bool {
-        match (&self.allow_list, &self.block_list) {
-            (None, None) => true,
-            (Some(allow_list), None) => allow_list.contains(row_id),
-            (None, Some(block_list)) => !block_list.contains(row_id),
-            (Some(allow_list), Some(block_list)) => {
-                allow_list.contains(row_id) && !block_list.contains(row_id)
-            }
+        match self {
+            Self::AllowList(allow_list) => allow_list.contains(row_id),
+            Self::BlockList(block_list) => !block_list.contains(row_id),
         }
     }
 
     /// Return the indices of the input row ids that were valid
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
-        let enumerated_ids = row_ids.enumerate();
-        match (&self.block_list, &self.allow_list) {
-            (Some(block_list), Some(allow_list)) => {
-                // Only take rows that are both in the allow list and not in the block list
-                enumerated_ids
-                    .filter(|(_, row_id)| {
-                        !block_list.contains(**row_id) && allow_list.contains(**row_id)
-                    })
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (Some(block_list), None) => {
-                // Take rows that are not in the block list
-                enumerated_ids
-                    .filter(|(_, row_id)| !block_list.contains(**row_id))
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (None, Some(allow_list)) => {
-                // Take rows that are in the allow list
-                enumerated_ids
-                    .filter(|(_, row_id)| allow_list.contains(**row_id))
-                    .map(|(idx, _)| idx as u64)
-                    .collect()
-            }
-            (None, None) => {
-                // We should not encounter this case because callers should
-                // check is_empty first.
-                panic!("selected_indices called but prefilter has nothing to filter with")
-            }
-        }
+        row_ids
+            .enumerate()
+            .filter_map(|(idx, row_id)| {
+                if self.selected(*row_id) {
+                    Some(idx as u64)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Also block the given ids
     pub fn also_block(self, block_list: RowAddrTreeMap) -> Self {
-        if block_list.is_empty() {
-            return self;
-        }
-        if let Some(existing) = self.block_list {
-            Self {
-                block_list: Some(existing | block_list),
-                allow_list: self.allow_list,
-            }
-        } else {
-            Self {
-                block_list: Some(block_list),
-                allow_list: self.allow_list,
-            }
+        match self {
+            Self::AllowList(allow_list) => Self::AllowList(allow_list - block_list),
+            Self::BlockList(existing) => Self::BlockList(existing | block_list),
         }
     }
 
     /// Also allow the given ids
     pub fn also_allow(self, allow_list: RowAddrTreeMap) -> Self {
-        if let Some(existing) = self.allow_list {
-            Self {
-                block_list: self.block_list,
-                allow_list: Some(existing | allow_list),
-            }
-        } else {
-            Self {
-                block_list: self.block_list,
-                // allow_list = None means "all rows allowed" and so allowing
-                //              more rows is meaningless
-                allow_list: None,
-            }
+        match self {
+            Self::AllowList(existing) => Self::AllowList(existing | allow_list),
+            Self::BlockList(block_list) => Self::BlockList(block_list - allow_list),
         }
     }
 
@@ -175,13 +120,17 @@ impl RowIdMask {
     /// We serialize this as a variable length binary array with two items.  The first item
     /// is the block list and the second item is the allow list.
     pub fn into_arrow(&self) -> Result<BinaryArray> {
-        let block_list_length = self
-            .block_list
+        // NOTE: This serialization format must be stable as it is used in IPC.
+        let (block_list, allow_list) = match self {
+            Self::AllowList(allow_list) => (None, Some(allow_list)),
+            Self::BlockList(block_list) => (Some(block_list), None),
+        };
+
+        let block_list_length = block_list
             .as_ref()
             .map(|bl| bl.serialized_size())
             .unwrap_or(0);
-        let allow_list_length = self
-            .allow_list
+        let allow_list_length = allow_list
             .as_ref()
             .map(|al| al.serialized_size())
             .unwrap_or(0);
@@ -189,11 +138,11 @@ impl RowIdMask {
         let offsets = OffsetBuffer::from_lengths(lengths);
         let mut value_bytes = vec![0; block_list_length + allow_list_length];
         let mut validity = vec![false, false];
-        if let Some(block_list) = &self.block_list {
+        if let Some(block_list) = &block_list {
             validity[0] = true;
             block_list.serialize_into(&mut value_bytes[0..])?;
         }
-        if let Some(allow_list) = &self.allow_list {
+        if let Some(allow_list) = &allow_list {
             validity[1] = true;
             allow_list.serialize_into(&mut value_bytes[block_list_length..])?;
         }
@@ -202,7 +151,7 @@ impl RowIdMask {
         Ok(BinaryArray::try_new(offsets, values, Some(nulls))?)
     }
 
-    /// Deserialize a row id mask from Arrow
+    /// Deserialize a row address mask from Arrow
     pub fn from_arrow(array: &GenericBinaryArray<i32>) -> Result<Self> {
         let block_list = if array.is_null(0) {
             None
@@ -217,65 +166,40 @@ impl RowIdMask {
             Some(RowAddrTreeMap::deserialize_from(array.value(1)))
         }
         .transpose()?;
-        Ok(Self {
-            block_list,
-            allow_list,
-        })
+
+        let res = match (block_list, allow_list) {
+            (Some(bl), None) => Self::BlockList(bl),
+            (None, Some(al)) => Self::AllowList(al),
+            (Some(block), Some(allow)) => Self::AllowList(allow).also_block(block),
+            (None, None) => Self::all_rows(),
+        };
+        Ok(res)
     }
 
-    /// Return the maximum number of row ids that could be selected by this mask
+    /// Return the maximum number of row addresses that could be selected by this mask
     ///
-    /// Will be None if there is no allow list
+    /// Will be None if this is a BlockList (unbounded)
     pub fn max_len(&self) -> Option<u64> {
-        if let Some(allow_list) = &self.allow_list {
-            // If there is a block list we could theoretically intersect the two
-            // but it's not clear if that is worth the effort.  Feel free to add later.
-            allow_list.len()
-        } else {
-            None
+        match self {
+            Self::AllowList(selection) => selection.len(),
+            Self::BlockList(_) => None,
         }
     }
 
-    /// Iterate over the row ids that are selected by the mask
+    /// Iterate over the row addresses that are selected by the mask
     ///
-    /// This is only possible if there is an allow list and neither the
-    /// allow list nor the block list contain any "full fragment" blocks.
-    ///
-    /// TODO: We could probably still iterate efficiently even if the block
-    /// list contains "full fragment" blocks but that would require some
-    /// extra logic.
+    /// This is only possible if this is an AllowList and the maps don't contain
+    /// any "full fragment" blocks.
     pub fn iter_ids(&self) -> Option<Box<dyn Iterator<Item = RowAddress> + '_>> {
-        if let Some(mut allow_iter) = self.allow_list.as_ref().and_then(|list| list.row_addrs()) {
-            if let Some(block_list) = &self.block_list {
-                if let Some(block_iter) = block_list.row_addrs() {
-                    let mut block_iter = block_iter.peekable();
-                    Some(Box::new(iter::from_fn(move || {
-                        for allow_id in allow_iter.by_ref() {
-                            while let Some(block_id) = block_iter.peek() {
-                                if *block_id >= allow_id {
-                                    break;
-                                }
-                                block_iter.next();
-                            }
-                            if let Some(block_id) = block_iter.peek() {
-                                if *block_id == allow_id {
-                                    continue;
-                                }
-                            }
-                            return Some(allow_id);
-                        }
-                        None
-                    })))
+        match self {
+            Self::AllowList(allow_list) => {
+                if let Some(allow_iter) = allow_list.row_addrs() {
+                    Some(Box::new(allow_iter))
                 } else {
-                    // There is a block list but we can't iterate over it, give up
                     None
                 }
-            } else {
-                // There is no block list, use the allow list
-                Some(Box::new(allow_iter))
             }
-        } else {
-            None
+            Self::BlockList(_) => None, // Can't iterate over block list
         }
     }
 }
@@ -284,9 +208,9 @@ impl std::ops::Not for RowIdMask {
     type Output = Self;
 
     fn not(self) -> Self::Output {
-        Self {
-            block_list: self.allow_list,
-            allow_list: self.block_list,
+        match self {
+            Self::AllowList(allow_list) => Self::BlockList(allow_list),
+            Self::BlockList(block_list) => Self::AllowList(block_list),
         }
     }
 }
@@ -295,21 +219,11 @@ impl std::ops::BitAnd for RowIdMask {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
-        let block_list = match (self.block_list, rhs.block_list) {
-            (None, None) => None,
-            (Some(lhs), None) => Some(lhs),
-            (None, Some(rhs)) => Some(rhs),
-            (Some(lhs), Some(rhs)) => Some(lhs | rhs),
-        };
-        let allow_list = match (self.allow_list, rhs.allow_list) {
-            (None, None) => None,
-            (Some(lhs), None) => Some(lhs),
-            (None, Some(rhs)) => Some(rhs),
-            (Some(lhs), Some(rhs)) => Some(lhs & rhs),
-        };
-        Self {
-            block_list,
-            allow_list,
+        match (self, rhs) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
+            (Self::AllowList(allow), Self::BlockList(block))
+            | (Self::BlockList(block), Self::AllowList(allow)) => Self::AllowList(allow - block),
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
         }
     }
 }
@@ -318,44 +232,11 @@ impl std::ops::BitOr for RowIdMask {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
-        let this = self.normalize();
-        let rhs = rhs.normalize();
-        let block_list = if let Some(mut self_block_list) = this.block_list {
-            match (&rhs.allow_list, rhs.block_list) {
-                // If RHS is allow all, then our block list disappears
-                (None, None) => None,
-                // If RHS is allow list, remove allowed from our block list
-                (Some(allow_list), None) => {
-                    self_block_list -= allow_list;
-                    Some(self_block_list)
-                }
-                // If RHS is block list, intersect
-                (None, Some(block_list)) => Some(self_block_list & block_list),
-                // We normalized to avoid this path
-                (Some(_), Some(_)) => unreachable!(),
-            }
-        } else if let Some(mut rhs_block_list) = rhs.block_list {
-            if let Some(allow_list) = &this.allow_list {
-                rhs_block_list -= allow_list;
-                Some(rhs_block_list)
-            } else {
-                Some(rhs_block_list)
-            }
-        } else {
-            None
-        };
-
-        let allow_list = match (this.allow_list, rhs.allow_list) {
-            (None, None) => None,
-            // Remember that an allow list of None means "all rows" and
-            // so "all rows" | "some rows" is always "all rows"
-            (Some(_), None) => None,
-            (None, Some(_)) => None,
-            (Some(lhs), Some(rhs)) => Some(lhs | rhs),
-        };
-        Self {
-            block_list,
-            allow_list,
+        match (self, rhs) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a | b),
+            (Self::AllowList(allow), Self::BlockList(block))
+            | (Self::BlockList(block), Self::AllowList(allow)) => Self::BlockList(block - allow),
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a & b),
         }
     }
 }
@@ -682,14 +563,16 @@ impl RowAddrTreeMap {
 
     /// Apply a mask to the row ids
     ///
-    /// If there is an allow list then this will intersect the set with the allow list
-    /// If there is a block list then this will subtract the block list from the set
+    /// For AllowList: only keep rows that are in the selection and not null
+    /// For BlockList: remove rows that are blocked (not null) and remove nulls
     pub fn mask(&mut self, mask: &RowIdMask) {
-        if let Some(allow_list) = &mask.allow_list {
-            *self &= allow_list;
-        }
-        if let Some(block_list) = &mask.block_list {
-            *self -= block_list;
+        match mask {
+            RowIdMask::AllowList(allow_list) => {
+                *self &= allow_list;
+            }
+            RowIdMask::BlockList(block_list) => {
+                *self -= block_list;
+            }
         }
     }
 
@@ -723,8 +606,23 @@ impl std::ops::BitOr<Self> for RowAddrTreeMap {
     }
 }
 
+impl std::ops::BitOr<&Self> for RowAddrTreeMap {
+    type Output = Self;
+
+    fn bitor(mut self, rhs: &Self) -> Self::Output {
+        self |= rhs;
+        self
+    }
+}
+
 impl std::ops::BitOrAssign<Self> for RowAddrTreeMap {
     fn bitor_assign(&mut self, rhs: Self) {
+        *self |= &rhs;
+    }
+}
+
+impl std::ops::BitOrAssign<&Self> for RowAddrTreeMap {
+    fn bitor_assign(&mut self, rhs: &Self) {
         for (fragment, rhs_set) in &rhs.inner {
             let lhs_set = self.inner.get_mut(fragment);
             if let Some(lhs_set) = lhs_set {
@@ -754,6 +652,21 @@ impl std::ops::BitAnd<Self> for RowAddrTreeMap {
     fn bitand(mut self, rhs: Self) -> Self::Output {
         self &= &rhs;
         self
+    }
+}
+
+impl std::ops::BitAnd<&Self> for RowAddrTreeMap {
+    type Output = Self;
+
+    fn bitand(mut self, rhs: &Self) -> Self::Output {
+        self &= rhs;
+        self
+    }
+}
+
+impl std::ops::BitAndAssign<Self> for RowAddrTreeMap {
+    fn bitand_assign(&mut self, rhs: Self) {
+        *self &= &rhs;
     }
 }
 
@@ -791,6 +704,15 @@ impl std::ops::Sub<Self> for RowAddrTreeMap {
 
     fn sub(mut self, rhs: Self) -> Self {
         self -= &rhs;
+        self
+    }
+}
+
+impl std::ops::Sub<&Self> for RowAddrTreeMap {
+    type Output = Self;
+
+    fn sub(mut self, rhs: &Self) -> Self {
+        self -= rhs;
         self
     }
 }
@@ -862,6 +784,14 @@ impl<'a> FromIterator<&'a u64> for RowAddrTreeMap {
 
 impl From<Range<u64>> for RowAddrTreeMap {
     fn from(range: Range<u64>) -> Self {
+        let mut map = Self::default();
+        map.insert_range(range);
+        map
+    }
+}
+
+impl From<RangeInclusive<u64>> for RowAddrTreeMap {
+    fn from(range: RangeInclusive<u64>) -> Self {
         let mut map = Self::default();
         map.insert_range(range);
         map
@@ -971,12 +901,12 @@ mod tests {
         let block1 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[5, 6]));
         let mixed1 = allow1
             .clone()
-            .also_block(block1.block_list.as_ref().unwrap().clone());
+            .also_block(RowAddrTreeMap::from_iter(&[5, 6]));
         let allow2 = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[2, 3, 4, 5, 6, 7, 8]));
         let block2 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[4, 5]));
         let mixed2 = allow2
             .clone()
-            .also_block(block2.block_list.as_ref().unwrap().clone());
+            .also_block(RowAddrTreeMap::from_iter(&[4, 5]));
 
         fn check(lhs: &RowIdMask, rhs: &RowIdMask, expected: &[u64]) {
             for mask in [lhs.clone() | rhs.clone(), rhs.clone() | lhs.clone()] {
@@ -1009,6 +939,100 @@ mod tests {
         check(&allow2, &block2, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         check(&allow2, &mixed2, &[2, 3, 4, 5, 6, 7, 8]);
         check(&block2, &mixed2, &[0, 1, 2, 3, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_format() {
+        // Test that we can deserialize the old format where both allow_list
+        // and block_list could be present in the serialized form.
+        //
+        // The old format (before this PR) used a struct with both allow_list and block_list
+        // fields. The new format uses an enum. The deserialization code should handle
+        // the case where both lists are present by converting to AllowList(allow - block).
+
+        // Create the RowIdTreeMaps and serialize them directly
+        let allow = RowAddrTreeMap::from_iter(&[1, 2, 3, 4, 5, 10, 15]);
+        let block = RowAddrTreeMap::from_iter(&[2, 4, 15]);
+
+        // Serialize using the stable RowIdTreeMap serialization format
+        let block_bytes = {
+            let mut buf = Vec::with_capacity(block.serialized_size());
+            block.serialize_into(&mut buf).unwrap();
+            buf
+        };
+        let allow_bytes = {
+            let mut buf = Vec::with_capacity(allow.serialized_size());
+            allow.serialize_into(&mut buf).unwrap();
+            buf
+        };
+
+        // Construct a binary array with both values present (simulating old format)
+        let old_format_array =
+            BinaryArray::from_opt_vec(vec![Some(&block_bytes), Some(&allow_bytes)]);
+
+        // Deserialize - should handle this by creating AllowList(allow - block)
+        let deserialized = RowIdMask::from_arrow(&old_format_array).unwrap();
+
+        // The expected result: AllowList([1, 2, 3, 4, 5, 10, 15] - [2, 4, 15]) = [1, 3, 5, 10]
+        let expected_rows = vec![1u64, 3, 5, 10];
+        for row in &expected_rows {
+            assert!(
+                deserialized.selected(*row),
+                "Row {} should be selected",
+                row
+            );
+        }
+
+        // Verify blocked rows are not selected
+        assert!(!deserialized.selected(2), "Row 2 should be blocked");
+        assert!(!deserialized.selected(4), "Row 4 should be blocked");
+        assert!(!deserialized.selected(15), "Row 15 should be blocked");
+
+        // Verify it's an AllowList variant
+        assert!(
+            deserialized.allow_list().is_some(),
+            "Should deserialize to AllowList variant"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_legacy_empty_lists() {
+        // Test edge cases with None values in old format
+
+        // Case 1: Both None (should become all_rows)
+        let array = BinaryArray::from_opt_vec(vec![None, None]);
+        let mask = RowIdMask::from_arrow(&array).unwrap();
+        assert!(mask.selected(0));
+        assert!(mask.selected(100));
+        assert!(mask.selected(u64::MAX));
+
+        // Case 2: Only block list (no allow list)
+        let block = RowAddrTreeMap::from_iter(&[5, 10]);
+        let block_bytes = {
+            let mut buf = Vec::with_capacity(block.serialized_size());
+            block.serialize_into(&mut buf).unwrap();
+            buf
+        };
+        let array = BinaryArray::from_opt_vec(vec![Some(&block_bytes[..]), None]);
+        let mask = RowIdMask::from_arrow(&array).unwrap();
+        assert!(mask.selected(0));
+        assert!(!mask.selected(5));
+        assert!(!mask.selected(10));
+        assert!(mask.selected(15));
+
+        // Case 3: Only allow list (no block list)
+        let allow = RowAddrTreeMap::from_iter(&[5, 10]);
+        let allow_bytes = {
+            let mut buf = Vec::with_capacity(allow.serialized_size());
+            allow.serialize_into(&mut buf).unwrap();
+            buf
+        };
+        let array = BinaryArray::from_opt_vec(vec![None, Some(&allow_bytes[..])]);
+        let mask = RowIdMask::from_arrow(&array).unwrap();
+        assert!(!mask.selected(0));
+        assert!(mask.selected(5));
+        assert!(mask.selected(10));
+        assert!(!mask.selected(15));
     }
 
     #[test]
@@ -1226,53 +1250,5 @@ mod tests {
             prop_assert_eq!(expected, left);
         }
 
-    }
-
-    #[test]
-    fn test_iter_ids() {
-        let mut mask = RowIdMask::default();
-        assert!(mask.iter_ids().is_none());
-
-        // Test with just an allow list
-        let mut allow_list = RowAddrTreeMap::default();
-        allow_list.extend([1, 5, 10].iter().copied());
-        mask.allow_list = Some(allow_list);
-
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
-        assert_eq!(
-            ids,
-            vec![
-                RowAddress::new_from_parts(0, 1),
-                RowAddress::new_from_parts(0, 5),
-                RowAddress::new_from_parts(0, 10)
-            ]
-        );
-
-        // Test with both allow list and block list
-        let mut block_list = RowAddrTreeMap::default();
-        block_list.extend([5].iter().copied());
-        mask.block_list = Some(block_list);
-
-        let ids: Vec<_> = mask.iter_ids().unwrap().collect();
-        assert_eq!(
-            ids,
-            vec![
-                RowAddress::new_from_parts(0, 1),
-                RowAddress::new_from_parts(0, 10)
-            ]
-        );
-
-        // Test with full fragment in block list
-        let mut block_list = RowAddrTreeMap::default();
-        block_list.insert_fragment(0);
-        mask.block_list = Some(block_list);
-        assert!(mask.iter_ids().is_none());
-
-        // Test with full fragment in allow list
-        mask.block_list = None;
-        let mut allow_list = RowAddrTreeMap::default();
-        allow_list.insert_fragment(0);
-        mask.allow_list = Some(allow_list);
-        assert!(mask.iter_ids().is_none());
     }
 }
