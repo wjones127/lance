@@ -2308,6 +2308,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_optimize_with_partition_splits() {
+        // Regression test for issue #5312
+        // Ensures optimization works correctly when partition splits occur during
+        // incremental appends. The fix in IvfModel::partition_size ensures graceful
+        // handling of out-of-bounds partition accesses.
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Start with a small initial dataset
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        // Create index with a small number of partitions to encourage splitting
+        let params = VectorIndexParams::ivf_pq(3, 8, 2, DistanceType::Cosine, 50);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Append data and optimize multiple times
+        // This exercises the optimization path that calls should_split
+        for _ in 0..3 {
+            append_dataset::<Float32Type>(&mut dataset, 1000, 0.0..1.0).await;
+
+            // This optimization calls should_split which iterates over all partitions
+            // and calls partition_size on all existing indices.
+            // With the fix, partition_size safely returns 0 for out-of-bounds accesses
+            // instead of panicking.
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .expect("Optimization should succeed");
+        }
+
+        // Verify the index still works correctly
+        let query_vec = generate_random_array_with_range::<Float32Type>(DIM, 0.0..1.0);
+        let query_fsl = FixedSizeListArray::try_new_from_values(query_vec, DIM as i32).unwrap();
+        let results = dataset
+            .scan()
+            .nearest("vector", &query_fsl.value(0), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(results.num_rows(), 10);
+    }
+
+    #[tokio::test]
     async fn test_create_index_with_many_invalid_vectors() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
