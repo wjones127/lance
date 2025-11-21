@@ -615,7 +615,7 @@ mod tests {
     use std::{ops::Range, sync::Arc};
 
     use all_asserts::{assert_ge, assert_lt};
-    use arrow::datatypes::{Float64Type, UInt64Type, UInt8Type};
+    use arrow::datatypes::{Float64Type, Int32Type, UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
@@ -625,13 +625,14 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_datagen::{array, gen_batch, BatchCount, Dimension, RowCount};
     use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::vector::ivf::v2::IvfPq;
     use crate::index::DatasetIndexInternalExt;
-    use crate::utils::test::copy_test_data_to_tmp;
+    use crate::utils::test::{copy_test_data_to_tmp, DatagenExt, FragmentCount, FragmentRowCount};
     use crate::{
         dataset::optimize::{compact_files, CompactionOptions},
         index::vector::IndexFileVersion,
@@ -2310,50 +2311,45 @@ mod tests {
     #[tokio::test]
     async fn test_optimize_with_partition_splits() {
         // Regression test for issue #5312
-        // Ensures optimization works correctly when partition splits occur during
-        // incremental appends. The fix in IvfModel::partition_size ensures graceful
-        // handling of out-of-bounds partition accesses.
-
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        // Start with a small initial dataset
-        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-
-        // Create index with a small number of partitions to encourage splitting
-        let params = VectorIndexParams::ivf_pq(3, 8, 2, DistanceType::Cosine, 50);
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(30_000))
+            .await
+            .unwrap();
+        let ivf_params = IvfBuildParams::new(3);
+        let pq_params = PQBuildParams::new(2, 8);
+        let index_params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
         dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .create_index_builder(&["vec"], IndexType::Vector, &index_params)
             .await
             .unwrap();
 
-        // Append data and optimize multiple times
-        // This exercises the optimization path that calls should_split
-        for _ in 0..3 {
-            append_dataset::<Float32Type>(&mut dataset, 1000, 0.0..1.0).await;
-
-            // This optimization calls should_split which iterates over all partitions
-            // and calls partition_size on all existing indices.
-            // With the fix, partition_size safely returns 0 for out-of-bounds accesses
-            // instead of panicking.
-            dataset
-                .optimize_indices(&OptimizeOptions::default())
-                .await
-                .expect("Optimization should succeed");
-        }
-
-        // Verify the index still works correctly
-        let query_vec = generate_random_array_with_range::<Float32Type>(DIM, 0.0..1.0);
-        let query_fsl = FixedSizeListArray::try_new_from_values(query_vec, DIM as i32).unwrap();
-        let results = dataset
-            .scan()
-            .nearest("vector", &query_fsl.value(0), 10)
-            .unwrap()
-            .try_into_batch()
+        // Append 2 more rows and create a new index segment.
+        let new_data = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(10_000, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        dataset.append(new_data, None).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
 
-        assert_eq!(results.num_rows(), 10);
+        // Delete every other row
+        dataset.delete("id % 2 = 0").await.unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 50, // Prevent fragments from being merged together
+            ..Default::default()
+        };
+        let compact_stats = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(compact_stats.fragments_removed, 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
