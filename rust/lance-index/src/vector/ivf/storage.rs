@@ -92,7 +92,7 @@ impl IvfModel {
     }
 
     pub fn partition_size(&self, part: usize) -> usize {
-        self.lengths[part] as usize
+        self.lengths.get(part).cloned().unwrap_or(0) as usize
     }
 
     pub fn num_rows(&self) -> u64 {
@@ -353,5 +353,26 @@ mod tests {
         assert_eq!(first_vals.len(), 2);
         assert_eq!(first_vals.value(0), 1.0);
         assert_eq!(first_vals.value(1), 2.0);
+    }
+
+    #[test]
+    fn test_partition_size_bounds_checking() {
+        // Test that partition_size returns 0 for out-of-bounds partitions
+        // This prevents panics when indices have mismatched partition counts
+        // during optimization. Regression test for issue #5312.
+        let mut ivf = IvfModel::empty();
+        ivf.add_partition(20);
+        ivf.add_partition(50);
+        ivf.add_partition(30);
+
+        // Valid partitions
+        assert_eq!(ivf.partition_size(0), 20);
+        assert_eq!(ivf.partition_size(1), 50);
+        assert_eq!(ivf.partition_size(2), 30);
+
+        // Out of bounds - should return 0 instead of panicking
+        assert_eq!(ivf.partition_size(3), 0);
+        assert_eq!(ivf.partition_size(100), 0);
+        assert_eq!(ivf.partition_size(117), 0); // The specific case from issue #5312
     }
 }
