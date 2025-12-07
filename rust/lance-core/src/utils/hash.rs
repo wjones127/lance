@@ -41,9 +41,10 @@ mod tests {
 
     #[test]
     fn test_u8_slice_key() {
-        let mut map: HashMap<U8SliceKey, i32> = HashMap::new();
+        // Test cases not in doctest: key not found, inequality
+        let mut map = HashMap::new();
         map.insert(U8SliceKey(&[1, 2, 3]), 42);
-        assert_eq!(map.get(&U8SliceKey(&[1, 2, 3])), Some(&42));
-        assert_eq!(U8SliceKey(&[1, 2, 3]), U8SliceKey(&[1, 2, 3]));
+        assert_eq!(map.get(&U8SliceKey(&[4, 5, 6])), None);
+        assert_ne!(U8SliceKey(&[1]), U8SliceKey(&[2]));
     }
 }

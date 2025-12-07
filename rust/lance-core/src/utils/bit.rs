@@ -114,28 +114,16 @@ pub mod tests {
     use crate::utils::bit::{is_pwr_two, log_2_ceil, pad_bytes, pad_bytes_to, pad_bytes_u64};
 
     #[test]
-    fn test_is_pwr_two() {
-        assert!(is_pwr_two(1));
-        assert!(is_pwr_two(2));
-        assert!(!is_pwr_two(3));
-    }
+    fn test_bit_utils() {
+        // Test values not in doctests
+        assert!(is_pwr_two(4));
+        assert!(is_pwr_two(1024));
+        assert!(!is_pwr_two(5));
 
-    #[test]
-    fn test_pad_bytes() {
-        assert_eq!(pad_bytes::<8>(0), 0);
-        assert_eq!(pad_bytes::<8>(1), 7);
-    }
-
-    #[test]
-    fn test_pad_bytes_to() {
-        assert_eq!(pad_bytes_to(0, 8), 0);
-        assert_eq!(pad_bytes_to(1, 8), 7);
-    }
-
-    #[test]
-    fn test_pad_bytes_u64() {
-        assert_eq!(pad_bytes_u64::<8>(0), 0);
-        assert_eq!(pad_bytes_u64::<8>(1), 7);
+        // Test different alignment (64) not shown in doctests
+        assert_eq!(pad_bytes::<64>(100), 28);
+        assert_eq!(pad_bytes_to(100, 64), 28);
+        assert_eq!(pad_bytes_u64::<64>(100), 28);
     }
 
     #[test]

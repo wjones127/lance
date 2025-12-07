@@ -94,29 +94,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_from_u64() {
+    fn test_row_address() {
+        // new_from_u64 (not in doctest)
         let addr = RowAddress::new_from_u64(0x0000_0001_0000_0002);
         assert_eq!(addr.fragment_id(), 1);
         assert_eq!(addr.row_offset(), 2);
-    }
 
-    #[test]
-    fn test_address_range() {
-        let range = RowAddress::address_range(2);
-        assert_eq!(range.start, 2 * RowAddress::FRAGMENT_SIZE);
-    }
+        // address_range uses first_row internally (coverage)
+        let range = RowAddress::address_range(3);
+        assert_eq!(range.start, 3 * RowAddress::FRAGMENT_SIZE);
 
-    #[test]
-    fn test_from_impls() {
-        let addr = RowAddress::new_from_parts(1, 2);
-        let val: u64 = addr.into();
-        let addr2: RowAddress = val.into();
-        assert_eq!(addr, addr2);
-    }
+        // From impls with different values than doctest
+        let addr2 = RowAddress::new_from_parts(7, 8);
+        let raw: u64 = addr2.into();
+        let addr3: RowAddress = raw.into();
+        assert_eq!(addr2, addr3);
 
-    #[test]
-    fn test_debug() {
-        let addr = RowAddress::new_from_parts(10, 20);
-        assert_eq!(format!("{:?}", addr), "(10, 20)");
+        // Debug format (doctest only tests Display)
+        assert_eq!(format!("{:?}", addr), "(1, 2)");
     }
 }
