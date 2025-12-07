@@ -61,10 +61,52 @@ pub fn log_2_ceil(val: u32) -> u32 {
 
 #[cfg(test)]
 pub mod tests {
-    use crate::utils::bit::log_2_ceil;
+    use crate::utils::bit::{is_pwr_two, log_2_ceil, pad_bytes, pad_bytes_to, pad_bytes_u64};
+
+    #[test]
+    fn test_is_pwr_two() {
+        assert!(is_pwr_two(1));
+        assert!(is_pwr_two(2));
+        assert!(is_pwr_two(4));
+        assert!(is_pwr_two(1024));
+        assert!(!is_pwr_two(3));
+        assert!(!is_pwr_two(5));
+        assert!(!is_pwr_two(1000));
+    }
+
+    #[test]
+    fn test_pad_bytes() {
+        assert_eq!(pad_bytes::<8>(0), 0);
+        assert_eq!(pad_bytes::<8>(1), 7);
+        assert_eq!(pad_bytes::<8>(7), 1);
+        assert_eq!(pad_bytes::<8>(8), 0);
+        assert_eq!(pad_bytes::<8>(9), 7);
+        assert_eq!(pad_bytes::<64>(100), 28);
+    }
+
+    #[test]
+    fn test_pad_bytes_to() {
+        assert_eq!(pad_bytes_to(0, 8), 0);
+        assert_eq!(pad_bytes_to(1, 8), 7);
+        assert_eq!(pad_bytes_to(7, 8), 1);
+        assert_eq!(pad_bytes_to(8, 8), 0);
+        assert_eq!(pad_bytes_to(9, 8), 7);
+        assert_eq!(pad_bytes_to(100, 64), 28);
+    }
+
+    #[test]
+    fn test_pad_bytes_u64() {
+        assert_eq!(pad_bytes_u64::<8>(0), 0);
+        assert_eq!(pad_bytes_u64::<8>(1), 7);
+        assert_eq!(pad_bytes_u64::<8>(7), 1);
+        assert_eq!(pad_bytes_u64::<8>(8), 0);
+        assert_eq!(pad_bytes_u64::<8>(9), 7);
+        assert_eq!(pad_bytes_u64::<64>(100), 28);
+    }
 
     #[test]
     fn test_log_2_ceil() {
+        #[cfg_attr(coverage, coverage(off))]
         fn classic_approach(mut val: u32) -> u32 {
             let mut counter = 0;
             while val > 0 {
@@ -82,5 +124,8 @@ pub mod tests {
             log_2_ceil(1024 * 1024 * 1024),
             classic_approach(1024 * 1024 * 1024)
         );
+        // Cover the branch where upper_half != 0 but first_quarter == 0
+        // (value between 2^16 and 2^24)
+        assert_eq!(log_2_ceil(100_000), classic_approach(100_000));
     }
 }

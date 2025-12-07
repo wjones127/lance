@@ -61,3 +61,62 @@ impl std::fmt::Display for RowAddress {
         write!(f, "({}, {})", self.fragment_id(), self.row_offset())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_from_u64() {
+        let addr = RowAddress::new_from_u64(0x0000_0001_0000_0002);
+        assert_eq!(addr.fragment_id(), 1);
+        assert_eq!(addr.row_offset(), 2);
+    }
+
+    #[test]
+    fn test_new_from_parts() {
+        let addr = RowAddress::new_from_parts(5, 100);
+        assert_eq!(addr.fragment_id(), 5);
+        assert_eq!(addr.row_offset(), 100);
+    }
+
+    #[test]
+    fn test_first_row() {
+        let addr = RowAddress::first_row(3);
+        assert_eq!(addr.fragment_id(), 3);
+        assert_eq!(addr.row_offset(), 0);
+    }
+
+    #[test]
+    fn test_address_range() {
+        let range = RowAddress::address_range(2);
+        assert_eq!(range.start, 2 * RowAddress::FRAGMENT_SIZE);
+        assert_eq!(range.end, 3 * RowAddress::FRAGMENT_SIZE);
+    }
+
+    #[test]
+    fn test_from_u64() {
+        let addr: RowAddress = 0x0000_0003_0000_0004_u64.into();
+        assert_eq!(addr.fragment_id(), 3);
+        assert_eq!(addr.row_offset(), 4);
+    }
+
+    #[test]
+    fn test_into_u64() {
+        let addr = RowAddress::new_from_parts(1, 2);
+        let val: u64 = addr.into();
+        assert_eq!(val, 0x0000_0001_0000_0002);
+    }
+
+    #[test]
+    fn test_display() {
+        let addr = RowAddress::new_from_parts(10, 20);
+        assert_eq!(format!("{}", addr), "(10, 20)");
+    }
+
+    #[test]
+    fn test_debug() {
+        let addr = RowAddress::new_from_parts(10, 20);
+        assert_eq!(format!("{:?}", addr), "(10, 20)");
+    }
+}
