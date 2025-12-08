@@ -472,7 +472,7 @@ mod tests {
         let set1 = nullable_set(&[1, 2, 3], &[]);
         let set2 = nullable_set(&[2, 3, 4], &[]);
 
-        let mut result = set1.clone();
+        let mut result = set1;
         result &= &set2;
 
         // Intersection: [2, 3]
@@ -487,7 +487,7 @@ mod tests {
         let set1 = nullable_set(&[1, 2], &[]);
         let set2 = nullable_set(&[3, 4], &[]);
 
-        let mut result = set1.clone();
+        let mut result = set1;
         result |= &set2;
 
         // Union: [1, 2, 3, 4]
