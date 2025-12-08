@@ -867,120 +867,104 @@ mod tests {
     use super::*;
     use proptest::prop_assert_eq;
 
+    fn rows(ids: &[u64]) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(ids)
+    }
+
+    fn assert_mask_selects(mask: &RowIdMask, selected: &[u64], not_selected: &[u64]) {
+        for &id in selected {
+            assert!(mask.selected(id), "Expected row {} to be selected", id);
+        }
+        for &id in not_selected {
+            assert!(!mask.selected(id), "Expected row {} to NOT be selected", id);
+        }
+    }
+
+    fn selected_in_range(mask: &RowIdMask, range: std::ops::Range<u64>) -> Vec<u64> {
+        range.filter(|val| mask.selected(*val)).collect()
+    }
+
     #[test]
     fn test_row_id_mask_construction() {
         let full_mask = RowIdMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
-        for row_addr in &[0, 1, 4 << 32 | 3] {
-            assert!(full_mask.selected(*row_addr));
-        }
+        assert_mask_selects(&full_mask, &[0, 1, 4 << 32 | 3], &[]);
         assert_eq!(full_mask.allow_list(), None);
         assert_eq!(full_mask.block_list(), Some(&RowAddrTreeMap::default()));
         assert!(full_mask.iter_ids().is_none());
 
         let empty_mask = RowIdMask::allow_nothing();
         assert_eq!(empty_mask.max_len(), Some(0));
-        for row_addr in &[0, 1, 4 << 32 | 3] {
-            assert!(!empty_mask.selected(*row_addr));
-        }
+        assert_mask_selects(&empty_mask, &[], &[0, 1, 4 << 32 | 3]);
         assert_eq!(empty_mask.allow_list(), Some(&RowAddrTreeMap::default()));
         assert_eq!(empty_mask.block_list(), None);
         let iter = empty_mask.iter_ids();
         assert!(iter.is_some());
         assert_eq!(iter.unwrap().count(), 0);
 
-        let allow_list = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 20, 30]));
+        let allow_list = RowIdMask::from_allowed(rows(&[10, 20, 30]));
         assert_eq!(allow_list.max_len(), Some(3));
-        for row_addr in &[10, 20, 30] {
-            assert!(allow_list.selected(*row_addr));
-        }
-        for row_addr in &[0, 15, 25, 40] {
-            assert!(!allow_list.selected(*row_addr));
-        }
-        assert_eq!(
-            allow_list.allow_list(),
-            Some(&RowAddrTreeMap::from_iter(&[10, 20, 30]))
-        );
+        assert_mask_selects(&allow_list, &[10, 20, 30], &[0, 15, 25, 40]);
+        assert_eq!(allow_list.allow_list(), Some(&rows(&[10, 20, 30])));
         assert_eq!(allow_list.block_list(), None);
         let iter = allow_list.iter_ids();
         assert!(iter.is_some());
         let ids: Vec<u64> = iter.unwrap().map(|addr| addr.into()).collect();
         assert_eq!(ids, vec![10, 20, 30]);
 
-        let mut ids = RowAddrTreeMap::default();
-        ids.insert_fragment(2);
-        let allow_list = RowIdMask::from_allowed(ids);
+        let mut full_frag = RowAddrTreeMap::default();
+        full_frag.insert_fragment(2);
+        let allow_list = RowIdMask::from_allowed(full_frag);
         assert_eq!(allow_list.max_len(), None);
-        assert!(allow_list.selected((2_u64 << 32) + 5));
-        assert!(!allow_list.selected((3_u64 << 32) + 5));
+        assert_mask_selects(&allow_list, &[(2 << 32) + 5], &[(3 << 32) + 5]);
         assert!(allow_list.iter_ids().is_none());
     }
 
     #[test]
     fn test_selected_indices() {
         // Allow list
-        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 20, 40]));
-
-        let actual = mask.selected_indices(std::iter::empty());
-        assert!(actual.is_empty());
-
-        let actual = mask.selected_indices([25, 20, 14, 10].iter());
-        let expected = &[1, 3];
-        assert_eq!(&actual, expected);
+        let mask = RowIdMask::from_allowed(rows(&[10, 20, 40]));
+        assert!(mask.selected_indices(std::iter::empty()).is_empty());
+        assert_eq!(mask.selected_indices([25, 20, 14, 10].iter()), &[1, 3]);
 
         // Block list
-        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[10, 20, 40]));
-
-        let actual = mask.selected_indices(std::iter::empty());
-        assert!(actual.is_empty());
-
-        let actual = mask.selected_indices([25, 20, 14, 10].iter());
-        let expected = &[0, 2];
-        assert_eq!(&actual, expected);
+        let mask = RowIdMask::from_block(rows(&[10, 20, 40]));
+        assert!(mask.selected_indices(std::iter::empty()).is_empty());
+        assert_eq!(mask.selected_indices([25, 20, 14, 10].iter()), &[0, 2]);
     }
 
     #[test]
     fn test_also_allow() {
         // Allow list
-        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 20]));
-        let new_mask = mask.also_allow(RowAddrTreeMap::from_iter(&[20, 30, 40]));
-        let expected = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 20, 30, 40]));
-        assert_eq!(new_mask, expected);
+        let mask = RowIdMask::from_allowed(rows(&[10, 20]));
+        let new_mask = mask.also_allow(rows(&[20, 30, 40]));
+        assert_eq!(new_mask, RowIdMask::from_allowed(rows(&[10, 20, 30, 40])));
 
         // Block list
-        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[10, 20, 30]));
-        let new_mask = mask.also_allow(RowAddrTreeMap::from_iter(&[20, 40]));
-        let expected = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[10, 30]));
-        assert_eq!(new_mask, expected);
+        let mask = RowIdMask::from_block(rows(&[10, 20, 30]));
+        let new_mask = mask.also_allow(rows(&[20, 40]));
+        assert_eq!(new_mask, RowIdMask::from_block(rows(&[10, 30])));
     }
 
     #[test]
     fn test_also_block() {
         // Allow list
-        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 20, 30]));
-        let new_mask = mask.also_block(RowAddrTreeMap::from_iter(&[20, 40]));
-        let expected = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[10, 30]));
-        assert_eq!(new_mask, expected);
+        let mask = RowIdMask::from_allowed(rows(&[10, 20, 30]));
+        let new_mask = mask.also_block(rows(&[20, 40]));
+        assert_eq!(new_mask, RowIdMask::from_allowed(rows(&[10, 30])));
 
         // Block list
-        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[10, 20]));
-        let new_mask = mask.also_block(RowAddrTreeMap::from_iter(&[20, 30, 40]));
-        let expected = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[10, 20, 30, 40]));
-        assert_eq!(new_mask, expected);
+        let mask = RowIdMask::from_block(rows(&[10, 20]));
+        let new_mask = mask.also_block(rows(&[20, 30, 40]));
+        assert_eq!(new_mask, RowIdMask::from_block(rows(&[10, 20, 30, 40])));
     }
 
     #[test]
     fn test_iter_ids() {
         // Allow list
-        let ids = vec![10, 20, 30];
-        let mask = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&ids));
-        let expected = ids
-            .clone()
-            .into_iter()
-            .map(RowAddress::from)
-            .collect::<Vec<_>>();
-        let actual = mask.iter_ids().unwrap().collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+        let mask = RowIdMask::from_allowed(rows(&[10, 20, 30]));
+        let expected: Vec<_> = [10, 20, 30].into_iter().map(RowAddress::from).collect();
+        assert_eq!(mask.iter_ids().unwrap().collect::<Vec<_>>(), expected);
 
         // Allow list with full fragment
         let mut inner = RowAddrTreeMap::default();
@@ -989,62 +973,53 @@ mod tests {
         assert!(mask.iter_ids().is_none());
 
         // Block list
-        let mask = RowIdMask::from_block(RowAddrTreeMap::from_iter(&ids));
+        let mask = RowIdMask::from_block(rows(&[10, 20, 30]));
         assert!(mask.iter_ids().is_none());
     }
 
     #[test]
     fn test_row_id_mask_not() {
-        let allow_list = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[1, 2, 3]));
+        let allow_list = RowIdMask::from_allowed(rows(&[1, 2, 3]));
         let block_list = !allow_list.clone();
-        let expected = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[1, 2, 3]));
-        assert_eq!(block_list, expected);
+        assert_eq!(block_list, RowIdMask::from_block(rows(&[1, 2, 3])));
         // Can roundtrip by negating again
-        let allow_list_2 = !block_list;
-        assert_eq!(allow_list, allow_list_2);
+        assert_eq!(!block_list, allow_list);
     }
 
     #[test]
     fn test_ops() {
         let mask = RowIdMask::default();
-        assert!(mask.selected(1));
-        assert!(mask.selected(5));
-        let block_list = mask.also_block(RowAddrTreeMap::from_iter(&[0, 5, 15]));
-        assert!(block_list.selected(1));
-        assert!(!block_list.selected(5));
-        let allow_list = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 2, 5]));
-        assert!(!allow_list.selected(1));
-        assert!(allow_list.selected(5));
-        let combined = block_list & allow_list;
-        assert!(combined.selected(2));
-        assert!(!combined.selected(0));
-        assert!(!combined.selected(5));
-        let other = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[3]));
-        let combined = combined | other;
-        assert!(combined.selected(2));
-        assert!(combined.selected(3));
-        assert!(!combined.selected(0));
-        assert!(!combined.selected(5));
+        assert_mask_selects(&mask, &[1, 5], &[]);
 
-        let block_list = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[0]));
-        let allow_list = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[3]));
+        let block_list = mask.also_block(rows(&[0, 5, 15]));
+        assert_mask_selects(&block_list, &[1], &[5]);
+
+        let allow_list = RowIdMask::from_allowed(rows(&[0, 2, 5]));
+        assert_mask_selects(&allow_list, &[5], &[1]);
+
+        let combined = block_list & allow_list;
+        assert_mask_selects(&combined, &[2], &[0, 5]);
+
+        let other = RowIdMask::from_allowed(rows(&[3]));
+        let combined = combined | other;
+        assert_mask_selects(&combined, &[2, 3], &[0, 5]);
+
+        let block_list = RowIdMask::from_block(rows(&[0]));
+        let allow_list = RowIdMask::from_allowed(rows(&[3]));
         let combined = block_list | allow_list;
-        assert!(combined.selected(1));
+        assert_mask_selects(&combined, &[1], &[]);
     }
 
     #[test]
     fn test_logical_and() {
-        let allow1 = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[0, 1]));
-        let block1 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[1, 2]));
-        let allow2 = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[1, 2, 3, 4]));
-        let block2 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[3, 4]));
+        let allow1 = RowIdMask::from_allowed(rows(&[0, 1]));
+        let block1 = RowIdMask::from_block(rows(&[1, 2]));
+        let allow2 = RowIdMask::from_allowed(rows(&[1, 2, 3, 4]));
+        let block2 = RowIdMask::from_block(rows(&[3, 4]));
 
         fn check(lhs: &RowIdMask, rhs: &RowIdMask, expected: &[u64]) {
             for mask in [lhs.clone() & rhs.clone(), rhs.clone() & lhs.clone()] {
-                let values = (0..10)
-                    .filter(|val| mask.selected(*val))
-                    .collect::<Vec<_>>();
-                assert_eq!(&values, expected);
+                assert_eq!(selected_in_range(&mask, 0..10), expected);
             }
         }
 
@@ -1065,23 +1040,16 @@ mod tests {
 
     #[test]
     fn test_logical_or() {
-        let allow1 = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[5, 6, 7, 8, 9]));
-        let block1 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[5, 6]));
-        let mixed1 = allow1
-            .clone()
-            .also_block(RowAddrTreeMap::from_iter(&[5, 6]));
-        let allow2 = RowIdMask::from_allowed(RowAddrTreeMap::from_iter(&[2, 3, 4, 5, 6, 7, 8]));
-        let block2 = RowIdMask::from_block(RowAddrTreeMap::from_iter(&[4, 5]));
-        let mixed2 = allow2
-            .clone()
-            .also_block(RowAddrTreeMap::from_iter(&[4, 5]));
+        let allow1 = RowIdMask::from_allowed(rows(&[5, 6, 7, 8, 9]));
+        let block1 = RowIdMask::from_block(rows(&[5, 6]));
+        let mixed1 = allow1.clone().also_block(rows(&[5, 6]));
+        let allow2 = RowIdMask::from_allowed(rows(&[2, 3, 4, 5, 6, 7, 8]));
+        let block2 = RowIdMask::from_block(rows(&[4, 5]));
+        let mixed2 = allow2.clone().also_block(rows(&[4, 5]));
 
         fn check(lhs: &RowIdMask, rhs: &RowIdMask, expected: &[u64]) {
             for mask in [lhs.clone() | rhs.clone(), rhs.clone() | lhs.clone()] {
-                let values = (0..10)
-                    .filter(|val| mask.selected(*val))
-                    .collect::<Vec<_>>();
-                assert_eq!(&values, expected);
+                assert_eq!(selected_in_range(&mask, 0..10), expected);
             }
         }
 
@@ -1119,8 +1087,8 @@ mod tests {
         // the case where both lists are present by converting to AllowList(allow - block).
 
         // Create the RowIdTreeMaps and serialize them directly
-        let allow = RowAddrTreeMap::from_iter(&[1, 2, 3, 4, 5, 10, 15]);
-        let block = RowAddrTreeMap::from_iter(&[2, 4, 15]);
+        let allow = rows(&[1, 2, 3, 4, 5, 10, 15]);
+        let block = rows(&[2, 4, 15]);
 
         // Serialize using the stable RowIdTreeMap serialization format
         let block_bytes = {
@@ -1142,21 +1110,7 @@ mod tests {
         let deserialized = RowIdMask::from_arrow(&old_format_array).unwrap();
 
         // The expected result: AllowList([1, 2, 3, 4, 5, 10, 15] - [2, 4, 15]) = [1, 3, 5, 10]
-        let expected_rows = vec![1u64, 3, 5, 10];
-        for row in &expected_rows {
-            assert!(
-                deserialized.selected(*row),
-                "Row {} should be selected",
-                row
-            );
-        }
-
-        // Verify blocked rows are not selected
-        assert!(!deserialized.selected(2), "Row 2 should be blocked");
-        assert!(!deserialized.selected(4), "Row 4 should be blocked");
-        assert!(!deserialized.selected(15), "Row 15 should be blocked");
-
-        // Verify it's an AllowList variant
+        assert_mask_selects(&deserialized, &[1, 3, 5, 10], &[2, 4, 15]);
         assert!(
             deserialized.allow_list().is_some(),
             "Should deserialize to AllowList variant"
@@ -1165,34 +1119,28 @@ mod tests {
 
     #[test]
     fn test_roundtrip_arrow() {
-        let row_addrs = RowAddrTreeMap::from_iter(&[1, 2, 3, 100, 2000]);
+        let row_addrs = rows(&[1, 2, 3, 100, 2000]);
 
         // Allow list
         let original = RowIdMask::from_allowed(row_addrs.clone());
         let array = original.into_arrow().unwrap();
-        let deserialized = RowIdMask::from_arrow(&array).unwrap();
-        assert_eq!(original, deserialized);
+        assert_eq!(RowIdMask::from_arrow(&array).unwrap(), original);
 
         // Block list
         let original = RowIdMask::from_block(row_addrs);
         let array = original.into_arrow().unwrap();
-        let deserialized = RowIdMask::from_arrow(&array).unwrap();
-        assert_eq!(original, deserialized);
+        assert_eq!(RowIdMask::from_arrow(&array).unwrap(), original);
     }
 
     #[test]
     fn test_deserialize_legacy_empty_lists() {
-        // Test edge cases with None values in old format
-
         // Case 1: Both None (should become all_rows)
         let array = BinaryArray::from_opt_vec(vec![None, None]);
         let mask = RowIdMask::from_arrow(&array).unwrap();
-        assert!(mask.selected(0));
-        assert!(mask.selected(100));
-        assert!(mask.selected(u64::MAX));
+        assert_mask_selects(&mask, &[0, 100, u64::MAX], &[]);
 
         // Case 2: Only block list (no allow list)
-        let block = RowAddrTreeMap::from_iter(&[5, 10]);
+        let block = rows(&[5, 10]);
         let block_bytes = {
             let mut buf = Vec::with_capacity(block.serialized_size());
             block.serialize_into(&mut buf).unwrap();
@@ -1200,13 +1148,10 @@ mod tests {
         };
         let array = BinaryArray::from_opt_vec(vec![Some(&block_bytes[..]), None]);
         let mask = RowIdMask::from_arrow(&array).unwrap();
-        assert!(mask.selected(0));
-        assert!(!mask.selected(5));
-        assert!(!mask.selected(10));
-        assert!(mask.selected(15));
+        assert_mask_selects(&mask, &[0, 15], &[5, 10]);
 
         // Case 3: Only allow list (no block list)
-        let allow = RowAddrTreeMap::from_iter(&[5, 10]);
+        let allow = rows(&[5, 10]);
         let allow_bytes = {
             let mut buf = Vec::with_capacity(allow.serialized_size());
             allow.serialize_into(&mut buf).unwrap();
@@ -1214,10 +1159,7 @@ mod tests {
         };
         let array = BinaryArray::from_opt_vec(vec![None, Some(&allow_bytes[..])]);
         let mask = RowIdMask::from_arrow(&array).unwrap();
-        assert!(!mask.selected(0));
-        assert!(mask.selected(5));
-        assert!(mask.selected(10));
-        assert!(!mask.selected(15));
+        assert_mask_selects(&mask, &[5, 10], &[0, 15]);
     }
 
     #[test]
@@ -1300,20 +1242,18 @@ mod tests {
 
     #[test]
     fn test_map_mask() {
-        let mask = RowAddrTreeMap::from_iter(&[0, 1, 2]);
-        let mask2 = RowAddrTreeMap::from_iter(&[0, 2, 3]);
+        let mask = rows(&[0, 1, 2]);
+        let mask2 = rows(&[0, 2, 3]);
 
         let allow_list = RowIdMask::AllowList(mask2.clone());
-        let expected = RowAddrTreeMap::from_iter(&[0, 2]);
         let mut actual = mask.clone();
         actual.mask(&allow_list);
-        assert_eq!(actual, expected);
+        assert_eq!(actual, rows(&[0, 2]));
 
         let block_list = RowIdMask::BlockList(mask2);
-        let expected = RowAddrTreeMap::from_iter(&[1]);
         let mut actual = mask;
         actual.mask(&block_list);
-        assert_eq!(actual, expected);
+        assert_eq!(actual, rows(&[1]));
     }
 
     #[test]
@@ -1359,9 +1299,7 @@ mod tests {
     fn test_map_from_roaring() {
         let bitmap = RoaringTreemap::from_iter(&[0, 1, 1 << 32]);
         let map = RowAddrTreeMap::from(bitmap);
-        assert!(map.contains(0));
-        assert!(map.contains(1));
-        assert!(map.contains(1 << 32));
+        assert!(map.contains(0) && map.contains(1) && map.contains(1 << 32));
         assert!(!map.contains(2));
     }
 
@@ -1389,18 +1327,22 @@ mod tests {
         map.insert_fragment(1);
         map.insert(4 << 32);
 
-        let mut other_map = RowAddrTreeMap::from_iter(&[0, 2, 1 << 32 | 10, 3 << 32 | 5]);
+        let mut other_map = rows(&[0, 2, 1 << 32 | 10, 3 << 32 | 5]);
         other_map.insert_fragment(4);
         map.extend(std::iter::once(other_map));
 
-        assert!(map.contains(0));
-        assert!(map.contains(2));
-        assert!(map.contains(1 << 32 | 5));
-        assert!(map.contains(1 << 32 | 10));
-        assert!(map.contains(3 << 32 | 5));
+        for id in [
+            0,
+            2,
+            1 << 32 | 5,
+            1 << 32 | 10,
+            3 << 32 | 5,
+            4 << 32,
+            4 << 32 | 7,
+        ] {
+            assert!(map.contains(id), "Expected {} to be contained", id);
+        }
         assert!(!map.contains(3));
-        assert!(map.contains(4 << 32));
-        assert!(map.contains(4 << 32 | 7));
     }
 
     proptest::proptest! {
@@ -1585,23 +1527,20 @@ mod tests {
 
     #[test]
     fn test_row_addr_selection_union_all_with_full() {
-        // Test union_all when one selection is Full
         let full = RowAddrSelection::Full;
         let partial = RowAddrSelection::Partial(RoaringBitmap::from_iter(&[1, 2, 3]));
 
-        let result = RowAddrSelection::union_all(&[&full, &partial]);
-        assert!(matches!(result, RowAddrSelection::Full));
+        assert!(matches!(
+            RowAddrSelection::union_all(&[&full, &partial]),
+            RowAddrSelection::Full
+        ));
 
-        // Test union_all with only partial selections
         let partial2 = RowAddrSelection::Partial(RoaringBitmap::from_iter(&[4, 5, 6]));
-        let result = RowAddrSelection::union_all(&[&partial, &partial2]);
-        match result {
-            RowAddrSelection::Partial(bitmap) => {
-                assert!(bitmap.contains(1));
-                assert!(bitmap.contains(4));
-            }
-            RowAddrSelection::Full => panic!("Expected Partial"),
-        }
+        let RowAddrSelection::Partial(bitmap) = RowAddrSelection::union_all(&[&partial, &partial2])
+        else {
+            panic!("Expected Partial");
+        };
+        assert!(bitmap.contains(1) && bitmap.contains(4));
     }
 
     #[test]
@@ -1630,20 +1569,16 @@ mod tests {
         map.insert_fragment(0);
 
         // Verify it's a full fragment - get_fragment_bitmap returns None for Full
-        assert!(map.contains(0));
-        assert!(map.contains(100));
-        assert!(map.contains(u32::MAX as u64));
+        for id in [0, 100, u32::MAX as u64] {
+            assert!(map.contains(id));
+        }
         assert!(map.get_fragment_bitmap(0).is_none());
 
         // Remove a value from the full fragment
         assert!(map.remove(50));
 
         // Now it should be partial (a full RoaringBitmap minus one value)
-        assert!(map.contains(0));
-        assert!(!map.contains(50));
-        assert!(map.contains(100));
-
-        // The fragment should now be Partial, so get_fragment_bitmap returns Some
+        assert!(map.contains(0) && !map.contains(50) && map.contains(100));
         assert!(map.get_fragment_bitmap(0).is_some());
     }
 
@@ -1655,13 +1590,10 @@ mod tests {
         map.insert(2 << 32 | 10); // fragment 2
         map.insert_fragment(3); // fragment 3
 
-        // Retain only fragments 0 and 2
         map.retain_fragments([0, 2]);
 
-        assert!(map.contains(0));
-        assert!(!map.contains(1 << 32 | 5));
-        assert!(map.contains(2 << 32 | 10));
-        assert!(!map.contains(3 << 32));
+        assert!(map.contains(0) && map.contains(2 << 32 | 10));
+        assert!(!map.contains(1 << 32 | 5) && !map.contains(3 << 32));
     }
 
     #[test]
@@ -1669,28 +1601,22 @@ mod tests {
         // Test BitOrAssign when LHS has Full and RHS has Partial
         let mut map1 = RowAddrTreeMap::default();
         map1.insert_fragment(0);
-
         let mut map2 = RowAddrTreeMap::default();
         map2.insert(5);
 
         map1 |= &map2;
         // Full | Partial = Full
-        assert!(map1.contains(0));
-        assert!(map1.contains(5));
-        assert!(map1.contains(100));
+        assert!(map1.contains(0) && map1.contains(5) && map1.contains(100));
 
         // Test BitOrAssign when LHS has Partial and RHS has Full
         let mut map3 = RowAddrTreeMap::default();
         map3.insert(5);
-
         let mut map4 = RowAddrTreeMap::default();
         map4.insert_fragment(0);
 
         map3 |= &map4;
         // Partial | Full = Full
-        assert!(map3.contains(0));
-        assert!(map3.contains(5));
-        assert!(map3.contains(100));
+        assert!(map3.contains(0) && map3.contains(5) && map3.contains(100));
     }
 
     #[test]
@@ -1698,34 +1624,28 @@ mod tests {
         // Test BitAndAssign when both have Full for same fragment
         let mut map1 = RowAddrTreeMap::default();
         map1.insert_fragment(0);
-
         let mut map2 = RowAddrTreeMap::default();
         map2.insert_fragment(0);
 
         map1 &= &map2;
         // Full & Full = Full
-        assert!(map1.contains(0));
-        assert!(map1.contains(100));
+        assert!(map1.contains(0) && map1.contains(100));
 
         // Test BitAndAssign when LHS Full, RHS Partial
         let mut map3 = RowAddrTreeMap::default();
         map3.insert_fragment(0);
-
         let mut map4 = RowAddrTreeMap::default();
         map4.insert(5);
         map4.insert(10);
 
         map3 &= &map4;
         // Full & Partial([5,10]) = Partial([5,10])
-        assert!(map3.contains(5));
-        assert!(map3.contains(10));
-        assert!(!map3.contains(0));
-        assert!(!map3.contains(100));
+        assert!(map3.contains(5) && map3.contains(10));
+        assert!(!map3.contains(0) && !map3.contains(100));
 
         // Test that empty intersection results in removal
         let mut map5 = RowAddrTreeMap::default();
         map5.insert(5);
-
         let mut map6 = RowAddrTreeMap::default();
         map6.insert(10);
 
@@ -1738,36 +1658,29 @@ mod tests {
         // Test SubAssign when LHS is Full and RHS is Partial
         let mut map1 = RowAddrTreeMap::default();
         map1.insert_fragment(0);
-
         let mut map2 = RowAddrTreeMap::default();
         map2.insert(5);
         map2.insert(10);
 
         map1 -= &map2;
         // Full - Partial([5,10]) = Full minus those values
-        assert!(map1.contains(0));
-        assert!(!map1.contains(5));
-        assert!(!map1.contains(10));
-        assert!(map1.contains(100));
+        assert!(map1.contains(0) && map1.contains(100));
+        assert!(!map1.contains(5) && !map1.contains(10));
 
         // Test SubAssign when both are Full for same fragment
         let mut map3 = RowAddrTreeMap::default();
         map3.insert_fragment(0);
-
         let mut map4 = RowAddrTreeMap::default();
         map4.insert_fragment(0);
 
         map3 -= &map4;
         // Full - Full = empty
-        assert!(!map3.contains(0));
-        assert!(!map3.contains(100));
         assert!(map3.is_empty());
 
         // Test SubAssign when LHS is Partial and RHS is Full
         let mut map5 = RowAddrTreeMap::default();
         map5.insert(5);
         map5.insert(10);
-
         let mut map6 = RowAddrTreeMap::default();
         map6.insert_fragment(0);
 
@@ -1782,15 +1695,13 @@ mod tests {
         let mut map = RowAddrTreeMap::default();
         map.insert_fragment(0);
 
-        // Now extend with values that would go into fragment 0
+        // Extend with values that would go into fragment 0
         map.extend([5u64, 10, 100].iter());
 
         // Should still be full fragment
-        assert!(map.contains(0));
-        assert!(map.contains(5));
-        assert!(map.contains(10));
-        assert!(map.contains(100));
-        assert!(map.contains(u32::MAX as u64));
+        for id in [0, 5, 10, 100, u32::MAX as u64] {
+            assert!(map.contains(id));
+        }
     }
 
     #[test]
@@ -1808,50 +1719,33 @@ mod tests {
 
     #[test]
     fn test_bitand_assign_owned() {
-        // Test BitAndAssign<Self> (owned, not reference) - lines 668-670
+        // Test BitAndAssign<Self> (owned, not reference)
         let mut map1 = RowAddrTreeMap::default();
         map1.insert(5);
         map1.insert(10);
 
-        let map2 = RowAddrTreeMap::from_iter(&[5, 15]);
-
         // Using owned rhs (not reference)
-        map1 &= map2;
+        map1 &= rows(&[5, 15]);
 
         assert!(map1.contains(5));
-        assert!(!map1.contains(10));
-        assert!(!map1.contains(15));
+        assert!(!map1.contains(10) && !map1.contains(15));
     }
 
     #[test]
     fn test_from_iter_with_full_fragment() {
-        // Test FromIterator<u64> when a full fragment already exists (lines 767-769)
-        // First create an iterator that would insert into fragment 0
-        let values = vec![5u64, 10, 100];
+        // When we collect into RowAddrTreeMap, it should handle duplicates
+        let map: RowAddrTreeMap = vec![5u64, 10, 100].into_iter().collect();
+        assert!(map.contains(5) && map.contains(10));
 
-        // Create a map with a full fragment 0
+        // Test that extending a map with full fragment ignores new values
         let mut map = RowAddrTreeMap::default();
         map.insert_fragment(0);
-
-        // Extend using FromIterator style (but we need to use extend since from_iter creates new)
-        // Actually, FromIterator is used in from_iter, which creates a new map
-        // Let's test that from_iter handles existing entries correctly by using collect
-
-        // When we collect into RowAddrTreeMap, it should handle duplicates
-        let map2: RowAddrTreeMap = values.clone().into_iter().collect();
-        assert!(map2.contains(5));
-        assert!(map2.contains(10));
-
-        // Now test that extending a map with full fragment ignores new values
-        let values_iter = values.into_iter();
-        let mut map3 = RowAddrTreeMap::default();
-        map3.insert_fragment(0);
-        for val in values_iter {
-            map3.insert(val); // This should be no-op since fragment is full
+        for val in [5, 10, 100] {
+            map.insert(val); // This should be no-op since fragment is full
         }
         // Still full fragment
-        assert!(map3.contains(0));
-        assert!(map3.contains(5));
-        assert!(map3.contains(u32::MAX as u64));
+        for id in [0, 5, u32::MAX as u64] {
+            assert!(map.contains(id));
+        }
     }
 }
