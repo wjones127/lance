@@ -487,4 +487,343 @@ mod tests {
         assert_eq!(&result.true_rows(), &expected_true);
         assert_eq!(result.null_rows(), &expected_nulls);
     }
+
+    #[test]
+    fn test_nullable_row_addr_set_with_nulls() {
+        let selected = RowAddrTreeMap::from_iter(&[1, 2, 3]);
+        let set = NullableRowAddrSet::new(selected.clone(), RowAddrTreeMap::new());
+
+        // Test with_nulls
+        let nulls = RowAddrTreeMap::from_iter(&[2]);
+        let set_with_nulls = set.with_nulls(nulls.clone());
+
+        assert!(set_with_nulls.selected(1));
+        assert!(!set_with_nulls.selected(2)); // null
+        assert!(set_with_nulls.selected(3));
+    }
+
+    #[test]
+    fn test_nullable_row_addr_set_len_and_is_empty() {
+        // Test len
+        let selected = RowAddrTreeMap::from_iter(&[1, 2, 3, 4, 5]);
+        let nulls = RowAddrTreeMap::from_iter(&[2, 4]);
+        let set = NullableRowAddrSet::new(selected, nulls);
+
+        // len() returns count of TRUE rows (selected - nulls)
+        assert_eq!(set.len(), Some(3)); // 1, 3, 5
+
+        // Test is_empty
+        assert!(!set.is_empty());
+
+        let empty_set = NullableRowAddrSet::empty();
+        assert!(empty_set.is_empty());
+        assert_eq!(empty_set.len(), Some(0));
+    }
+
+    #[test]
+    fn test_nullable_row_addr_set_selected() {
+        let selected = RowAddrTreeMap::from_iter(&[1, 2, 3]);
+        let nulls = RowAddrTreeMap::from_iter(&[2]);
+        let set = NullableRowAddrSet::new(selected, nulls);
+
+        // selected() returns true only for TRUE rows (in selected and not in nulls)
+        assert!(set.selected(1));
+        assert!(!set.selected(2)); // null
+        assert!(set.selected(3));
+        assert!(!set.selected(4)); // not in selected
+    }
+
+    #[test]
+    fn test_nullable_row_addr_set_partial_eq() {
+        let set1 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::from_iter(&[2]),
+        );
+        let set2 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::from_iter(&[2]),
+        );
+        // set3 has same true_rows but different nulls
+        let set3 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 3]),
+            RowAddrTreeMap::from_iter(&[3]), // Different nulls
+        );
+
+        assert_eq!(set1, set2);
+        // set3 has different nulls, so not equal
+        assert_ne!(set1, set3);
+    }
+
+    #[test]
+    fn test_nullable_row_addr_set_bitand_fast_path() {
+        // Test fast path when both have no nulls
+        let set1 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::new(), // No nulls
+        );
+        let set2 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2, 3, 4]),
+            RowAddrTreeMap::new(), // No nulls
+        );
+
+        let mut result = set1.clone();
+        result &= &set2;
+
+        // Intersection: [2, 3]
+        assert!(!result.selected(1));
+        assert!(result.selected(2));
+        assert!(result.selected(3));
+        assert!(!result.selected(4));
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_nullable_row_addr_set_bitor_fast_path() {
+        // Test fast path when both have no nulls
+        let set1 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::new(), // No nulls
+        );
+        let set2 = NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[3, 4]),
+            RowAddrTreeMap::new(), // No nulls
+        );
+
+        let mut result = set1.clone();
+        result |= &set2;
+
+        // Union: [1, 2, 3, 4]
+        assert!(result.selected(1));
+        assert!(result.selected(2));
+        assert!(result.selected(3));
+        assert!(result.selected(4));
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_drop_nulls() {
+        // Test drop_nulls for AllowList
+        let allow_mask = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3, 4]),
+            RowAddrTreeMap::from_iter(&[2, 4]),
+        ));
+        let dropped = allow_mask.drop_nulls();
+        // Should be AllowList([1, 3]) after removing nulls
+        assert!(dropped.selected(1));
+        assert!(!dropped.selected(2));
+        assert!(dropped.selected(3));
+        assert!(!dropped.selected(4));
+
+        // Test drop_nulls for BlockList
+        let block_mask = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::from_iter(&[3]),
+        ));
+        let dropped = block_mask.drop_nulls();
+        // BlockList: blocked = [1, 2] | [3] = [1, 2, 3]
+        assert!(!dropped.selected(1));
+        assert!(!dropped.selected(2));
+        assert!(!dropped.selected(3));
+        assert!(dropped.selected(4));
+        assert!(dropped.selected(5));
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_not_blocklist() {
+        // Test NOT on BlockList (line 165)
+        let block_mask = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::from_iter(&[2]),
+        ));
+        let not_mask = !block_mask;
+
+        // NOT(BlockList) = AllowList
+        match not_mask {
+            NullableRowIdMask::AllowList(_) => {}
+            _ => panic!("Expected AllowList after NOT"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitand_allow_allow_fast_path() {
+        // Test AllowList & AllowList with no nulls (fast path at line 181)
+        let mask1 = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::new(),
+        ));
+        let mask2 = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2, 3, 4]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = mask1 & mask2;
+        assert!(!result.selected(1));
+        assert!(result.selected(2));
+        assert!(result.selected(3));
+        assert!(!result.selected(4));
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitand_allow_block() {
+        // Test AllowList & BlockList (lines 190-200)
+        let allow = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3, 4, 5]),
+            RowAddrTreeMap::from_iter(&[2]),
+        ));
+        let block = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[3, 4]),
+            RowAddrTreeMap::from_iter(&[4]),
+        ));
+
+        let result = allow & block;
+        // allow: T=[1,3,4,5], N=[2]
+        // block: F=[3,4], N=[4]
+        // Result: allow.selected - block.selected = [1,2,5] intersected appropriately
+        assert!(result.selected(1)); // T & T = T
+        assert!(!result.selected(2)); // N & T = N (filtered)
+        assert!(!result.selected(3)); // T & F = F
+        assert!(!result.selected(4)); // T & N = N (filtered)
+        assert!(result.selected(5)); // T & T = T
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitand_allow_block_fast_path() {
+        // Test AllowList & BlockList fast path (no nulls, line 193)
+        let allow = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::new(),
+        ));
+        let block = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = allow & block;
+        assert!(result.selected(1));
+        assert!(!result.selected(2)); // blocked
+        assert!(result.selected(3));
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitand_block_block() {
+        // Test BlockList & BlockList (lines 202-211)
+        let block1 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::from_iter(&[2]),
+        ));
+        let block2 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2, 3]),
+            RowAddrTreeMap::from_iter(&[3]),
+        ));
+
+        let result = block1 & block2;
+        // block1: F=[1], N=[2]
+        // block2: F=[2], N=[3]
+        // AND: BlockList with selected = [1,2] | [2,3] = [1,2,3]
+        assert!(!result.selected(1)); // F & T = F
+        assert!(!result.selected(2)); // N & F = F or F & N = F
+        assert!(!result.selected(3)); // T & N = N (filtered)
+        assert!(result.selected(4)); // T & T = T
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitand_block_block_fast_path() {
+        // Test BlockList & BlockList fast path (no nulls, line 204)
+        let block1 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1]),
+            RowAddrTreeMap::new(),
+        ));
+        let block2 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = block1 & block2;
+        assert!(!result.selected(1)); // blocked by first
+        assert!(!result.selected(2)); // blocked by second
+        assert!(result.selected(3)); // not blocked
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitor_allow_allow_fast_path() {
+        // Test AllowList | AllowList with no nulls (fast path at line 228)
+        let mask1 = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::new(),
+        ));
+        let mask2 = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[3, 4]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = mask1 | mask2;
+        assert!(result.selected(1));
+        assert!(result.selected(2));
+        assert!(result.selected(3));
+        assert!(result.selected(4));
+        assert!(!result.selected(5));
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitor_allow_block() {
+        // Test AllowList | BlockList (lines 238-248)
+        let allow = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            RowAddrTreeMap::from_iter(&[2]),
+        ));
+        let block = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 4]),
+            RowAddrTreeMap::from_iter(&[4]),
+        ));
+
+        let result = allow | block;
+        // allow: T=[1,3], N=[2]
+        // block: F=[1], N=[4], T=everything else (including 2, 3, 5, etc.)
+        // OR semantics: T|F=T, T|T=T, N|T=T, F|N=N
+        assert!(result.selected(1)); // T | F = T
+                                     // Row 2: N (from allow) | T (from block, since 2 is not in block.selected) = T
+        assert!(result.selected(2)); // N | T = T (Kleene OR)
+        assert!(result.selected(3)); // T | T = T
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitor_allow_block_fast_path() {
+        // Test AllowList | BlockList fast path (no nulls, line 241)
+        let allow = NullableRowIdMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1]),
+            RowAddrTreeMap::new(),
+        ));
+        let block = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = allow | block;
+        // allow=[1], block=[2] (everything except 2 is allowed)
+        // OR: everything except 2, or 1 => everything except nothing that's not 1 but is 2
+        // Actually: AllowList([1]) | BlockList([2]) = BlockList([2] - [1]) = BlockList([2])
+        assert!(result.selected(1)); // in allow
+        assert!(!result.selected(2)); // blocked
+        assert!(result.selected(3)); // T from block
+    }
+
+    #[test]
+    fn test_nullable_row_id_mask_bitor_block_block_fast_path() {
+        // Test BlockList | BlockList with no nulls (fast path at line 252)
+        let block1 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[1, 2]),
+            RowAddrTreeMap::new(),
+        ));
+        let block2 = NullableRowIdMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(&[2, 3]),
+            RowAddrTreeMap::new(),
+        ));
+
+        let result = block1 | block2;
+        // OR of BlockLists: BlockList([1,2] & [2,3]) = BlockList([2])
+        assert!(result.selected(1)); // only blocked in first
+        assert!(!result.selected(2)); // blocked in both
+        assert!(result.selected(3)); // only blocked in second
+        assert!(result.selected(4)); // not blocked
+    }
 }

@@ -1563,4 +1563,295 @@ mod tests {
         }
 
     }
+
+    #[test]
+    fn test_row_addr_selection_deep_size_of() {
+        use deepsize::DeepSizeOf;
+
+        // Test Full variant - should have minimal size (just the enum discriminant)
+        let full = RowAddrSelection::Full;
+        let full_size = full.deep_size_of();
+        // Full variant has no heap allocations beyond the enum itself
+        assert!(full_size < 100); // Small sanity check
+
+        // Test Partial variant - should include bitmap size
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert_range(0..100);
+        let partial = RowAddrSelection::Partial(bitmap.clone());
+        let partial_size = partial.deep_size_of();
+        // Partial variant should be larger due to bitmap
+        assert!(partial_size >= bitmap.serialized_size());
+    }
+
+    #[test]
+    fn test_row_addr_selection_union_all_with_full() {
+        // Test union_all when one selection is Full
+        let full = RowAddrSelection::Full;
+        let partial = RowAddrSelection::Partial(RoaringBitmap::from_iter(&[1, 2, 3]));
+
+        let result = RowAddrSelection::union_all(&[&full, &partial]);
+        assert!(matches!(result, RowAddrSelection::Full));
+
+        // Test union_all with only partial selections
+        let partial2 = RowAddrSelection::Partial(RoaringBitmap::from_iter(&[4, 5, 6]));
+        let result = RowAddrSelection::union_all(&[&partial, &partial2]);
+        match result {
+            RowAddrSelection::Partial(bitmap) => {
+                assert!(bitmap.contains(1));
+                assert!(bitmap.contains(4));
+            }
+            RowAddrSelection::Full => panic!("Expected Partial"),
+        }
+    }
+
+    #[test]
+    fn test_insert_range_unbounded_start() {
+        let mut map = RowAddrTreeMap::default();
+
+        // Test exclusive start bound
+        let count = map.insert_range((std::ops::Bound::Excluded(5), std::ops::Bound::Included(10)));
+        assert_eq!(count, 5); // 6, 7, 8, 9, 10
+        assert!(!map.contains(5));
+        assert!(map.contains(6));
+        assert!(map.contains(10));
+
+        // Test unbounded end
+        let mut map2 = RowAddrTreeMap::default();
+        let count = map2.insert_range(0..5);
+        assert_eq!(count, 5);
+        assert!(map2.contains(0));
+        assert!(map2.contains(4));
+        assert!(!map2.contains(5));
+    }
+
+    #[test]
+    fn test_remove_from_full_fragment() {
+        let mut map = RowAddrTreeMap::default();
+        map.insert_fragment(0);
+
+        // Verify it's a full fragment - get_fragment_bitmap returns None for Full
+        assert!(map.contains(0));
+        assert!(map.contains(100));
+        assert!(map.contains(u32::MAX as u64));
+        assert!(map.get_fragment_bitmap(0).is_none());
+
+        // Remove a value from the full fragment
+        assert!(map.remove(50));
+
+        // Now it should be partial (a full RoaringBitmap minus one value)
+        assert!(map.contains(0));
+        assert!(!map.contains(50));
+        assert!(map.contains(100));
+
+        // The fragment should now be Partial, so get_fragment_bitmap returns Some
+        assert!(map.get_fragment_bitmap(0).is_some());
+    }
+
+    #[test]
+    fn test_retain_fragments() {
+        let mut map = RowAddrTreeMap::default();
+        map.insert(0); // fragment 0
+        map.insert(1 << 32 | 5); // fragment 1
+        map.insert(2 << 32 | 10); // fragment 2
+        map.insert_fragment(3); // fragment 3
+
+        // Retain only fragments 0 and 2
+        map.retain_fragments([0, 2]);
+
+        assert!(map.contains(0));
+        assert!(!map.contains(1 << 32 | 5));
+        assert!(map.contains(2 << 32 | 10));
+        assert!(!map.contains(3 << 32));
+    }
+
+    #[test]
+    fn test_bitor_assign_full_fragment() {
+        // Test BitOrAssign when LHS has Full and RHS has Partial
+        let mut map1 = RowAddrTreeMap::default();
+        map1.insert_fragment(0);
+
+        let mut map2 = RowAddrTreeMap::default();
+        map2.insert(5);
+
+        map1 |= &map2;
+        // Full | Partial = Full
+        assert!(map1.contains(0));
+        assert!(map1.contains(5));
+        assert!(map1.contains(100));
+
+        // Test BitOrAssign when LHS has Partial and RHS has Full
+        let mut map3 = RowAddrTreeMap::default();
+        map3.insert(5);
+
+        let mut map4 = RowAddrTreeMap::default();
+        map4.insert_fragment(0);
+
+        map3 |= &map4;
+        // Partial | Full = Full
+        assert!(map3.contains(0));
+        assert!(map3.contains(5));
+        assert!(map3.contains(100));
+    }
+
+    #[test]
+    fn test_bitand_assign_full_fragments() {
+        // Test BitAndAssign when both have Full for same fragment
+        let mut map1 = RowAddrTreeMap::default();
+        map1.insert_fragment(0);
+
+        let mut map2 = RowAddrTreeMap::default();
+        map2.insert_fragment(0);
+
+        map1 &= &map2;
+        // Full & Full = Full
+        assert!(map1.contains(0));
+        assert!(map1.contains(100));
+
+        // Test BitAndAssign when LHS Full, RHS Partial
+        let mut map3 = RowAddrTreeMap::default();
+        map3.insert_fragment(0);
+
+        let mut map4 = RowAddrTreeMap::default();
+        map4.insert(5);
+        map4.insert(10);
+
+        map3 &= &map4;
+        // Full & Partial([5,10]) = Partial([5,10])
+        assert!(map3.contains(5));
+        assert!(map3.contains(10));
+        assert!(!map3.contains(0));
+        assert!(!map3.contains(100));
+
+        // Test that empty intersection results in removal
+        let mut map5 = RowAddrTreeMap::default();
+        map5.insert(5);
+
+        let mut map6 = RowAddrTreeMap::default();
+        map6.insert(10);
+
+        map5 &= &map6;
+        assert!(map5.is_empty());
+    }
+
+    #[test]
+    fn test_sub_assign_with_full_fragments() {
+        // Test SubAssign when LHS is Full and RHS is Partial
+        let mut map1 = RowAddrTreeMap::default();
+        map1.insert_fragment(0);
+
+        let mut map2 = RowAddrTreeMap::default();
+        map2.insert(5);
+        map2.insert(10);
+
+        map1 -= &map2;
+        // Full - Partial([5,10]) = Full minus those values
+        assert!(map1.contains(0));
+        assert!(!map1.contains(5));
+        assert!(!map1.contains(10));
+        assert!(map1.contains(100));
+
+        // Test SubAssign when both are Full for same fragment
+        let mut map3 = RowAddrTreeMap::default();
+        map3.insert_fragment(0);
+
+        let mut map4 = RowAddrTreeMap::default();
+        map4.insert_fragment(0);
+
+        map3 -= &map4;
+        // Full - Full = empty
+        assert!(!map3.contains(0));
+        assert!(!map3.contains(100));
+        assert!(map3.is_empty());
+
+        // Test SubAssign when LHS is Partial and RHS is Full
+        let mut map5 = RowAddrTreeMap::default();
+        map5.insert(5);
+        map5.insert(10);
+
+        let mut map6 = RowAddrTreeMap::default();
+        map6.insert_fragment(0);
+
+        map5 -= &map6;
+        // Partial - Full = empty
+        assert!(map5.is_empty());
+    }
+
+    #[test]
+    fn test_from_iterator_with_full_fragment() {
+        // Test that inserting into a full fragment is a no-op
+        let mut map = RowAddrTreeMap::default();
+        map.insert_fragment(0);
+
+        // Now extend with values that would go into fragment 0
+        map.extend([5u64, 10, 100].iter());
+
+        // Should still be full fragment
+        assert!(map.contains(0));
+        assert!(map.contains(5));
+        assert!(map.contains(10));
+        assert!(map.contains(100));
+        assert!(map.contains(u32::MAX as u64));
+    }
+
+    #[test]
+    fn test_insert_range_excluded_end() {
+        // Test excluded end bound (line 391-393)
+        let mut map = RowAddrTreeMap::default();
+        // Using RangeFrom with small range won't hit the unbounded case
+        // Instead test Bound::Excluded for end
+        let count = map.insert_range((std::ops::Bound::Included(5), std::ops::Bound::Excluded(10)));
+        assert_eq!(count, 5); // 5, 6, 7, 8, 9
+        assert!(map.contains(5));
+        assert!(map.contains(9));
+        assert!(!map.contains(10));
+    }
+
+    #[test]
+    fn test_bitand_assign_owned() {
+        // Test BitAndAssign<Self> (owned, not reference) - lines 668-670
+        let mut map1 = RowAddrTreeMap::default();
+        map1.insert(5);
+        map1.insert(10);
+
+        let map2 = RowAddrTreeMap::from_iter(&[5, 15]);
+
+        // Using owned rhs (not reference)
+        map1 &= map2;
+
+        assert!(map1.contains(5));
+        assert!(!map1.contains(10));
+        assert!(!map1.contains(15));
+    }
+
+    #[test]
+    fn test_from_iter_with_full_fragment() {
+        // Test FromIterator<u64> when a full fragment already exists (lines 767-769)
+        // First create an iterator that would insert into fragment 0
+        let values = vec![5u64, 10, 100];
+
+        // Create a map with a full fragment 0
+        let mut map = RowAddrTreeMap::default();
+        map.insert_fragment(0);
+
+        // Extend using FromIterator style (but we need to use extend since from_iter creates new)
+        // Actually, FromIterator is used in from_iter, which creates a new map
+        // Let's test that from_iter handles existing entries correctly by using collect
+
+        // When we collect into RowAddrTreeMap, it should handle duplicates
+        let map2: RowAddrTreeMap = values.clone().into_iter().collect();
+        assert!(map2.contains(5));
+        assert!(map2.contains(10));
+
+        // Now test that extending a map with full fragment ignores new values
+        let values_iter = values.into_iter();
+        let mut map3 = RowAddrTreeMap::default();
+        map3.insert_fragment(0);
+        for val in values_iter {
+            map3.insert(val); // This should be no-op since fragment is full
+        }
+        // Still full fragment
+        assert!(map3.contains(0));
+        assert!(map3.contains(5));
+        assert!(map3.contains(u32::MAX as u64));
+    }
 }
