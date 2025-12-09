@@ -22,6 +22,8 @@ such as Euclidean distance or cosine similarity. They return row addresses and t
 
 **System indices** are auxiliary indices that help accelerate internal system operations. They are
 different from user-facing scalar and vector indices, as they are not directly used in user queries.
+Examples include the [Fragment Reuse Index](system/frag_reuse.md), which supports efficient row address
+remapping after compaction.
 
 ## Design
 
@@ -48,8 +50,8 @@ Lance indices are designed with the following design choices in mind:
 An index in Lance is defined over a specific column (or multiple columns) of a dataset.
 It is identified by its name.
 
-An index is made up of multiple **index segments**. (These are sometimes called "delta indices".)
-These segments are identified by their unique UUIDs.
+An index is made up of multiple **index segments**, identified by their unique UUIDs.
+Each segment is an independent, self-contained index covering a subset of the data.
 
 Each index segment covers a disjoint subset of fragments in the dataset. The segments must cover
 all rows in the fragments they cover, with one exception: if a fragment has delete markers at the time
@@ -87,6 +89,47 @@ The actual content stored in the index directory depends on the index type. Thes
 arbitrary files defined by the index implementation. However, often they are made up of
 Lance files containing the index data structures. The allows reuse of the existing Lance
 file format code for reading and writing index data.
+
+## Creating and Updating Index Segments
+
+Index segments are created and updated through a transactional process:
+
+1. **Build the index data**: Read the relevant column data from the fragments to be indexed
+   and construct the index data structures. Write these to files in a new `_indices/{UUID}`
+   directory, where `{UUID}` is a newly generated unique identifier.
+
+2. **Prepare the metadata**: Create an `IndexMetadata` message with:
+    - `uuid`: The newly generated UUID
+    - `name`: The index name (must match existing segments if adding to an existing index)
+    - `fields`: The column(s) being indexed
+    - `fragment_bitmap`: The set of fragment IDs covered by this segment
+    - `index_details`: Index-specific configuration and parameters
+    - `version`: The format version of this index type
+
+3. **Commit the transaction**: Write a new manifest that includes the new index segment
+   in its `IndexSection`. This is done atomically using the same transaction mechanism
+   as data writes.
+
+When updating an indexed column in place (without deleting the row), the engine must
+add the affected fragment IDs to the `invalidated_fragments` field of any index segments
+that cover those fragments. This marks those fragments as needing re-indexing without
+invalidating the entire segment.
+
+## Index Compatibility
+
+Before using an index segment, engines must verify they support it:
+
+1. **Check the index type**: The `index_details` field contains a protobuf `Any` message
+   whose type URL identifies the index type (e.g., B-tree, IVF, HNSW). If the engine
+   does not recognize the type, it should skip this index segment.
+
+2. **Check the version**: The `version` field in `IndexMetadata` indicates the format
+   version of the index segment. If the engine does not support this version, it should
+   skip this index segment. This allows index formats to evolve over time while
+   maintaining backwards compatibility.
+
+When an engine cannot use an index segment, it should fall back to scanning the
+fragments that would have been covered by that segment.
 
 ## Loading an index
 
@@ -130,8 +173,15 @@ There are both part of the `table.proto` file in the Lance source code.
 
 ## Handling deleted rows
 
-Since index segments are immutable, they main contain references to rows that have been deleted
+Since index segments are immutable, they may contain references to rows that have been deleted
 or updated. These should be filtered out during query execution.
+
+!!! important "Fragment bitmap immutability"
+
+    The `fragment_bitmap` field must never be modified after an index segment is created.
+    This invariant is critical for correctly detecting deleted fragments: if a fragment ID
+    is present in the bitmap but missing from the dataset, the engine knows the fragment
+    was deleted after the index was created.
 
 <figure markdown="span">
   ![](./indices-fragment handling.drawio.svg)
@@ -146,8 +196,7 @@ There are three situations to consider:
    as deleted, but some of the rows are still present. The row addresses from the deletion
    file should be used to filter out results from the index.
 2. **A fragment has been completely deleted.** This can be detected by checking if a
-   fragment ID present in the fragment bitmap is missing from the dataset. (This is why
-   it is important for index segments to not mutate the fragment bitmap after creation.)
+   fragment ID present in the fragment bitmap is missing from the dataset.
    Any row addresses from this fragment should be filtered out.
 3. **A fragment has had the indexed column updated in place.** This can be detected by checking
    if a fragment ID present in the fragment bitmap is also present in the `invalidated_fragments`
@@ -194,7 +243,18 @@ to existing row addresses. There are three ways to handle this:
 
 ## Stable Row ID for Index
 
-Using a stable row ID to replace the row address for an index is a work in progress.
-The main benefit is that remap is not needed, and an update only needs to invalidate the index if related column data has changed.
-The tradeoff is that it requires an additional index search to translate a stable row ID to the physical row address.
-We are still working on evaluating the performance impact of this change before making it more widely used.
+Indices can optionally use stable row IDs instead of row addresses. A stable row ID is a
+logical identifier that remains constant even when rows are moved during compaction.
+
+**Benefits:**
+
+- No remapping needed after compaction
+- Updates only invalidate the index if the indexed column data changes
+
+**Tradeoffs:**
+
+- Requires an additional lookup to translate stable row IDs to physical row addresses
+  at query time
+
+This feature is currently experimental. Performance evaluation is ongoing to determine
+when the tradeoff is worthwhile.
