@@ -250,8 +250,22 @@ message IndexMetadata {
   // deleted while the index is still in use, this information is also stored
   // in the index.
   //
+  // This should contain all fragments that the index was built from. It should
+  // not be modified after creation. To indicate that the index should invalidate
+  // certain fragments, use the `invalidated_fragments` bitmap instead. This field
+  // is used to understand which row address ranges can be expected from the index,
+  // and thus can be used to construct a mask for filtering index results.
+  //
   // The bitmap is stored as a 32-bit Roaring bitmap.
   bytes fragment_bitmap = 5;
+
+  // A bitmap of invalidated fragment ids. This is used to invalidate a portion
+  // of an index if the indexed column is updated in-place in a fragment
+  // (using a DataReplacement transaction, for example).
+  //
+  // The bitmap is stored as a 32-bit Roaring bitmap. This may be empty if no
+  // fragments have been invalidated or if it was written by an older version.
+  bytes invalidated_fragments = 10;
 
   // Details, specific to the index type, which are needed to load / interpret the index
   //

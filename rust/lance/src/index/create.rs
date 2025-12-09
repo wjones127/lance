@@ -339,6 +339,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 // Empty bitmap for untrained indices
                 Some(roaring::RoaringBitmap::new())
             },
+            invalidated_fragments: Some(roaring::RoaringBitmap::new()),
             index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),

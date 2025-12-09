@@ -2382,6 +2382,7 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
+            invalidated_fragments: Some(RoaringBitmap::new()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -2420,6 +2421,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
+            invalidated_fragments: Some(RoaringBitmap::new()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
@@ -2485,6 +2487,7 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
+            invalidated_fragments: Some(RoaringBitmap::new()),
             index_details: Some(Arc::new(vector_index_details())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),

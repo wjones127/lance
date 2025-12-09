@@ -550,6 +550,7 @@ pub(crate) fn new_mem_wal_index_meta(
         fields: vec![],
         dataset_version,
         fragment_bitmap: None,
+        invalidated_fragments: None,
         index_details: Some(Arc::new(prost_types::Any::from_msg(
             &pb::MemWalIndexDetails::from(&MemWalIndexDetails {
                 mem_wal_list: new_mem_wal_list,

@@ -3943,6 +3943,7 @@ mod tests {
             name: name.to_string(),
             dataset_version,
             fragment_bitmap,
+            invalidated_fragments: None,
             index_details,
             index_version: 1,
             created_at: None,
@@ -3961,6 +3962,7 @@ mod tests {
             name: name.to_string(),
             dataset_version: 1,
             fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
+            invalidated_fragments: None,
             index_details: Some(Arc::new(Any {
                 type_url: "type.googleapis.com/lance.index.SystemIndexDetails".to_string(),
                 value: vec![],

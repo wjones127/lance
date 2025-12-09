@@ -571,6 +571,7 @@ mod tests {
             fields: vec![field_id],
             dataset_version: 1,
             fragment_bitmap: None,
+            invalidated_fragments: None,
             index_details,
             index_version: 0,
             created_at: None,

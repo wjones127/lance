@@ -2176,6 +2176,7 @@ mod tests {
             fields: vec![0],
             dataset_version: 1,
             fragment_bitmap: None,
+            invalidated_fragments: None,
             index_details: None,
             index_version: 0,
             created_at: None, // Test index, not setting timestamp

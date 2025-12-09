@@ -732,6 +732,7 @@ impl DatasetIndexExt for Dataset {
         }
     }
 
+    // TODO: Should we deprecate this in favor of the commit API?
     async fn commit_existing_index(
         &mut self,
         index_name: &str,
@@ -754,6 +755,7 @@ impl DatasetIndexExt for Dataset {
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            invalidated_fragments: Some(RoaringBitmap::new()),
             index_details: None,
             index_version: 0,
             created_at: Some(chrono::Utc::now()),
@@ -874,6 +876,7 @@ impl DatasetIndexExt for Dataset {
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(res.new_fragment_bitmap),
+                invalidated_fragments: Some(RoaringBitmap::new()),
                 index_details: Some(Arc::new(res.new_index_details)),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),

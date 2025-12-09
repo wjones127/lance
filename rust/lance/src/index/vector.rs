@@ -51,6 +51,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::IndexMetadata;
 use object_store::path::Path;
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use snafu::location;
 use tracing::instrument;
@@ -1159,17 +1160,13 @@ pub async fn initialize_vector_index(
             location: location!(),
         })?;
 
-    let fragment_bitmap = if target_dataset.get_fragments().is_empty() {
-        Some(roaring::RoaringBitmap::new())
-    } else {
-        Some(
-            target_dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect(),
-        )
-    };
+    let fragment_bitmap = Some(
+        target_dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect(),
+    );
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -1177,6 +1174,7 @@ pub async fn initialize_vector_index(
         fields: vec![field.id],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
+        invalidated_fragments: Some(RoaringBitmap::new()),
         index_details: Some(Arc::new(vector_index_details())),
         index_version: VECTOR_INDEX_VERSION as i32,
         created_at: Some(chrono::Utc::now()),

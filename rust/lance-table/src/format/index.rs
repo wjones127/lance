@@ -34,10 +34,19 @@ pub struct IndexMetadata {
 
     /// The fragment ids this index covers.
     ///
-    /// This may contain fragment ids that no longer exist in the dataset.
+    /// This may contain fragment ids that no longer exist in the dataset. It should **not**
+    /// be modified after it's initial creation. To indicate that certain fragments are invalidated,
+    /// use the `invalidated_fragments` field instead.
     ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
+
+    /// The fragment ids that have been invalidated in this index.
+    ///
+    /// If a fragment is invalidated, it means that the index should not be used to query data from that fragment.
+    /// This is typically used when the indexed column is updated in-place in a fragment (using a DataReplacement transaction, for example).
+    /// If this is None, then assume no fragments are invalidated.
+    pub invalidated_fragments: Option<RoaringBitmap>,
 
     /// Metadata specific to the index type
     ///
@@ -95,6 +104,14 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )?)
         };
 
+        let invalidated_fragments = if proto.invalidated_fragments.is_empty() {
+            None
+        } else {
+            Some(RoaringBitmap::deserialize_from(
+                &mut proto.invalidated_fragments.as_slice(),
+            )?)
+        };
+
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::io(
@@ -106,6 +123,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
+            invalidated_fragments,
             index_details: proto.index_details.map(Arc::new),
             index_version: proto.index_version.unwrap_or_default(),
             created_at: proto.created_at.map(|ts| {
@@ -121,11 +139,23 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
         if let Some(bitmap) = &idx.fragment_bitmap {
+            fragment_bitmap.reserve(bitmap.serialized_size() as usize);
             if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
                 // In theory, this should never error. But if we do, just
                 // recover gracefully.
                 log::error!("Failed to serialize fragment bitmap: {}", e);
                 fragment_bitmap.clear();
+            }
+        }
+
+        let mut invalidated_fragments = Vec::new();
+        if let Some(bitmap) = &idx.invalidated_fragments {
+            invalidated_fragments.reserve(bitmap.serialized_size() as usize);
+            if let Err(e) = bitmap.serialize_into(&mut invalidated_fragments) {
+                // In theory, this should never error. But if we do, just
+                // recover gracefully.
+                log::error!("Failed to serialize invalidated fragments bitmap: {}", e);
+                invalidated_fragments.clear();
             }
         }
 
@@ -135,6 +165,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
+            invalidated_fragments,
             index_details: idx
                 .index_details
                 .as_ref()
