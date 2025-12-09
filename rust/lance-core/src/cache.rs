@@ -24,12 +24,14 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 pub struct SizedRecord {
     record: ArcAny,
     size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    type_name: &'static str,
 }
 
 impl std::fmt::Debug for SizedRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SizedRecord")
             .field("record", &self.record)
+            .field("type_name", &self.type_name)
             .finish()
     }
 }
@@ -48,6 +50,7 @@ impl SizedRecord {
         Self {
             record,
             size_accessor: Arc::new(size_accessor),
+            type_name: std::any::type_name::<T>(),
         }
     }
 }
@@ -275,6 +278,99 @@ impl LanceCache {
         self.cache.run_pending_tasks().await;
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
+    }
+
+    /// Debug cache size estimates using Archimedes' Method.
+    ///
+    /// This method drops cache entries one by one in random order, measuring
+    /// actual memory usage before and after each drop to compare with `DeepSizeOf`
+    /// estimates.
+    ///
+    /// **Warning**: This method clears the cache! It is intended for debugging
+    /// only and should not be used in production.
+    ///
+    /// The random order helps identify if certain entry types consistently
+    /// under/over-estimate their sizes, regardless of drop order effects.
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - Optional random seed for reproducible debugging sessions.
+    ///
+    /// # Returns
+    ///
+    /// A [`CacheDebugReport`] containing per-entry measurements and totals.
+    #[cfg(feature = "debug-cache")]
+    pub async fn debug_sizes(&self, seed: Option<u64>) -> CacheDebugReport {
+        use memory_stats::memory_stats;
+        use rand::prelude::SliceRandom;
+        use rand::SeedableRng;
+
+        // Ensure all pending operations are complete
+        self.cache.run_pending_tasks().await;
+
+        // Collect all entries with their keys, type names, and DeepSizeOf sizes
+        let mut entries: Vec<((String, TypeId), &'static str, usize)> = self
+            .cache
+            .iter()
+            .map(|(key, record)| {
+                let deep_size = (record.size_accessor)(&record.record);
+                // key is Arc<(String, TypeId)>, we need to clone the inner tuple
+                ((*key).clone(), record.type_name, deep_size)
+            })
+            .collect();
+
+        // Shuffle entries randomly
+        let mut rng = match seed {
+            Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+            None => rand::rngs::StdRng::from_rng(&mut rand::rng()),
+        };
+        entries.shuffle(&mut rng);
+
+        let total_deep_size_of: usize = entries.iter().map(|(_, _, size)| size).sum();
+        let mut results = Vec::with_capacity(entries.len());
+        let mut total_measured: i64 = 0;
+        let mut entries_with_measurement: usize = 0;
+
+        for (cache_key, type_name, deep_size) in entries {
+            // Measure memory before drop
+            let mem_before = memory_stats().map(|s| s.physical_mem);
+
+            // Remove the entry from cache
+            self.cache.invalidate(&cache_key).await;
+
+            // Force pending operations and give allocator time to release
+            self.cache.run_pending_tasks().await;
+
+            // Small yield to allow memory to be released
+            tokio::task::yield_now().await;
+
+            // Measure memory after drop
+            let mem_after = memory_stats().map(|s| s.physical_mem);
+
+            let measured = match (mem_before, mem_after) {
+                (Some(before), Some(after)) => {
+                    let diff = before as i64 - after as i64;
+                    total_measured += diff;
+                    entries_with_measurement += 1;
+                    Some(diff)
+                }
+                _ => None,
+            };
+
+            results.push(CacheDebugEntry {
+                key: cache_key.0,
+                type_name,
+                deep_size_of_bytes: deep_size,
+                measured_bytes: measured,
+            });
+        }
+
+        CacheDebugReport {
+            entries: results,
+            total_deep_size_of,
+            total_measured,
+            entries_with_measurement,
+        }
     }
 
     // CacheKey-based methods
@@ -597,6 +693,119 @@ impl CacheStats {
     }
 }
 
+/// Information about a single cache entry during Archimedes' Method debugging.
+///
+/// See [`LanceCache::debug_sizes`] for details on this debugging approach.
+#[cfg(feature = "debug-cache")]
+#[derive(Debug, Clone)]
+pub struct CacheDebugEntry {
+    /// The cache key (string portion)
+    pub key: String,
+    /// The type name of the cached value (captured via `std::any::type_name`)
+    pub type_name: &'static str,
+    /// Size reported by `DeepSizeOf`
+    pub deep_size_of_bytes: usize,
+    /// Actual memory released when this entry was dropped (measured via process memory).
+    /// None if memory measurement was unavailable.
+    pub measured_bytes: Option<i64>,
+}
+
+/// Report from Archimedes' Method cache debugging.
+///
+/// This report is produced by [`LanceCache::debug_sizes`] and contains measurements
+/// comparing estimated sizes (via `DeepSizeOf`) with actual memory released when
+/// dropping cache entries.
+#[cfg(feature = "debug-cache")]
+#[derive(Debug, Clone)]
+pub struct CacheDebugReport {
+    /// Individual entry measurements
+    pub entries: Vec<CacheDebugEntry>,
+    /// Sum of all `DeepSizeOf` values
+    pub total_deep_size_of: usize,
+    /// Sum of all measured memory releases (only entries where measurement succeeded)
+    pub total_measured: i64,
+    /// Number of entries where memory measurement was available
+    pub entries_with_measurement: usize,
+}
+
+#[cfg(feature = "debug-cache")]
+impl CacheDebugReport {
+    /// Calculate the discrepancy between `DeepSizeOf` and measured memory.
+    ///
+    /// Positive values indicate `DeepSizeOf` underestimates memory usage.
+    /// Negative values indicate `DeepSizeOf` overestimates memory usage.
+    pub fn discrepancy(&self) -> i64 {
+        self.total_measured - self.total_deep_size_of as i64
+    }
+
+    /// Calculate the discrepancy as a percentage of `DeepSizeOf`.
+    pub fn discrepancy_percent(&self) -> f64 {
+        if self.total_deep_size_of == 0 {
+            0.0
+        } else {
+            (self.discrepancy() as f64 / self.total_deep_size_of as f64) * 100.0
+        }
+    }
+
+    /// Format the report as a human-readable table.
+    pub fn format_table(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        writeln!(out, "Cache Debug Report (Archimedes' Method)").unwrap();
+        writeln!(out, "========================================").unwrap();
+        writeln!(
+            out,
+            "{:<50} {:<40} {:>15} {:>15}",
+            "Key", "Type", "DeepSizeOf", "Measured"
+        )
+        .unwrap();
+        writeln!(out, "{}", "-".repeat(120)).unwrap();
+
+        for entry in &self.entries {
+            let measured_str = match entry.measured_bytes {
+                Some(m) => format!("{}", m),
+                None => "N/A".to_string(),
+            };
+            // Truncate long strings for display
+            let key_display = if entry.key.len() > 47 {
+                format!("{}...", &entry.key[..47])
+            } else {
+                entry.key.clone()
+            };
+            let type_display = if entry.type_name.len() > 37 {
+                format!("{}...", &entry.type_name[..37])
+            } else {
+                entry.type_name.to_string()
+            };
+            writeln!(
+                out,
+                "{:<50} {:<40} {:>15} {:>15}",
+                key_display, type_display, entry.deep_size_of_bytes, measured_str
+            )
+            .unwrap();
+        }
+
+        writeln!(out, "{}", "-".repeat(120)).unwrap();
+        writeln!(out, "Total DeepSizeOf: {} bytes", self.total_deep_size_of).unwrap();
+        writeln!(
+            out,
+            "Total Measured: {} bytes ({} entries)",
+            self.total_measured, self.entries_with_measurement
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "Discrepancy: {} bytes ({:.1}%)",
+            self.discrepancy(),
+            self.discrepancy_percent()
+        )
+        .unwrap();
+
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +1014,112 @@ mod tests {
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 2);
+    }
+
+    #[test]
+    fn test_sized_record_type_name() {
+        let record = SizedRecord::new(Arc::new(vec![1u8, 2, 3]));
+        assert!(record.type_name.contains("Vec"));
+        assert!(record.type_name.contains("u8"));
+    }
+}
+
+#[cfg(all(test, feature = "debug-cache"))]
+mod debug_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_debug_sizes_basic() {
+        let cache = LanceCache::with_capacity(10_000_000);
+
+        // Insert some test data
+        cache.insert("key1", Arc::new(vec![0u8; 1024])).await;
+        cache.insert("key2", Arc::new(vec![0u8; 2048])).await;
+        cache.insert("key3", Arc::new(vec![0u8; 4096])).await;
+
+        let report = cache.debug_sizes(Some(42)).await;
+
+        assert_eq!(report.entries.len(), 3);
+        // At least the vec data should be counted
+        assert!(report.total_deep_size_of > 7000);
+
+        // After debug_sizes, cache should be empty
+        assert_eq!(cache.size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_debug_sizes_empty_cache() {
+        let cache = LanceCache::with_capacity(1000);
+        let report = cache.debug_sizes(None).await;
+
+        assert_eq!(report.entries.len(), 0);
+        assert_eq!(report.total_deep_size_of, 0);
+        assert_eq!(report.total_measured, 0);
+        assert_eq!(report.entries_with_measurement, 0);
+    }
+
+    #[tokio::test]
+    async fn test_debug_sizes_contains_all_entries() {
+        let cache = LanceCache::with_capacity(10_000_000);
+        cache.insert("a", Arc::new(vec![0u8; 100])).await;
+        cache.insert("b", Arc::new(vec![0u8; 200])).await;
+        cache.insert("c", Arc::new(vec![0u8; 300])).await;
+
+        let report = cache.debug_sizes(Some(12345)).await;
+
+        // All entries should be present (order may vary due to shuffling)
+        let mut keys: Vec<_> = report.entries.iter().map(|e| e.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+
+        // Verify type names are captured
+        for entry in &report.entries {
+            assert!(entry.type_name.contains("Vec"));
+        }
+    }
+
+    #[test]
+    fn test_cache_debug_report_discrepancy() {
+        let report = CacheDebugReport {
+            entries: vec![],
+            total_deep_size_of: 1000,
+            total_measured: 1200,
+            entries_with_measurement: 1,
+        };
+
+        assert_eq!(report.discrepancy(), 200);
+        assert!((report.discrepancy_percent() - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_cache_debug_report_format_table() {
+        let report = CacheDebugReport {
+            entries: vec![
+                CacheDebugEntry {
+                    key: "test/key1".to_string(),
+                    type_name: "alloc::vec::Vec<u8>",
+                    deep_size_of_bytes: 1024,
+                    measured_bytes: Some(1000),
+                },
+                CacheDebugEntry {
+                    key: "test/key2".to_string(),
+                    type_name: "alloc::string::String",
+                    deep_size_of_bytes: 256,
+                    measured_bytes: None,
+                },
+            ],
+            total_deep_size_of: 1280,
+            total_measured: 1000,
+            entries_with_measurement: 1,
+        };
+
+        let table = report.format_table();
+        assert!(table.contains("Cache Debug Report"));
+        assert!(table.contains("test/key1"));
+        assert!(table.contains("test/key2"));
+        assert!(table.contains("1024"));
+        assert!(table.contains("1000"));
+        assert!(table.contains("N/A"));
+        assert!(table.contains("Total DeepSizeOf: 1280 bytes"));
     }
 }

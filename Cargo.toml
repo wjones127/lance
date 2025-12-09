@@ -144,6 +144,7 @@ jieba-rs = { version = "0.8.1", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
+memory-stats = "1.2"
 mockall = { version = "0.13.1" }
 mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
