@@ -118,13 +118,14 @@ The `IndexMetadata` message contains important information about the index segme
 <details>
   <summary>Full protobuf definitions</summary>
 
-  There are both part of the `table.proto` file in the Lance source code.
+There are both part of the `table.proto` file in the Lance source code.
 
-  ```protobuf
-  %%% proto.message.IndexSection %%%
+```protobuf
+%%% proto.message.IndexSection %%%
 
-  %%% proto.message.IndexMetadata %%%
-  ```
+%%% proto.message.IndexMetadata %%%
+```
+
 </details>
 
 ## Handling deleted rows
@@ -174,12 +175,18 @@ When fragments are compacted, the row addresses of the rows in the fragments cha
 This means that any index segments referencing those fragments will no longer point
 to existing row addresses. There are three ways to handle this:
 
+<figure markdown="span">
+![](./indices-compaction.drawio.svg)
+</figure>
+
 1. Do nothing and let the index segment not cover those fragments anymore. This approach is
    simple and valid, but it means compaction can immediately make an index out-of-date. This
    is the worst options for query performance.
+
 2. Immediately rewrite the index segments with the row addresses remapped. This approach
    ensures the index is kept up-to-date, but it incurs singificant write ampliciation
    during compaction.
+
 3. Create a [Fragment Reuse Index](system/frag_reuse.md) that maps old row addresses to new
    row addresses. This allows readers to remap the row addresses in memory upon reading
    the index segments. This approach adds some IO and computation overhead during query

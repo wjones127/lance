@@ -59,7 +59,6 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
-  - footnotes
 
 plugins:
   - search
