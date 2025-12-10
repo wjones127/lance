@@ -75,7 +75,7 @@ const LOG_TABLE_256: [u8; 256] = [
 
 /// Returns the number of bits needed to represent the given number.
 ///
-/// Inspired by https://graphics.stanford.edu/~seander/bithacks.html
+/// Inspired by <https://graphics.stanford.edu/~seander/bithacks.html>
 ///
 /// ```
 /// use lance_core::utils::bit::log_2_ceil;
