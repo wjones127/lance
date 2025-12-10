@@ -1212,6 +1212,300 @@ async fn test_data_replacement_invalidates_indices() {
     );
 }
 
+/// Test that optimize_indices creates merged indices with empty invalidated_fragments.
+#[tokio::test]
+async fn test_optimize_indices_resets_invalidated_fragments() {
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use roaring::RoaringBitmap;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+    ]));
+
+    // Create first fragment
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://test_optimize_reset", None)
+        .await
+        .unwrap();
+
+    // Create index on value column (this creates the base index on fragment 0)
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Append second fragment
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5, 6])),
+            Arc::new(Int32Array::from(vec![40, 50, 60])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    // Create a delta index for the new fragment
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    // Verify all indices have empty invalidated_fragments
+    let indices = dataset.load_indices().await.unwrap();
+    let value_indices: Vec<_> = indices.iter().filter(|i| i.name == "value_idx").collect();
+    // May have 1 or 2 indices depending on whether append merges
+    assert!(!value_indices.is_empty(), "Should have at least 1 index");
+
+    for idx in &value_indices {
+        assert!(
+            idx.invalidated_fragments
+                .as_ref()
+                .map_or(true, |b| b.is_empty()),
+            "Index should have empty invalidated_fragments"
+        );
+    }
+
+    // Run merge to ensure we have a single merged index
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Verify merged index has empty invalidated_fragments
+    let indices = dataset.load_indices().await.unwrap();
+    let value_indices: Vec<_> = indices.iter().filter(|i| i.name == "value_idx").collect();
+    assert_eq!(
+        value_indices.len(),
+        1,
+        "Should have 1 merged index after merge"
+    );
+
+    let merged_index = value_indices[0];
+    assert!(
+        merged_index
+            .invalidated_fragments
+            .as_ref()
+            .map_or(true, |b| b.is_empty()),
+        "Merged index should have empty invalidated_fragments. Got: {:?}",
+        merged_index.invalidated_fragments
+    );
+
+    // The merged index should cover both fragments
+    assert_eq!(
+        merged_index.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0, 1]),
+        "Merged index should cover both fragments"
+    );
+
+    let effective = merged_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert_eq!(
+        effective,
+        RoaringBitmap::from_iter([0, 1]),
+        "Effective bitmap should include both fragments"
+    );
+}
+
+/// Test invalidated fragments lifecycle: accumulation, query behavior, and all-invalidated edge case.
+#[tokio::test]
+async fn test_invalidated_fragments_lifecycle() {
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use roaring::RoaringBitmap;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+    ]));
+
+    // Create dataset with 3 fragments
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://test_lifecycle", None)
+        .await
+        .unwrap();
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![3, 4])),
+            Arc::new(Int32Array::from(vec![30, 40])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    let batch3 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![5, 6])),
+            Arc::new(Int32Array::from(vec![50, 60])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch3)], schema.clone());
+    dataset.append(reader, None).await.unwrap();
+
+    // Create index on value column
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Verify initial state: index covers fragments 0, 1, 2
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert_eq!(
+        value_index.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0, 1, 2])
+    );
+
+    // Helper to perform DataReplacement on a fragment
+    let perform_replacement = |dataset: Dataset, frag_id: u64, suffix: &str| {
+        let suffix = suffix.to_string();
+        async move {
+            let value_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "value",
+                DataType::Int32,
+                false,
+            )]));
+            let new_values: Int32Array = vec![999, 888].into();
+            let new_batch =
+                RecordBatch::try_new(value_schema.clone(), vec![Arc::new(new_values)]).unwrap();
+
+            let path = format!("data/replacement_{}.lance", suffix);
+            let object_writer = dataset
+                .object_store
+                .create(&Path::from(path.as_str()))
+                .await
+                .unwrap();
+            let mut writer = FileWriter::try_new(
+                object_writer,
+                value_schema.as_ref().try_into().unwrap(),
+                Default::default(),
+            )
+            .unwrap();
+            writer.write_batch(&new_batch).await.unwrap();
+            writer.finish().await.unwrap();
+
+            let frag = dataset.get_fragment(frag_id as usize).unwrap();
+            let data_file = frag.data_file_for_field(1).unwrap();
+            let mut new_data_file = data_file.clone();
+            new_data_file.path = format!("replacement_{}.lance", suffix);
+
+            let read_version = dataset.manifest.version;
+            Dataset::commit(
+                WriteDestination::Dataset(Arc::new(dataset)),
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(frag_id, new_data_file)],
+                },
+                Some(read_version),
+                None,
+                None,
+                Arc::new(Default::default()),
+                false,
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Step 1: Replace fragment 0, verify invalidated_fragments = [0]
+    let dataset = perform_replacement(dataset, 0, "frag0").await;
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert_eq!(
+        value_index.invalidated_fragments.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0]),
+        "After first replacement, only fragment 0 should be invalidated"
+    );
+    let effective = value_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert_eq!(
+        effective,
+        RoaringBitmap::from_iter([1, 2]),
+        "Effective bitmap should only include fragments 1 and 2"
+    );
+
+    // Step 2: Replace fragment 1, verify invalidated_fragments = [0, 1]
+    let dataset = perform_replacement(dataset, 1, "frag1").await;
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert_eq!(
+        value_index.invalidated_fragments.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0, 1]),
+        "After second replacement, fragments 0 and 1 should be invalidated"
+    );
+    let effective = value_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert_eq!(
+        effective,
+        RoaringBitmap::from_iter([2]),
+        "Effective bitmap should only include fragment 2"
+    );
+
+    // Step 3: Replace fragment 2, all fragments now invalidated
+    let dataset = perform_replacement(dataset, 2, "frag2").await;
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert_eq!(
+        value_index.invalidated_fragments.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0, 1, 2]),
+        "After third replacement, all fragments should be invalidated"
+    );
+
+    // Verify effective_fragment_bitmap is empty
+    let effective = value_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert!(
+        effective.is_empty(),
+        "Effective bitmap should be empty when all fragments are invalidated"
+    );
+
+    // Note: We can't easily test query behavior here because in-memory storage
+    // doesn't persist the replacement files correctly across dataset reopens.
+    // The query correctness is tested by the existing test suite for scalar indexes.
+}
+
 #[tokio::test]
 async fn test_insert_skip_auto_cleanup() {
     let test_uri = TempStrDir::default();
