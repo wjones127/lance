@@ -3685,16 +3685,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            if id_frags.is_empty() {
-                assert!(id_index.is_none());
-            } else {
-                let id_index = id_index.unwrap();
-                let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
-                // Fragment bitmaps are now immutable, so we check the effective bitmap
+            // Index may exist but with empty effective bitmap when all fragments are invalidated
+            let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
+            if let Some(id_index) = id_index {
                 let effective_bitmap = id_index
                     .effective_fragment_bitmap(&dataset.fragment_bitmap)
                     .unwrap();
                 assert_eq!(effective_bitmap, id_frags_bitmap);
+            } else {
+                // If index doesn't exist, expected fragments should be empty
+                assert!(
+                    id_frags.is_empty(),
+                    "id_idx not found but expected fragments {:?}",
+                    id_frags
+                );
             }
 
             let value_index = dataset
@@ -3702,16 +3706,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            if value_frags.is_empty() {
-                assert!(value_index.is_none());
-            } else {
-                let value_index = value_index.unwrap();
-                let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
-                // Fragment bitmaps are now immutable, so we check the effective bitmap
+            // Index may exist but with empty effective bitmap when all fragments are invalidated
+            let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
+            if let Some(value_index) = value_index {
                 let effective_bitmap = value_index
                     .effective_fragment_bitmap(&dataset.fragment_bitmap)
                     .unwrap();
                 assert_eq!(effective_bitmap, value_frags_bitmap);
+            } else {
+                // If index doesn't exist, expected fragments should be empty
+                assert!(
+                    value_frags.is_empty(),
+                    "value_idx not found but expected fragments {:?}",
+                    value_frags
+                );
             }
 
             let other_value_index = dataset
@@ -3829,6 +3837,103 @@ mod tests {
             .unwrap();
 
         check_indices(&dataset, &[], &[]).await;
+    }
+
+    /// Test that merge_insert with partial schema updates populates invalidated_fragments
+    /// instead of modifying fragment_bitmap.
+    ///
+    /// This tests the `update_fragments()` code path (partial schema update), which is used when
+    /// the source schema doesn't match the full target schema.
+    #[tokio::test]
+    async fn test_merge_insert_updates_invalidated_fragments() {
+        // Create a dataset with 2 fragments, 10 rows each
+        // Schema: id, value, other_value (3 columns)
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other_value", array::step::<UInt32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        // Create a BTree index on the value column
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Verify initial state: index covers both fragments
+        let indices = dataset.load_indices().await.unwrap();
+        let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+        assert_eq!(
+            value_index.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0, 1]),
+            "Index should initially cover fragments 0 and 1"
+        );
+        assert!(
+            value_index
+                .invalidated_fragments
+                .as_ref()
+                .map_or(true, |b| b.is_empty()),
+            "No fragments should be invalidated initially"
+        );
+
+        // Perform a PARTIAL schema merge_insert that updates rows in fragment 0 only
+        // Only include id and value columns (not other_value) to trigger partial schema path
+        // Update rows with id 0-4 (first half of fragment 0)
+        let source = lance_datagen::gen_batch()
+            .col("id", array::step_custom::<UInt32Type>(0, 1))
+            .col("value", array::step_custom::<UInt32Type>(1000, 1)) // New values
+            .into_df_stream(RowCount::from(5), BatchCount::from(1));
+
+        let merge_insert = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+
+        let (dataset, stats) = merge_insert.execute_reader(source).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 5);
+
+        // Verify: fragment_bitmap should be unchanged, invalidated_fragments should contain fragment 0
+        let indices = dataset.load_indices().await.unwrap();
+        let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+
+        // The fragment_bitmap should still contain [0, 1] - it should NOT be modified
+        assert_eq!(
+            value_index.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0, 1]),
+            "fragment_bitmap should remain unchanged after update"
+        );
+
+        // The invalidated_fragments should contain fragment 0
+        let invalidated = value_index.invalidated_fragments.as_ref().unwrap();
+        assert!(
+            invalidated.contains(0),
+            "Fragment 0 should be invalidated after updating rows in it. Got: {:?}",
+            invalidated
+        );
+        assert!(
+            !invalidated.contains(1),
+            "Fragment 1 should NOT be invalidated (no rows updated). Got: {:?}",
+            invalidated
+        );
+
+        // Verify effective_fragment_bitmap correctly excludes invalidated
+        let effective = value_index
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .unwrap();
+        assert_eq!(
+            effective,
+            RoaringBitmap::from_iter([1]),
+            "effective_fragment_bitmap should only include fragment 1"
+        );
     }
 
     #[tokio::test]

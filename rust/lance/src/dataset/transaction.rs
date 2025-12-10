@@ -1732,8 +1732,8 @@ impl Transaction {
 
                 final_fragments.extend(updated_frags);
 
-                // If we updated any fields, remove those fragments from indices covering those fields
-                Self::prune_updated_fields_from_indices(
+                // If we updated any fields, mark those fragments as invalidated in indices covering those fields
+                Self::invalidate_updated_fields_in_indices(
                     &mut final_indices,
                     updated_fragments,
                     fields_modified,
@@ -2033,6 +2033,12 @@ impl Transaction {
                     .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
                     .unzip();
 
+                // Capture replaced fields before we consume new_datafiles
+                let replaced_fields: Vec<u32> = new_datafiles
+                    .first()
+                    .map(|f| f.fields.iter().map(|&id| id as u32).collect())
+                    .unwrap_or_default();
+
                 // 1. make sure the new files all have the same fields / or empty
                 // NOTE: arguably this requirement could be relaxed in the future
                 // for the sake of simplicity, we require the new files to have the same fields
@@ -2130,6 +2136,19 @@ impl Transaction {
                     .collect::<Vec<_>>();
 
                 final_fragments.extend(unmodified_fragments);
+
+                // 5. Invalidate indices covering the replaced fields
+                let modified_fragments: Vec<Fragment> = existing_fragments
+                    .iter()
+                    .filter(|f| fragments_changed.contains(&f.id))
+                    .cloned()
+                    .collect();
+
+                Self::invalidate_updated_fields_in_indices(
+                    &mut final_indices,
+                    &modified_fragments,
+                    &replaced_fields,
+                );
             }
             Operation::UpdateMemWalState {
                 added,
@@ -2341,9 +2360,12 @@ impl Transaction {
         }
     }
 
-    /// If an operation modifies one or more fields in a fragment then we need to remove
-    /// that fragment from any indices that cover one of the modified fields.
-    fn prune_updated_fields_from_indices(
+    /// If an operation modifies one or more fields in a fragment, add those fragments
+    /// to the `invalidated_fragments` bitmap of any indices that cover the modified fields.
+    ///
+    /// This preserves the immutability of `fragment_bitmap` while marking which fragments
+    /// should not be queried via this index.
+    fn invalidate_updated_fields_in_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
@@ -2352,8 +2374,6 @@ impl Transaction {
             return;
         }
 
-        // If we modified any fields in the fragments then we need to remove those fragments
-        // from the index if the index covers one of those modified fields.
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
@@ -2361,10 +2381,12 @@ impl Transaction {
                 .iter()
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
             {
-                if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                    for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
-                        fragment_bitmap.remove(fragment_id);
-                    }
+                // Add to invalidated_fragments instead of removing from fragment_bitmap
+                let invalidated = index
+                    .invalidated_fragments
+                    .get_or_insert_with(RoaringBitmap::new);
+                for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
+                    invalidated.insert(fragment_id);
                 }
             }
         }

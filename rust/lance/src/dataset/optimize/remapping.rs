@@ -15,7 +15,7 @@ use lance_index::frag_reuse::{FragDigest, FRAG_REUSE_INDEX_NAME};
 use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::collections::HashMap;
@@ -280,7 +280,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     fields: curr_index_meta.fields.clone(),
                     dataset_version: dataset.manifest.version,
                     fragment_bitmap: bitmap_after_remap,
-                    invalidated_fragments: todo!(),
+                    // During remapping, row addresses are updated to point to compacted fragments.
+                    // Start with empty invalidated_fragments since the index is refreshed.
+                    invalidated_fragments: Some(RoaringBitmap::new()),
                     index_details: curr_index_meta.index_details.clone(),
                     index_version: curr_index_meta.index_version,
                     created_at: curr_index_meta.created_at,
@@ -292,7 +294,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     fields: curr_index_meta.fields.clone(),
                     dataset_version: dataset.manifest.version,
                     fragment_bitmap: bitmap_after_remap,
-                    invalidated_fragments: todo!(),
+                    // During remapping, row addresses are updated to point to compacted fragments.
+                    // Start with empty invalidated_fragments since the index is refreshed.
+                    invalidated_fragments: Some(RoaringBitmap::new()),
                     index_details: Some(Arc::new(remapped_index.index_details)),
                     index_version: remapped_index.index_version as i32,
                     created_at: curr_index_meta.created_at,

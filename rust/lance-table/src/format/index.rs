@@ -69,12 +69,24 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Returns the effective fragment bitmap for this index.
+    ///
+    /// This is the set of fragments that the index can be used to query. It is computed by:
+    /// 1. Starting with the fragments the index was built on (`fragment_bitmap`)
+    /// 2. Intersecting with fragments that still exist in the dataset (`existing_fragments`)
+    /// 3. Subtracting any fragments that have been invalidated (`invalidated_fragments`)
+    ///
+    /// Returns `None` if the index has no `fragment_bitmap` set.
     pub fn effective_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
     ) -> Option<RoaringBitmap> {
         let fragment_bitmap = self.fragment_bitmap.as_ref()?;
-        Some(fragment_bitmap & existing_fragments)
+        let mut result = fragment_bitmap & existing_fragments;
+        if let Some(invalidated) = &self.invalidated_fragments {
+            result -= invalidated;
+        }
+        Some(result)
     }
 }
 
@@ -139,7 +151,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
         if let Some(bitmap) = &idx.fragment_bitmap {
-            fragment_bitmap.reserve(bitmap.serialized_size() as usize);
+            fragment_bitmap.reserve(bitmap.serialized_size());
             if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
                 // In theory, this should never error. But if we do, just
                 // recover gracefully.
@@ -150,7 +162,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
 
         let mut invalidated_fragments = Vec::new();
         if let Some(bitmap) = &idx.invalidated_fragments {
-            invalidated_fragments.reserve(bitmap.serialized_size() as usize);
+            invalidated_fragments.reserve(bitmap.serialized_size());
             if let Err(e) = bitmap.serialize_into(&mut invalidated_fragments) {
                 // In theory, this should never error. But if we do, just
                 // recover gracefully.
@@ -174,5 +186,111 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_index(
+        fragment_bitmap: Option<RoaringBitmap>,
+        invalidated_fragments: Option<RoaringBitmap>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            name: "test_index".to_string(),
+            dataset_version: 1,
+            fragment_bitmap,
+            invalidated_fragments,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_fragment_bitmap_excludes_invalidated() {
+        // Index covers fragments 0, 1, 2, 3
+        let fragment_bitmap = RoaringBitmap::from_iter([0, 1, 2, 3]);
+        // Fragment 1 and 2 have been invalidated (indexed column was updated in place)
+        let invalidated_fragments = RoaringBitmap::from_iter([1, 2]);
+        let index = make_test_index(Some(fragment_bitmap), Some(invalidated_fragments));
+
+        // Dataset currently has fragments 0, 1, 2, 3, 4
+        let existing_fragments = RoaringBitmap::from_iter([0, 1, 2, 3, 4]);
+
+        let effective = index
+            .effective_fragment_bitmap(&existing_fragments)
+            .unwrap();
+
+        // Should only include 0 and 3 (not 1, 2 which are invalidated, not 4 which wasn't indexed)
+        assert_eq!(effective, RoaringBitmap::from_iter([0, 3]));
+    }
+
+    #[test]
+    fn test_effective_fragment_bitmap_no_invalidated() {
+        // Index covers fragments 0, 1, 2
+        let fragment_bitmap = RoaringBitmap::from_iter([0, 1, 2]);
+        let index = make_test_index(Some(fragment_bitmap), None);
+
+        // Dataset currently has fragments 0, 1, 2, 3
+        let existing_fragments = RoaringBitmap::from_iter([0, 1, 2, 3]);
+
+        let effective = index
+            .effective_fragment_bitmap(&existing_fragments)
+            .unwrap();
+
+        // Should include all indexed fragments that still exist
+        assert_eq!(effective, RoaringBitmap::from_iter([0, 1, 2]));
+    }
+
+    #[test]
+    fn test_effective_fragment_bitmap_empty_invalidated() {
+        // Index covers fragments 0, 1, 2
+        let fragment_bitmap = RoaringBitmap::from_iter([0, 1, 2]);
+        let index = make_test_index(Some(fragment_bitmap), Some(RoaringBitmap::new()));
+
+        let existing_fragments = RoaringBitmap::from_iter([0, 1, 2, 3]);
+
+        let effective = index
+            .effective_fragment_bitmap(&existing_fragments)
+            .unwrap();
+
+        // Empty invalidated should not affect the result
+        assert_eq!(effective, RoaringBitmap::from_iter([0, 1, 2]));
+    }
+
+    #[test]
+    fn test_effective_fragment_bitmap_deleted_and_invalidated() {
+        // Index covers fragments 0, 1, 2, 3
+        let fragment_bitmap = RoaringBitmap::from_iter([0, 1, 2, 3]);
+        // Fragment 2 was invalidated
+        let invalidated_fragments = RoaringBitmap::from_iter([2]);
+        let index = make_test_index(Some(fragment_bitmap), Some(invalidated_fragments));
+
+        // Dataset currently has fragments 0, 2, 3 (fragment 1 was deleted)
+        let existing_fragments = RoaringBitmap::from_iter([0, 2, 3]);
+
+        let effective = index
+            .effective_fragment_bitmap(&existing_fragments)
+            .unwrap();
+
+        // Should exclude both deleted (1) and invalidated (2)
+        assert_eq!(effective, RoaringBitmap::from_iter([0, 3]));
+    }
+
+    #[test]
+    fn test_effective_fragment_bitmap_no_fragment_bitmap() {
+        let index = make_test_index(None, Some(RoaringBitmap::from_iter([1])));
+
+        let existing_fragments = RoaringBitmap::from_iter([0, 1, 2]);
+
+        // Should return None if no fragment_bitmap
+        assert!(index
+            .effective_fragment_bitmap(&existing_fragments)
+            .is_none());
     }
 }

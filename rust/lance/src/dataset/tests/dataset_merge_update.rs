@@ -1077,6 +1077,141 @@ async fn test_replace_dataset() {
     assert_eq!(ds2.manifest.version, 1);
 }
 
+/// Test that DataReplacement invalidates indices covering the replaced fields.
+#[tokio::test]
+async fn test_data_replacement_invalidates_indices() {
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use roaring::RoaringBitmap;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", DataType::Int32, false),
+    ]));
+
+    // Create a dataset with one fragment
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://test_data_replacement_index", None)
+        .await
+        .unwrap();
+
+    // Create an index on the value column
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Verify initial state
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+    assert_eq!(
+        value_index.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0]),
+        "Index should initially cover fragment 0"
+    );
+    assert!(
+        value_index
+            .invalidated_fragments
+            .as_ref()
+            .map_or(true, |b| b.is_empty()),
+        "No fragments should be invalidated initially"
+    );
+
+    // Write a new data file to replace the value column
+    // Use a schema with only the value column for the replacement file
+    let value_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let new_values: Int32Array = vec![100, 200, 300].into();
+    let new_batch = RecordBatch::try_new(value_schema.clone(), vec![Arc::new(new_values)]).unwrap();
+
+    // Write the new data file using the same pattern as other tests
+    let object_writer = dataset
+        .object_store
+        .create(&Path::from("data/new_values.lance"))
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        value_schema.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&new_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    // Find the datafile we want to replace (value column)
+    let frag = dataset.get_fragment(0).unwrap();
+    let data_file = frag.data_file_for_field(1).unwrap(); // field 1 is "value"
+    let mut new_data_file = data_file.clone();
+    new_data_file.path = "new_values.lance".to_string();
+
+    // Perform the DataReplacement
+    // After write (v1) and create_index (v2), we're at v2
+    let read_version = dataset.manifest.version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_data_file)],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Verify: fragment_bitmap should be unchanged, invalidated_fragments should contain fragment 0
+    let indices = dataset.load_indices().await.unwrap();
+    let value_index = indices.iter().find(|i| i.name == "value_idx").unwrap();
+
+    // The fragment_bitmap should still contain [0] - it should NOT be modified
+    assert_eq!(
+        value_index.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0]),
+        "fragment_bitmap should remain unchanged after DataReplacement"
+    );
+
+    // The invalidated_fragments should contain fragment 0
+    let invalidated = value_index
+        .invalidated_fragments
+        .as_ref()
+        .expect("invalidated_fragments should be set");
+    assert!(
+        invalidated.contains(0),
+        "Fragment 0 should be invalidated after replacing data. Got: {:?}",
+        invalidated
+    );
+
+    // Verify effective_fragment_bitmap correctly excludes invalidated
+    let effective = value_index
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap();
+    assert!(
+        effective.is_empty(),
+        "effective_fragment_bitmap should be empty since fragment 0 is invalidated"
+    );
+}
+
 #[tokio::test]
 async fn test_insert_skip_auto_cleanup() {
     let test_uri = TempStrDir::default();

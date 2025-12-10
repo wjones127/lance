@@ -173,7 +173,9 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         fields: vec![],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(new_fragment_bitmap),
-        invalidated_fragments: todo!(),
+        // Fragment reuse index is a system index that doesn't index columns,
+        // so invalidated_fragments is always empty.
+        invalidated_fragments: Some(RoaringBitmap::new()),
         index_details: Some(Arc::new(prost_types::Any::from_msg(&proto)?)),
         index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
         created_at: Some(chrono::Utc::now()),
