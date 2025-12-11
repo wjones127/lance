@@ -9,7 +9,7 @@ from lance.log import LOGGER
 
 from ci_benchmarks.datasets import get_dataset_uri
 
-NUM_ROWS = 100_000
+NUM_ROWS = 59_986_052
 
 
 def _gen_data(scale_factor: int):

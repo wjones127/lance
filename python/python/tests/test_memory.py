@@ -4,11 +4,17 @@
 from pathlib import Path
 
 import lance
-import memtest
 import pyarrow as pa
+import pytest
+
+pytest.importorskip(
+    "memtest", reason="memtest is not available. Please install from ../memtest"
+)
 
 
 def test_insert_memory(tmp_path: Path):
+    import memtest
+
     def batch_generator():
         # 5MB batches -> 100MB total
         for _ in range(20):

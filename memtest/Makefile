@@ -11,7 +11,7 @@ build-release:
 	pip install -e .
 
 test:
-	pytest python/tests/ -v
+	LD_PRELOAD=./python/memtest/libmemtest.so pytest python/tests/ -v
 
 lint:
 	cargo clippy -- -D warnings
