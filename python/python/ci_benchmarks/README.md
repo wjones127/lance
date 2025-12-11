@@ -92,6 +92,10 @@ To save results as JSON (Bencher Metric Format):
 pytest ... --benchmark-stats-json stats.json
 ```
 
+## Investigating memory use for a particular benchmark
+
+
+
 ## Uploading to Bencher
 
 ```bash

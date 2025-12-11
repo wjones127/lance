@@ -186,13 +186,10 @@ def is_preloaded() -> bool:
         ...     stats = get_stats()
         ...     print(f"Tracking {stats['total_allocations']} allocations")
     """
-    try:
-        stats = get_stats()
-        # If we can get stats and there's been any activity, we're preloaded
-        # Even with no activity, if the library loads we're preloaded
-        return True
-    except Exception:
-        return False
+    import os
+
+    ld_preload = os.environ.get("LD_PRELOAD", "")
+    return "libmemtest" in ld_preload
 
 
 __all__ = [
