@@ -244,3 +244,35 @@ def test_iops_basic_btree_search(benchmark, filt: str | None, payload: str):
     benchmark.pedantic(
         bench, warmup_rounds=1, rounds=1, iterations=1, setup=clear_timer
     )
+
+@pytest.mark.io_memory_benchmark()
+@pytest.mark.parametrize("filt", BASIC_BTREE_FILTERS, ids=BASIC_BTREE_FILTER_LABELS)
+@pytest.mark.parametrize("payload", ["small_strings", "integers"])
+def test_basic_btree_search(benchmark, filt: str | None, payload: str):
+    dataset_uri = get_dataset_uri("basic")
+    ds = lance.dataset(dataset_uri)
+
+    columns = []
+    if payload is not None:
+        columns = [payload]
+
+    def bench(dataset):
+        dataset.to_table(
+            columns=[payload],
+            filter=filt,
+            with_row_id=True,
+            batch_size=32 * 1024,
+        )
+    
+    benchmark(bench, ds)
+
+def benchmark(bench, ds, warmup: bool=True):
+    if warmup:
+        bench(ds)
+    ds.io_stats_incremental()
+    with memtest.track() as get_stats:
+        bench(ds)
+        memory_stats = get_stats()
+    io_stats = ds.io_stats_incremental()
+    # TODO: Record the I/O and memory stats
+

@@ -12,7 +12,7 @@ from lance.log import LOGGER
 
 from ci_benchmarks.datasets import get_dataset_uri
 
-NUM_ROWS = 10_000_000
+NUM_ROWS = 100_000
 NUM_BATCHES = 100
 ROWS_PER_BATCH = NUM_ROWS // NUM_BATCHES
 

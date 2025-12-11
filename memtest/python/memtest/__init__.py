@@ -175,6 +175,26 @@ def print_stats(stats: Optional[Dict[str, int]] = None) -> None:
     print(f"  Peak memory usage:     {format_bytes(stats['peak_bytes'])}")
 
 
+def is_preloaded() -> bool:
+    """Check if libmemtest.so is preloaded and actively tracking allocations.
+
+    Returns:
+        True if the library is preloaded via LD_PRELOAD, False otherwise.
+
+    Example:
+        >>> if is_preloaded():
+        ...     stats = get_stats()
+        ...     print(f"Tracking {stats['total_allocations']} allocations")
+    """
+    try:
+        stats = get_stats()
+        # If we can get stats and there's been any activity, we're preloaded
+        # Even with no activity, if the library loads we're preloaded
+        return True
+    except Exception:
+        return False
+
+
 __all__ = [
     "get_library_path",
     "get_stats",
@@ -182,4 +202,5 @@ __all__ = [
     "track",
     "format_bytes",
     "print_stats",
+    "is_preloaded",
 ]

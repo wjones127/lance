@@ -35,3 +35,6 @@ memtest = "python/memtest"
 
 [tool.setuptools.package-data]
 memtest = ["*.so", "*.dylib", "*.dll"]
+
+[project.entry-points.pytest11]
+memtest = "memtest.pytest_plugin"
