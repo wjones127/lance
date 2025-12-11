@@ -22,7 +22,7 @@ def test_insert_memory(tmp_path: Path):
     )
 
     with memtest.track() as get_stats:
-        ds = lance.write_dataset(
+        lance.write_dataset(
             reader,
             tmp_path / "test.lance",
         )
