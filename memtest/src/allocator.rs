@@ -211,3 +211,19 @@ pub unsafe extern "C" fn reallocarray(
     };
     realloc(old_ptr, size)
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn malloc_usable_size(ptr: *mut c_void) -> size_t {
+    if ptr.is_null() {
+        return 0;
+    }
+
+    if is_ours(ptr) {
+        let (size, _, _) = extract(ptr);
+        size
+    } else {
+        // Not our allocation - return 0 as we don't know the size
+        // (there's no __libc_malloc_usable_size to call)
+        0
+    }
+}
