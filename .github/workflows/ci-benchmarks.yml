@@ -50,8 +50,7 @@ jobs:
         run: |
           source venv/bin/activate
           cd memtest
-          cargo build --release
-          pip install -e .
+          make build-release
       - name: Generate datasets
         run: |
           source venv/bin/activate

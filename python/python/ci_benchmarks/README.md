@@ -94,7 +94,24 @@ pytest ... --benchmark-stats-json stats.json
 
 ## Investigating memory use for a particular benchmark
 
+To investigate memory use for a particular benchmark, you can use the `bytehound` library.
+After installing it, you can run a benchmark with memory profiling enabled:
 
+```shell
+LD_PRELOAD=/usr/local/lib/libbytehound.so \
+    pytest 'python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_btree_search[small_strings-equal]' -v
+```
+
+Then use the `bytehound` server to visualize the memory profiling data:
+
+```shell
+bytehound server memory-profiling_*.dat
+```
+
+You can use time filters on the allocations view to see memory allocations at a specific point in time,
+which can help you filter out allocations from setup. Once you have filters in place, you can use
+the Flamegraph view (available from the menu in the upper right corner) to get a flamegraph of the
+memory allocations in that time range.
 
 ## Uploading to Bencher
 
