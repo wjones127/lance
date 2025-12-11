@@ -49,12 +49,11 @@ jobs:
       - name: Build memtest
         run: |
           source venv/bin/activate
-          cd ../memtest
+          cd memtest
           cargo build --release
           pip install -e .
       - name: Generate datasets
         run: |
-          python -m venv venv
           source venv/bin/activate
           python python/ci_benchmarks/datagen/gen_all.py
       - name: Run benchmarks

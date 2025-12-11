@@ -1,11 +1,23 @@
 """Memory allocation testing utilities for Python."""
 
 import ctypes
+import platform
+import warnings
 from pathlib import Path
 from typing import Dict, Optional
 from contextlib import contextmanager
 
 __version__ = "0.1.0"
+
+# Platform support check
+_SUPPORTED_PLATFORM = platform.system() == "Linux"
+if not _SUPPORTED_PLATFORM:
+    warnings.warn(
+        f"lance-memtest only supports Linux (current platform: {platform.system()}). "
+        "Memory statistics will not be available.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 class _MemtestStats(ctypes.Structure):
@@ -23,6 +35,9 @@ class _MemtestStats(ctypes.Structure):
 
 def _load_library():
     """Load the memtest shared library."""
+    if not _SUPPORTED_PLATFORM:
+        return None, None
+
     # Find the library relative to this module
     module_dir = Path(__file__).parent
 
@@ -53,15 +68,29 @@ def _load_library():
 _lib, _lib_path = _load_library()
 
 
-def get_library_path() -> Path:
+def _empty_stats() -> Dict[str, int]:
+    """Return empty stats for unsupported platforms."""
+    return {
+        "total_allocations": 0,
+        "total_deallocations": 0,
+        "total_bytes_allocated": 0,
+        "total_bytes_deallocated": 0,
+        "current_bytes": 0,
+        "peak_bytes": 0,
+    }
+
+
+def get_library_path() -> Optional[Path]:
     """Get the path to the memtest shared library for use with LD_PRELOAD.
 
     Returns:
-        Path to the .so file that can be used with LD_PRELOAD
+        Path to the .so file that can be used with LD_PRELOAD, or None on
+        unsupported platforms.
 
     Example:
         >>> lib_path = get_library_path()
-        >>> os.environ['LD_PRELOAD'] = str(lib_path)
+        >>> if lib_path:
+        ...     os.environ['LD_PRELOAD'] = str(lib_path)
     """
     return _lib_path
 
@@ -78,11 +107,16 @@ def get_stats() -> Dict[str, int]:
             - current_bytes: Current memory usage (allocated - deallocated)
             - peak_bytes: Peak memory usage observed
 
+        On unsupported platforms, all values will be 0.
+
     Example:
         >>> stats = get_stats()
         >>> print(f"Current memory: {stats['current_bytes']} bytes")
         >>> print(f"Peak memory: {stats['peak_bytes']} bytes")
     """
+    if _lib is None:
+        return _empty_stats()
+
     stats = _MemtestStats()
     _lib.memtest_get_stats(ctypes.byref(stats))
 
@@ -100,12 +134,15 @@ def reset_stats() -> None:
     """Reset all allocation statistics to zero.
 
     This is useful for measuring allocations in a specific section of code.
+    On unsupported platforms, this is a no-op.
 
     Example:
         >>> reset_stats()
         >>> # ... run code to measure ...
         >>> stats = get_stats()
     """
+    if _lib is None:
+        return
     _lib.memtest_reset_stats()
 
 
@@ -192,6 +229,21 @@ def is_preloaded() -> bool:
     return "libmemtest" in ld_preload
 
 
+def is_supported() -> bool:
+    """Check if memory tracking is supported on this platform.
+
+    Returns:
+        True if on Linux (the only supported platform), False otherwise.
+
+    Example:
+        >>> if is_supported():
+        ...     with track() as get:
+        ...         # ... do work ...
+        ...         stats = get()
+    """
+    return _SUPPORTED_PLATFORM
+
+
 __all__ = [
     "get_library_path",
     "get_stats",
@@ -200,4 +252,5 @@ __all__ = [
     "format_bytes",
     "print_stats",
     "is_preloaded",
+    "is_supported",
 ]
