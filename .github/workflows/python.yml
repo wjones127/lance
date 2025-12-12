@@ -114,14 +114,12 @@ jobs:
         with:
           workspaces: python
           prefix-key: ${{ env.CACHE_PREFIX }}
-      - name: Install memtest
-        run: |
-          cd ../memtest
-          make build-release
       - uses: ./.github/workflows/build_linux_wheel
         with:
           args: "--profile ci"
       - uses: ./.github/workflows/run_tests
+        with:
+          memtest: true
       - name: Upload wheels as artifacts
         if: ${{ matrix.python-minor-version == '13' }}
         uses: actions/upload-artifact@v4
