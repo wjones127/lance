@@ -31,6 +31,7 @@ runs:
     - name: Install memtest
       working-directory: memtest
       if: inputs.memtest == 'true'
+      shell: bash
       run: |
         make build-release
         echo "LD_PRELOAD=$(lance-memtest)" >> $GITHUB_ENV
