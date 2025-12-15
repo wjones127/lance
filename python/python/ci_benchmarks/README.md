@@ -112,13 +112,3 @@ You can use time filters on the allocations view to see memory allocations at a 
 which can help you filter out allocations from setup. Once you have filters in place, you can use
 the Flamegraph view (available from the menu in the upper right corner) to get a flamegraph of the
 memory allocations in that time range.
-
-## Uploading to Bencher
-
-```bash
-# Upload timing results (from pytest-benchmark)
-bencher run --adapter python_pytest --file timing_results.json
-
-# Upload IO/memory stats
-bencher run --adapter json --file stats.json
-```

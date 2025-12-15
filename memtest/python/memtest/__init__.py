@@ -41,25 +41,18 @@ def _load_library():
     # Find the library relative to this module
     module_dir = Path(__file__).parent
 
-    # Look for the library in common locations
-    possible_paths = [
-        module_dir / "libmemtest.so",  # Linux
-        module_dir / "libmemtest.dylib",  # macOS
-        module_dir / "memtest.dll",  # Windows
-    ]
+    lib_path = module_dir / "libmemtest.so"
+    if lib_path.exists():
+        lib = ctypes.CDLL(str(lib_path))
 
-    for lib_path in possible_paths:
-        if lib_path.exists():
-            lib = ctypes.CDLL(str(lib_path))
+        # Define function signatures
+        lib.memtest_get_stats.argtypes = [ctypes.POINTER(_MemtestStats)]
+        lib.memtest_get_stats.restype = None
 
-            # Define function signatures
-            lib.memtest_get_stats.argtypes = [ctypes.POINTER(_MemtestStats)]
-            lib.memtest_get_stats.restype = None
+        lib.memtest_reset_stats.argtypes = []
+        lib.memtest_reset_stats.restype = None
 
-            lib.memtest_reset_stats.argtypes = []
-            lib.memtest_reset_stats.restype = None
-
-            return lib, lib_path
+        return lib, lib_path
 
     raise RuntimeError("memtest library not found. Run 'make build' to build it.")
 
