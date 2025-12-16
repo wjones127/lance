@@ -3,7 +3,7 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use super::{IndexFile, IndexReader, IndexStore, IndexWriter};
+use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
+use lance_table::format::{list_index_files_with_sizes, IndexFile};
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -314,50 +315,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
-        use futures::stream::StreamExt;
-
-        let mut files = Vec::new();
-        let mut stream = self.object_store.read_dir_all(&self.index_dir, None);
-        while let Some(meta) = stream.next().await {
-            let meta = meta?;
-            // Get relative path by stripping the index_dir prefix
-            let relative_path = meta
-                .location
-                .as_ref()
-                .strip_prefix(self.index_dir.as_ref())
-                .map(|s| s.trim_start_matches('/').to_string())
-                .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
-            files.push(IndexFile {
-                path: relative_path,
-                size_bytes: meta.size,
-            });
-        }
-        Ok(files)
-    }
-}
-
-impl LanceIndexStore {
-    /// List all files in the index directory with their sizes.
-    ///
-    /// Returns a list of (relative_path, size_bytes) tuples.
-    #[deprecated(note = "Use IndexStore::list_files_with_sizes instead")]
-    pub async fn list_files_with_sizes_tuple(&self) -> Result<Vec<(String, u64)>> {
-        use futures::stream::StreamExt;
-
-        let mut files = Vec::new();
-        let mut stream = self.object_store.read_dir_all(&self.index_dir, None);
-        while let Some(meta) = stream.next().await {
-            let meta = meta?;
-            // Get relative path by stripping the index_dir prefix
-            let relative_path = meta
-                .location
-                .as_ref()
-                .strip_prefix(self.index_dir.as_ref())
-                .map(|s| s.trim_start_matches('/').to_string())
-                .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
-            files.push((relative_path, meta.size));
-        }
-        Ok(files)
+        list_index_files_with_sizes(&self.object_store, &self.index_dir).await
     }
 }
 

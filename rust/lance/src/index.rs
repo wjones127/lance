@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{stream, StreamExt};
+use futures::stream;
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
@@ -56,8 +56,8 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
+use lance_table::format::{list_index_files_with_sizes, IndexFile, IndexMetadata};
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -370,7 +370,7 @@ pub(crate) async fn remap_index(
 
             // Capture file sizes for the vector index
             let index_dir = dataset.indices_dir().child(new_id.to_string());
-            let files = list_index_files_with_sizes(dataset, &index_dir).await?;
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             (
                 CreatedIndex {
@@ -1930,30 +1930,6 @@ fn is_vector_field(data_type: DataType) -> bool {
         }
         _ => false,
     }
-}
-
-/// List all files in an index directory with their sizes.
-async fn list_index_files_with_sizes(
-    dataset: &Dataset,
-    index_dir: &object_store::path::Path,
-) -> Result<Vec<IndexFile>> {
-    let mut files = Vec::new();
-    let mut stream = dataset.object_store.read_dir_all(index_dir, None);
-    while let Some(meta) = stream.next().await {
-        let meta = meta?;
-        // Get relative path by stripping the index_dir prefix
-        let relative_path = meta
-            .location
-            .as_ref()
-            .strip_prefix(index_dir.as_ref())
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
-        files.push(IndexFile {
-            path: relative_path,
-            size_bytes: meta.size,
-        });
-    }
-    Ok(files)
 }
 
 #[cfg(test)]

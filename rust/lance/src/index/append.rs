@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, IndexStore};
 use lance_index::VECTOR_INDEX_VERSION;
-use lance_table::format::{Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{list_index_files_with_sizes, Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -189,15 +189,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
             // Capture file sizes for the new vector index
             let index_dir = dataset.indices_dir().child(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset, &index_dir).await?;
-            // Convert to lance_index::scalar::IndexFile for CreatedIndex
-            let scalar_files: Vec<lance_index::scalar::IndexFile> = files
-                .into_iter()
-                .map(|f| lance_index::scalar::IndexFile {
-                    path: f.path,
-                    size_bytes: f.size_bytes,
-                })
-                .collect();
+            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
             Ok((
                 new_uuid,
@@ -205,7 +197,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: VECTOR_INDEX_VERSION,
-                    files: Some(scalar_files),
+                    files: Some(files),
                 },
             ))
         }
@@ -223,49 +215,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         frag_bitmap |= removed.fragment_bitmap.as_ref().unwrap();
     }
 
-    // Convert from lance_index::scalar::IndexFile to lance_table::format::IndexFile
-    let files = created_index.files.map(|files| {
-        files
-            .into_iter()
-            .map(|f| IndexFile {
-                path: f.path,
-                size_bytes: f.size_bytes,
-            })
-            .collect()
-    });
-
     Ok(Some(IndexMergeResults {
         new_uuid,
         removed_indices,
         new_fragment_bitmap: frag_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files,
+        files: created_index.files,
     }))
-}
-
-/// List all files in an index directory with their sizes.
-async fn list_index_files_with_sizes(
-    dataset: &Dataset,
-    index_dir: &object_store::path::Path,
-) -> Result<Vec<IndexFile>> {
-    let mut files = Vec::new();
-    let mut stream = dataset.object_store.read_dir_all(index_dir, None);
-    while let Some(meta) = stream.next().await {
-        let meta = meta?;
-        // Get relative path by stripping the index_dir prefix
-        let relative_path = meta
-            .location
-            .as_ref()
-            .strip_prefix(index_dir.as_ref())
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
-        files.push(IndexFile {
-            path: relative_path,
-            size_bytes: meta.size,
-        });
-    }
-    Ok(files)
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ use snafu::location;
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::TrainingCriteria;
 use crate::{Index, IndexParams, IndexType};
+pub use lance_table::format::IndexFile;
 
 pub mod bitmap;
 pub mod bloomfilter;
@@ -734,15 +735,6 @@ impl SearchResult {
     pub fn is_exact(&self) -> bool {
         matches!(self, Self::Exact(_))
     }
-}
-
-/// Metadata about a single file within an index segment.
-#[derive(Debug, Clone)]
-pub struct IndexFile {
-    /// Path relative to the index directory
-    pub path: String,
-    /// Size of the file in bytes
-    pub size_bytes: u64,
 }
 
 /// Brief information about an index that was created

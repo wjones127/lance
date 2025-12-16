@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
+use futures::StreamExt;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::location;
 use uuid::Uuid;
@@ -214,4 +217,31 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             files,
         }
     }
+}
+
+/// List all files in an index directory with their sizes.
+///
+/// Returns a list of `IndexFile` structs containing relative paths and sizes.
+/// This is used to capture file metadata after index creation/modification.
+pub async fn list_index_files_with_sizes(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut stream = object_store.read_dir_all(index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }
