@@ -5448,4 +5448,190 @@ mod tests {
         assert!(total_size.is_some(), "total_size_bytes should be Some");
         assert!(total_size.unwrap() > 0, "Total size should be positive");
     }
+
+    /// Helper to assert that all indices have file sizes populated
+    async fn assert_all_indices_have_files(dataset: &Dataset, context: &str) {
+        let indices = dataset.load_indices().await.unwrap();
+        for index in indices.iter() {
+            // Skip system indices (mem_wal, frag_reuse) which don't have files
+            if index.name == lance_index::mem_wal::MEM_WAL_INDEX_NAME
+                || index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+            {
+                continue;
+            }
+            assert!(
+                index.files.is_some(),
+                "{}: Index '{}' should have files field populated",
+                context,
+                index.name
+            );
+            let files = index.files.as_ref().unwrap();
+            assert!(
+                !files.is_empty(),
+                "{}: Index '{}' should have at least one file",
+                context,
+                index.name
+            );
+            for file in files {
+                assert!(
+                    file.size_bytes > 0,
+                    "{}: Index '{}' file '{}' should have positive size",
+                    context,
+                    index.name,
+                    file.path
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_file_sizes_through_lifecycle() {
+        use crate::dataset::optimize::{compact_files, remapping, CompactionOptions};
+        use crate::dataset::WriteDestination;
+        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+
+        // Create initial dataset with columns for different index types
+        let data = gen_batch()
+            .col("int_col", array::step::<Int32Type>())
+            .col("str_col", array::rand_utf8(8.into(), false))
+            .col(
+                "vec_col",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(1));
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            data,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 200, // Multiple fragments for compaction
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["int_col"],
+                IndexType::BTree,
+                Some("btree_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create Bitmap index
+        dataset
+            .create_index(
+                &["int_col"],
+                IndexType::Bitmap,
+                Some("bitmap_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Create Inverted index for text search
+        dataset
+            .create_index(
+                &["str_col"],
+                IndexType::Inverted,
+                Some("inverted_idx".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Validate files are populated after creation
+        assert_all_indices_have_files(&dataset, "after initial creation").await;
+
+        // Append more data
+        let more_data = gen_batch()
+            .col("int_col", array::step::<Int32Type>())
+            .col("str_col", array::rand_utf8(8.into(), false))
+            .col(
+                "vec_col",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .into_reader_rows(RowCount::from(500), BatchCount::from(1));
+
+        Dataset::write(
+            more_data,
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Optimize indices (triggers update/merge)
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        // Validate files are still populated after optimize
+        assert_all_indices_have_files(&dataset, "after optimize_indices").await;
+
+        // Run compaction with deferred remap
+        let options = CompactionOptions {
+            target_rows_per_fragment: 500,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+
+        // Check if frag reuse index exists (indicates remap is needed)
+        if dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            // Remap each index
+            remapping::remap_column_index(
+                &mut dataset,
+                &["int_col"],
+                Some("btree_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            remapping::remap_column_index(
+                &mut dataset,
+                &["int_col"],
+                Some("bitmap_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            remapping::remap_column_index(
+                &mut dataset,
+                &["str_col"],
+                Some("inverted_idx".to_string()),
+            )
+            .await
+            .unwrap();
+
+            // Validate files are populated after remap
+            assert_all_indices_have_files(&dataset, "after remap").await;
+        }
+    }
 }
