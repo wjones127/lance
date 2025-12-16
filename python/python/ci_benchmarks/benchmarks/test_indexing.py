@@ -16,7 +16,11 @@ from lance._datagen import rand_batches
 def test_io_mem_build_scalar_index(
     io_mem_benchmark, data_type: pa.DataType, index_type: str, tmp_path: Path
 ):
-    schema = pa.schema([pa.field("col", data_type)])
+    metadata = None
+    if index_type == "bitmap":
+        metadata = {b"lance-datagen:cardinality": b"1000"}
+    schema = pa.schema([pa.field("col", data_type, metadata=metadata)])
+
     # 100MB
     data = rand_batches(schema, num_batches=100, batch_size_bytes=1024 * 1024)
     ds = lance.write_dataset(data, tmp_path)

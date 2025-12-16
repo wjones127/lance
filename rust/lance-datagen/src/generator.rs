@@ -1569,6 +1569,72 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> ArrayGenerator for DictionaryGener
     }
 }
 
+/// Generator that produces low-cardinality data by generating a fixed set of
+/// unique values and then randomly selecting from them.
+struct LowCardinalityGenerator {
+    inner: Box<dyn ArrayGenerator>,
+    cardinality: usize,
+    /// Cached unique values, generated on first call
+    unique_values: Option<Arc<dyn Array>>,
+}
+
+impl std::fmt::Debug for LowCardinalityGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LowCardinalityGenerator")
+            .field("inner", &self.inner)
+            .field("cardinality", &self.cardinality)
+            .field("initialized", &self.unique_values.is_some())
+            .finish()
+    }
+}
+
+impl LowCardinalityGenerator {
+    fn new(inner: Box<dyn ArrayGenerator>, cardinality: usize) -> Self {
+        Self {
+            inner,
+            cardinality,
+            unique_values: None,
+        }
+    }
+}
+
+impl ArrayGenerator for LowCardinalityGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn Array>, ArrowError> {
+        // Generate unique values on first call
+        if self.unique_values.is_none() {
+            self.unique_values = Some(
+                self.inner
+                    .generate(RowCount::from(self.cardinality as u64), rng)?,
+            );
+        }
+
+        let unique_values = self.unique_values.as_ref().unwrap();
+
+        // Generate random indices into the unique values
+        let indices: Vec<usize> = (0..length.0)
+            .map(|_| rng.random_range(0..self.cardinality))
+            .collect();
+
+        // Use arrow's take to select values
+        let indices_array =
+            arrow_array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        arrow::compute::take(unique_values.as_ref(), &indices_array, None)
+            .map(|arr| arr as Arc<dyn Array>)
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.inner.data_type()
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        self.inner.element_size_bytes()
+    }
+}
+
 #[derive(Debug)]
 struct RandomListGenerator {
     field: Arc<Field>,
@@ -2776,6 +2842,17 @@ pub mod array {
             _ => unimplemented!(),
         }
     }
+
+    /// Wraps a generator to produce low-cardinality data.
+    ///
+    /// Generates `cardinality` unique values on first call, then randomly
+    /// selects from them for all subsequent rows.
+    pub fn low_cardinality(
+        generator: Box<dyn ArrayGenerator>,
+        cardinality: usize,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(LowCardinalityGenerator::new(generator, cardinality))
+    }
 }
 
 /// Create a BatchGeneratorBuilder to start generating batch data
@@ -2792,23 +2869,48 @@ pub fn gen_array(genn: Box<dyn ArrayGenerator>) -> ArrayGeneratorBuilder {
 /// Set to "sentence" to use the sentence generator with Zipf distribution.
 pub const CONTENT_TYPE_KEY: &str = "lance-datagen:content-type";
 
+/// Metadata key to specify cardinality for low-cardinality data generation.
+/// Set to a numeric string (e.g., "100") to limit unique values.
+pub const CARDINALITY_KEY: &str = "lance-datagen:cardinality";
+
 /// Create a generator for a field, checking metadata for content type hints.
+///
+/// Supported metadata keys:
+/// - `lance-datagen:content-type`: Set to "sentence" for Utf8/LargeUtf8 fields
+///   to use the sentence generator with Zipf distribution.
+/// - `lance-datagen:cardinality`: Set to a number to limit unique values.
+///   The generator will produce only that many unique values and randomly
+///   select from them.
 pub fn rand_field(field: &Field) -> Box<dyn ArrayGenerator> {
-    if let Some(content_type) = field.metadata().get(CONTENT_TYPE_KEY) {
+    let mut generator = if let Some(content_type) = field.metadata().get(CONTENT_TYPE_KEY) {
         match (content_type.as_str(), field.data_type()) {
-            ("sentence", DataType::Utf8) => return array::random_sentence(1, 10, false),
-            ("sentence", DataType::LargeUtf8) => return array::random_sentence(1, 10, true),
-            _ => {}
+            ("sentence", DataType::Utf8) => array::random_sentence(1, 10, false),
+            ("sentence", DataType::LargeUtf8) => array::random_sentence(1, 10, true),
+            _ => array::rand_type(field.data_type()),
+        }
+    } else {
+        array::rand_type(field.data_type())
+    };
+
+    if let Some(cardinality_str) = field.metadata().get(CARDINALITY_KEY) {
+        if let Ok(cardinality) = cardinality_str.parse::<usize>() {
+            if cardinality > 0 {
+                generator = array::low_cardinality(generator, cardinality);
+            }
         }
     }
-    array::rand_type(field.data_type())
+
+    generator
 }
 
 /// Create a BatchGeneratorBuilder with the given schema
 ///
 /// You can add more columns or convert this into a reader immediately.
-/// Fields with metadata `lance-datagen:content-type` = `"sentence"` will use
-/// the sentence generator with Zipf distribution for more realistic text.
+///
+/// Supported field metadata:
+/// - `lance-datagen:content-type` = `"sentence"`: Use sentence generator with
+///   Zipf distribution for more realistic text (Utf8/LargeUtf8 only).
+/// - `lance-datagen:cardinality` = `"<number>"`: Limit to N unique values.
 pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
     let mut builder = BatchGeneratorBuilder::default();
     for field in schema.fields() {
