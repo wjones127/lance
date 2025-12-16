@@ -2788,13 +2788,31 @@ pub fn gen_array(genn: Box<dyn ArrayGenerator>) -> ArrayGeneratorBuilder {
     ArrayGeneratorBuilder::new(genn)
 }
 
+/// Metadata key to specify content type for string generation.
+/// Set to "sentence" to use the sentence generator with Zipf distribution.
+pub const CONTENT_TYPE_KEY: &str = "lance-datagen:content-type";
+
+/// Create a generator for a field, checking metadata for content type hints.
+pub fn rand_field(field: &Field) -> Box<dyn ArrayGenerator> {
+    if let Some(content_type) = field.metadata().get(CONTENT_TYPE_KEY) {
+        match (content_type.as_str(), field.data_type()) {
+            ("sentence", DataType::Utf8) => return array::random_sentence(1, 10, false),
+            ("sentence", DataType::LargeUtf8) => return array::random_sentence(1, 10, true),
+            _ => {}
+        }
+    }
+    array::rand_type(field.data_type())
+}
+
 /// Create a BatchGeneratorBuilder with the given schema
 ///
-/// You can add more columns or convert this into a reader immediately
+/// You can add more columns or convert this into a reader immediately.
+/// Fields with metadata `lance-datagen:content-type` = `"sentence"` will use
+/// the sentence generator with Zipf distribution for more realistic text.
 pub fn rand(schema: &Schema) -> BatchGeneratorBuilder {
     let mut builder = BatchGeneratorBuilder::default();
     for field in schema.fields() {
-        builder = builder.col(field.name(), array::rand_type(field.data_type()));
+        builder = builder.col(field.name(), rand_field(field));
     }
     builder
 }

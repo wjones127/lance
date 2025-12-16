@@ -30,7 +30,13 @@ def test_io_mem_build_scalar_index(
 @pytest.mark.parametrize("with_positions", [True, False])
 @pytest.mark.io_memory_benchmark()
 def test_io_mem_build_fts(io_mem_benchmark, with_positions: bool, tmp_path: Path):
-    schema = pa.schema([pa.field("text", pa.string())])
+    schema = pa.schema(
+        [
+            pa.field(
+                "text", pa.string(), metadata={"lance-datagen:content-type": "sentence"}
+            )
+        ]
+    )
     # 100MB
     data = rand_batches(schema, num_batches=100, batch_size_bytes=1024 * 1024)
     ds = lance.write_dataset(data, tmp_path)
