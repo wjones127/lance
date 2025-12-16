@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
+use futures::{stream, StreamExt};
 use itertools::Itertools;
 use lance_core::cache::{CacheKey, UnsizedCacheKey};
 use lance_core::datatypes::Field;
@@ -56,8 +56,8 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
-use lance_table::format::IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
+use lance_table::format::{IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -295,7 +295,7 @@ pub(crate) async fn remap_index(
         .open_generic_index(&field_path, &index_id.to_string(), &NoOpMetricsCollector)
         .await?;
 
-    let created_index = match generic.index_type() {
+    let (created_index, files) = match generic.index_type() {
         it if it.is_scalar() => {
             let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
 
@@ -306,7 +306,7 @@ pub(crate) async fn remap_index(
                 return Ok(RemapResult::Drop);
             }
 
-            match scalar_index.index_type() {
+            let created = match scalar_index.index_type() {
                 IndexType::Inverted => {
                     let inverted_index = scalar_index
                         .as_any()
@@ -342,7 +342,16 @@ pub(crate) async fn remap_index(
                     }
                 }
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
-            }
+            };
+
+            // Capture file sizes for the scalar index
+            let file_sizes = new_store.list_files_with_sizes().await?;
+            let files: Vec<IndexFile> = file_sizes
+                .into_iter()
+                .map(|(path, size_bytes)| IndexFile { path, size_bytes })
+                .collect();
+
+            (created, Some(files))
         }
         it if it.is_vector() => {
             remap_vector_index(
@@ -354,14 +363,22 @@ pub(crate) async fn remap_index(
                 row_id_map,
             )
             .await?;
-            CreatedIndex {
-                index_details: prost_types::Any::from_msg(
-                    &lance_table::format::pb::VectorIndexDetails::default(),
-                )
-                .unwrap(),
-                index_version: VECTOR_INDEX_VERSION,
-                files: None, // No file info for remapped indices
-            }
+
+            // Capture file sizes for the vector index
+            let index_dir = dataset.indices_dir().child(new_id.to_string());
+            let files = list_index_files_with_sizes(dataset, &index_dir).await?;
+
+            (
+                CreatedIndex {
+                    index_details: prost_types::Any::from_msg(
+                        &lance_table::format::pb::VectorIndexDetails::default(),
+                    )
+                    .unwrap(),
+                    index_version: VECTOR_INDEX_VERSION,
+                    files: None,
+                },
+                Some(files),
+            )
         }
         _ => {
             return Err(Error::Index {
@@ -376,6 +393,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
+        files,
     }))
 }
 
@@ -1908,6 +1926,30 @@ fn is_vector_field(data_type: DataType) -> bool {
         }
         _ => false,
     }
+}
+
+/// List all files in an index directory with their sizes.
+async fn list_index_files_with_sizes(
+    dataset: &Dataset,
+    index_dir: &object_store::path::Path,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut stream = dataset.object_store.read_dir_all(index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }
 
 #[cfg(test)]

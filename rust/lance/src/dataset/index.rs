@@ -108,6 +108,7 @@ impl IndexRemapper for DatasetIndexRemapper {
                             new_id: id,
                             index_details,
                             index_version: index.index_version as u32,
+                            files: index.files.clone(),
                         });
                     }
                     RemapResult::Remapped(remapped_index) => {

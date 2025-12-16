@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+use futures::StreamExt;
+
 pub mod builder;
 pub mod ivf;
 pub mod pq;
@@ -49,7 +51,7 @@ use lance_index::{
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexFile, IndexMetadata};
 use object_store::path::Path;
 use serde::Serialize;
 use snafu::location;
@@ -1151,6 +1153,10 @@ pub async fn initialize_vector_index(
     )
     .await?;
 
+    // Capture file sizes for the new vector index
+    let index_dir = target_dataset.indices_dir().child(new_uuid.to_string());
+    let files = list_index_files_with_sizes(target_dataset, &index_dir).await?;
+
     let field = target_dataset
         .schema()
         .field(column_name)
@@ -1181,8 +1187,7 @@ pub async fn initialize_vector_index(
         index_version: VECTOR_INDEX_VERSION as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        // TODO: Capture file sizes when adding vector index
-        files: None,
+        files: Some(files),
     };
 
     let transaction = Transaction::new(
@@ -1199,6 +1204,30 @@ pub async fn initialize_vector_index(
         .await?;
 
     Ok(())
+}
+
+/// List all files in an index directory with their sizes.
+async fn list_index_files_with_sizes(
+    dataset: &Dataset,
+    index_dir: &Path,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut stream = dataset.object_store.read_dir_all(index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }
 
 /// Create IVF build parameters for delta index creation from an existing IVF model
