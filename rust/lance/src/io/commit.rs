@@ -31,8 +31,8 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, DETACHED_VERSION_MASK,
+    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, IndexFile, IndexMetadata,
+    Manifest, WriterVersion, DETACHED_VERSION_MASK,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -535,6 +535,7 @@ fn must_recalculate_fragment_bitmap(
 /// Update indices with new fields.
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
+/// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
@@ -542,7 +543,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             bad_indices.into_iter().map(|(name, _)| name).collect()
         }
     };
-    for index in indices {
+    for index in indices.iter_mut() {
         if needs_recalculating.contains(&index.name)
             || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
                 && !is_system_index(index)
@@ -564,9 +565,58 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         if index.index_details.is_none() {
             log::debug!("the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.", index.uuid);
         }
+
+        // Migrate file sizes for indices that don't have them
+        if index.files.is_none() && !is_system_index(index) {
+            match collect_index_file_sizes(dataset, index).await {
+                Ok(files) => {
+                    log::debug!(
+                        "Migrated file sizes for index {} (uuid: {}): {} files",
+                        index.name,
+                        index.uuid,
+                        files.len()
+                    );
+                    index.files = Some(files);
+                }
+                Err(e) => {
+                    // Log but don't fail - file sizes are optional
+                    log::debug!(
+                        "Could not collect file sizes for index {} (uuid: {}): {}",
+                        index.name,
+                        index.uuid,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Collect file sizes for an index by listing all files in its directory.
+async fn collect_index_file_sizes(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Vec<IndexFile>> {
+    let index_dir = dataset.indices_dir().child(index.uuid.to_string());
+    let mut files = Vec::new();
+    let mut stream = dataset.object_store.read_dir_all(&index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }
 
 pub(crate) struct BadFragmentBitmapError {
