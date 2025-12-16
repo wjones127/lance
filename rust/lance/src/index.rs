@@ -34,7 +34,7 @@ use lance_index::scalar::expression::{
 use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use lance_index::scalar::{CreatedIndex, ScalarIndex};
+use lance_index::scalar::{CreatedIndex, IndexStore, ScalarIndex};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -345,10 +345,14 @@ pub(crate) async fn remap_index(
             };
 
             // Capture file sizes for the scalar index
-            let file_sizes = new_store.list_files_with_sizes().await?;
-            let files: Vec<IndexFile> = file_sizes
+            let files: Vec<IndexFile> = new_store
+                .list_files_with_sizes()
+                .await?
                 .into_iter()
-                .map(|(path, size_bytes)| IndexFile { path, size_bytes })
+                .map(|f| IndexFile {
+                    path: f.path,
+                    size_bytes: f.size_bytes,
+                })
                 .collect();
 
             (created, Some(files))

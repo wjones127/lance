@@ -199,7 +199,7 @@ impl ScalarIndex for LabelListIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: None,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -217,7 +217,7 @@ impl ScalarIndex for LabelListIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: None,
+            files: Some(dest_store.list_files_with_sizes().await?),
         })
     }
 
@@ -453,7 +453,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: None,
+            files: Some(index_store.list_files_with_sizes().await?),
         })
     }
 

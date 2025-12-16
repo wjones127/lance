@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::CreatedIndex;
+use lance_index::scalar::{CreatedIndex, IndexStore};
 use lance_index::VECTOR_INDEX_VERSION;
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -149,13 +149,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let mut created_index = index.update(new_data_stream, &new_store).await?;
 
             // Capture file sizes for the new index
-            let file_sizes = new_store.list_files_with_sizes().await?;
-            created_index.files = Some(
-                file_sizes
-                    .into_iter()
-                    .map(|(path, size_bytes)| lance_index::scalar::IndexFile { path, size_bytes })
-                    .collect(),
-            );
+            created_index.files = Some(new_store.list_files_with_sizes().await?);
 
             // TODO: don't hard-code index version
             Ok((new_uuid, 1, created_index))

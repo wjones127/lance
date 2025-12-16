@@ -291,13 +291,7 @@ pub(super) async fn build_scalar_index(
         .await?;
 
     // Capture file sizes after index creation
-    let file_sizes = index_store.list_files_with_sizes().await?;
-    created_index.files = Some(
-        file_sizes
-            .into_iter()
-            .map(|(path, size_bytes)| lance_index::scalar::IndexFile { path, size_bytes })
-            .collect(),
-    );
+    created_index.files = Some(index_store.list_files_with_sizes().await?);
 
     Ok(created_index)
 }

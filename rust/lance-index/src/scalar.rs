@@ -227,6 +227,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
 
     /// Delete an index file (used in the tmp spill store to keep tmp size down)
     async fn delete_index_file(&self, name: &str) -> Result<()>;
+
+    /// List all files in the index directory with their sizes.
+    ///
+    /// Returns a list of (relative_path, size_bytes) tuples.
+    /// Used to capture file metadata after index creation/modification.
+    async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>>;
 }
 
 /// Different scalar indices may support different kinds of queries
