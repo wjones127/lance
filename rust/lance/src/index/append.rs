@@ -29,6 +29,8 @@ pub struct IndexMergeResults<'a> {
     pub new_fragment_bitmap: RoaringBitmap,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
+    /// List of files and their sizes for the merged index
+    pub files: Option<Vec<lance_table::format::IndexFile>>,
 }
 
 /// Merge in-inflight unindexed data, with a specific number of previous indices
@@ -188,6 +190,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: VECTOR_INDEX_VERSION,
+                    files: None,
                 },
             ))
         }
@@ -211,6 +214,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap: frag_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
+        // TODO: Capture file sizes during merge
+        files: None,
     }))
 }
 

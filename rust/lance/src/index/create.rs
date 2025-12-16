@@ -16,12 +16,16 @@ use crate::{
     Error, Result,
 };
 use futures::future::BoxFuture;
+use futures::StreamExt;
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
+use lance_index::{
+    scalar::CreatedIndex, scalar::IndexFile, IndexParams, IndexType, VECTOR_INDEX_VERSION,
+};
 use lance_table::format::IndexMetadata;
+use object_store::path::Path;
 use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
 use tracing::instrument;
@@ -293,9 +297,13 @@ impl<'a> CreateIndexBuilder<'a> {
                     )
                     .await?;
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files = list_index_files_with_sizes(self.dataset, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: VECTOR_INDEX_VERSION,
+                    files: Some(files),
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -328,9 +336,13 @@ impl<'a> CreateIndexBuilder<'a> {
                 } else {
                     todo!("create empty vector index when train=false");
                 }
+                // Capture file sizes after vector index creation
+                let index_dir = self.dataset.indices_dir().child(index_id.to_string());
+                let files = list_index_files_with_sizes(self.dataset, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details(),
                     index_version: VECTOR_INDEX_VERSION,
+                    files: Some(files),
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -374,6 +386,15 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: created_index.files.map(|files| {
+                files
+                    .into_iter()
+                    .map(|f| lance_table::format::IndexFile {
+                        path: f.path,
+                        size_bytes: f.size_bytes,
+                    })
+                    .collect()
+            }),
         })
     }
 
@@ -395,6 +416,30 @@ impl<'a> CreateIndexBuilder<'a> {
 
         Ok(())
     }
+}
+
+/// List all files in an index directory with their sizes.
+async fn list_index_files_with_sizes(
+    dataset: &Dataset,
+    index_dir: &Path,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut stream = dataset.object_store.read_dir_all(index_dir, None);
+    while let Some(meta) = stream.next().await {
+        let meta = meta?;
+        // Get relative path by stripping the index_dir prefix
+        let relative_path = meta
+            .location
+            .as_ref()
+            .strip_prefix(index_dir.as_ref())
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+        files.push(IndexFile {
+            path: relative_path,
+            size_bytes: meta.size,
+        });
+    }
+    Ok(files)
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {

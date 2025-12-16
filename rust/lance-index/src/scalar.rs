@@ -730,6 +730,15 @@ impl SearchResult {
     }
 }
 
+/// Metadata about a single file within an index segment.
+#[derive(Debug, Clone)]
+pub struct IndexFile {
+    /// Path relative to the index directory
+    pub path: String,
+    /// Size of the file in bytes
+    pub size_bytes: u64,
+}
+
 /// Brief information about an index that was created
 pub struct CreatedIndex {
     /// The details of the index that was created
@@ -741,6 +750,11 @@ pub struct CreatedIndex {
     ///
     /// This can be used to determine if a reader is able to load the index.
     pub index_version: u32,
+    /// List of files and their sizes for this index
+    ///
+    /// This enables skipping HEAD calls when opening indices and provides
+    /// visibility into index storage size via describe_indices().
+    pub files: Option<Vec<IndexFile>>,
 }
 
 /// The criteria that specifies how to update an index

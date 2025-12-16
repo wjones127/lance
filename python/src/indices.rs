@@ -481,11 +481,14 @@ pub struct PyIndexSegmentDescription {
     pub index_version: i32,
     /// The timestamp when the index segment was created
     pub created_at: Option<DateTime<Utc>>,
+    /// The total size in bytes of all files in this segment
+    /// (None for backward compatibility with indices created before file tracking)
+    pub size_bytes: Option<u64>,
 }
 
 impl PyIndexSegmentDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at)
+        format!("IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?})", self.uuid, self.dataset_version_at_last_update, self.fragment_ids, self.index_version, self.created_at, self.size_bytes)
     }
 }
 
@@ -507,6 +510,9 @@ pub struct PyIndexDescription {
     pub details: PyJson,
     /// The segments of the index
     pub segments: Vec<PyIndexSegmentDescription>,
+    /// The total size in bytes of all files across all segments
+    /// (None for backward compatibility with indices created before file tracking)
+    pub total_size_bytes: Option<u64>,
 }
 
 impl PyIndexDescription {
@@ -532,12 +538,14 @@ impl PyIndexDescription {
                     .as_ref()
                     .map(|bitmap| bitmap.iter().collect::<HashSet<_>>())
                     .unwrap_or_default();
+                let size_bytes = segment.total_size_bytes();
                 PyIndexSegmentDescription {
                     uuid: segment.uuid.to_string(),
                     dataset_version_at_last_update: segment.dataset_version,
                     fragment_ids,
                     index_version: segment.index_version,
                     created_at: segment.created_at,
+                    size_bytes,
                 }
             })
             .collect();
@@ -553,6 +561,7 @@ impl PyIndexDescription {
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
             details: PyJson(details),
+            total_size_bytes: index.total_size_bytes(),
         }
     }
 }
@@ -560,7 +569,7 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len())
+        format!("IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={}, total_size_bytes={:?})", self.name, self.type_url, self.num_rows_indexed, self.fields, self.field_names, self.segments.len(), self.total_size_bytes)
     }
 }
 

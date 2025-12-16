@@ -131,6 +131,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -148,6 +149,7 @@ impl ScalarIndex for JsonIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
             // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -815,6 +817,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
             index_version: JSON_INDEX_VERSION,
+            files: None,
         })
     }
 

@@ -360,6 +360,7 @@ pub(crate) async fn remap_index(
                 )
                 .unwrap(),
                 index_version: VECTOR_INDEX_VERSION,
+                files: None, // No file info for remapped indices
             }
         }
         _ => {
@@ -535,6 +536,18 @@ impl IndexDescription for IndexDescriptionImpl {
         plugin
             .details_as_json(&self.details.0)
             .map(|v| v.to_string())
+    }
+
+    fn total_size_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for segment in &self.segments {
+            // If any segment is missing file info, return None for backward compatibility
+            let files = segment.files.as_ref()?;
+            for file in files {
+                total += file.size_bytes;
+            }
+        }
+        Some(total)
     }
 }
 
@@ -760,6 +773,7 @@ impl DatasetIndexExt for Dataset {
             index_version: 0,
             created_at: Some(chrono::Utc::now()),
             base_id: None, // New indices don't have base_id (they're not from shallow clone)
+            files: None,   // File info will be populated when index is created
         };
 
         let transaction = Transaction::new(
@@ -879,7 +893,8 @@ impl DatasetIndexExt for Dataset {
                 index_details: Some(Arc::new(res.new_index_details)),
                 index_version: res.new_index_version,
                 created_at: Some(chrono::Utc::now()),
-                base_id: None, // Mew merged index file locates in the cloned dataset.
+                base_id: None, // New merged index file locates in the cloned dataset.
+                files: res.files,
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             if deltas.len() > res.removed_indices.len() {
@@ -1373,9 +1388,12 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler
-                    .open_file(&index_file, &CachedFileSize::unknown())
-                    .await?;
+                let file_sizes = index_meta.file_size_map();
+                let cached_size = file_sizes
+                    .get(INDEX_FILE_NAME)
+                    .map(|&size| CachedFileSize::new(size))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&index_file, &cached_size).await?;
                 let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
@@ -5207,5 +5225,185 @@ mod tests {
             field_path2.contains('.'),
             "Field path should contain '.' for nested field"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scalar_index_file_sizes_captured() {
+        // Test that file sizes are captured when creating a scalar index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("values", DataType::Utf8, false),
+        ]));
+
+        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get index metadata and verify files are populated
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices.iter().find(|idx| idx.name == "test_idx").unwrap();
+
+        assert!(
+            test_index.files.is_some(),
+            "Index should have files populated"
+        );
+        let files = test_index.files.as_ref().unwrap();
+        assert!(!files.is_empty(), "Index should have at least one file");
+
+        // Verify each file has a positive size
+        for file in files {
+            assert!(
+                file.size_bytes > 0,
+                "File {} should have positive size",
+                file.path
+            );
+        }
+
+        // Verify total_size_bytes works
+        let total_size = test_index.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should return Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_file_sizes_captured() {
+        // Test that file sizes are captured when creating a vector index
+        let num_rows = 300;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]));
+
+        let float_arr = generate_random_array(4 * num_rows);
+        let vectors = FixedSizeListArray::try_new_from_values(float_arr, 4).unwrap();
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create vector index
+        let params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_vec_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Get index metadata and verify files are populated
+        let indices = dataset.load_indices().await.unwrap();
+        let test_index = indices
+            .iter()
+            .find(|idx| idx.name == "test_vec_idx")
+            .unwrap();
+
+        assert!(
+            test_index.files.is_some(),
+            "Index should have files populated"
+        );
+        let files = test_index.files.as_ref().unwrap();
+        assert!(!files.is_empty(), "Index should have at least one file");
+
+        // Verify each file has a positive size
+        for file in files {
+            assert!(
+                file.size_bytes > 0,
+                "File {} should have positive size",
+                file.path
+            );
+        }
+
+        // Verify total_size_bytes works
+        let total_size = test_index.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should return Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_total_size() {
+        // Test that describe_indices returns total_size_bytes
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("values", DataType::Utf8, false),
+        ]));
+
+        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+
+        let reader =
+            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        // Create a scalar index
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::Scalar,
+                Some("test_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Use describe_indices to get index info
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+
+        let desc = &descriptions[0];
+        assert_eq!(desc.name(), "test_idx");
+
+        // Verify total_size_bytes is available
+        let total_size = desc.total_size_bytes();
+        assert!(total_size.is_some(), "total_size_bytes should be Some");
+        assert!(total_size.unwrap() > 0, "Total size should be positive");
     }
 }

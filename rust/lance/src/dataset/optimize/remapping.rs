@@ -284,6 +284,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_version: curr_index_meta.index_version,
                     created_at: curr_index_meta.created_at,
                     base_id: None,
+                    files: curr_index_meta.files.clone(),
                 },
                 RemapResult::Remapped(remapped_index) => IndexMetadata {
                     uuid: remapped_index.new_id,
@@ -295,6 +296,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                     index_version: remapped_index.index_version as i32,
                     created_at: curr_index_meta.created_at,
                     base_id: None,
+                    // TODO: Capture file sizes after remapping
+                    files: None,
                 },
             };
 

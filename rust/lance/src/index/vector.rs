@@ -1181,6 +1181,8 @@ pub async fn initialize_vector_index(
         index_version: VECTOR_INDEX_VERSION as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
+        // TODO: Capture file sizes when adding vector index
+        files: None,
     };
 
     let transaction = Transaction::new(

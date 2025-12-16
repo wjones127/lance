@@ -576,6 +576,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version,
+            files: None,
         })
     }
 
@@ -597,6 +598,7 @@ impl ScalarIndex for InvertedIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version,
+            files: None,
         })
     }
 

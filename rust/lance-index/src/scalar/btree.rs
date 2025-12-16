@@ -1530,6 +1530,7 @@ impl ScalarIndex for BTreeIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -1549,6 +1550,7 @@ impl ScalarIndex for BTreeIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -2500,6 +2502,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),
             index_version: BTREE_INDEX_VERSION,
+            files: None,
         })
     }
 

@@ -148,10 +148,8 @@ impl LanceIndexStoreExt for LanceIndexStore {
             .indice_files_dir(index)?
             .child(index.uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
-        Ok(Self::new(
-            dataset.object_store.clone(),
-            index_dir,
-            Arc::new(cache),
-        ))
+        let store = Self::new(dataset.object_store.clone(), index_dir, Arc::new(cache));
+        // Apply cached file sizes if available
+        Ok(store.with_file_sizes(index.file_size_map()))
     }
 }

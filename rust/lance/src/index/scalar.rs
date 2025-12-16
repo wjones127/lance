@@ -286,9 +286,20 @@ pub(super) async fn build_scalar_index(
         preprocessed_data.unwrap()
     };
 
-    plugin
+    let mut created_index = plugin
         .train_index(training_data, &index_store, training_request, fragment_ids)
-        .await
+        .await?;
+
+    // Capture file sizes after index creation
+    let file_sizes = index_store.list_files_with_sizes().await?;
+    created_index.files = Some(
+        file_sizes
+            .into_iter()
+            .map(|(path, size_bytes)| lance_index::scalar::IndexFile { path, size_bytes })
+            .collect(),
+    );
+
+    Ok(created_index)
 }
 
 /// Fetches the scalar index plugin for a given index metadata
@@ -580,6 +591,7 @@ mod tests {
             index_version: 0,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 

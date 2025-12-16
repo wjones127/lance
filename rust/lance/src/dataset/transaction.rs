@@ -3947,6 +3947,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 
@@ -3968,6 +3969,7 @@ mod tests {
             index_version: 1,
             created_at: None,
             base_id: None,
+            files: None,
         }
     }
 

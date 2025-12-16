@@ -37,6 +37,9 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
+    /// Cached file sizes (filename -> size in bytes)
+    /// When set, used to avoid HEAD calls when opening files
+    file_sizes: HashMap<String, u64>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -63,7 +66,17 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
+            file_sizes: HashMap::new(),
         }
+    }
+
+    /// Set cached file sizes to avoid HEAD calls when opening files.
+    ///
+    /// The map should contain relative paths (e.g., "index.idx") as keys
+    /// and file sizes in bytes as values.
+    pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
+        self.file_sizes = file_sizes;
+        self
     }
 }
 
@@ -223,10 +236,13 @@ impl IndexStore for LanceIndexStore {
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_dir.child(name);
-        let file_scheduler = self
-            .scheduler
-            .open_file(&path, &CachedFileSize::unknown())
-            .await?;
+        // Use cached file size if available, otherwise unknown (requires HEAD call)
+        let cached_size = self
+            .file_sizes
+            .get(name)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,
@@ -295,6 +311,30 @@ impl IndexStore for LanceIndexStore {
     async fn delete_index_file(&self, name: &str) -> Result<()> {
         let path = self.index_dir.child(name);
         self.object_store.delete(&path).await
+    }
+}
+
+impl LanceIndexStore {
+    /// List all files in the index directory with their sizes.
+    ///
+    /// Returns a list of (relative_path, size_bytes) tuples.
+    pub async fn list_files_with_sizes(&self) -> Result<Vec<(String, u64)>> {
+        use futures::stream::StreamExt;
+
+        let mut files = Vec::new();
+        let mut stream = self.object_store.read_dir_all(&self.index_dir, None);
+        while let Some(meta) = stream.next().await {
+            let meta = meta?;
+            // Get relative path by stripping the index_dir prefix
+            let relative_path = meta
+                .location
+                .as_ref()
+                .strip_prefix(self.index_dir.as_ref())
+                .map(|s| s.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+            files.push((relative_path, meta.size));
+        }
+        Ok(files)
     }
 }
 

@@ -54,6 +54,7 @@ impl FromPyObject<'_> for PyLance<IndexMetadata> {
             index_version,
             created_at,
             base_id,
+            files: None,
         }))
     }
 }

@@ -580,6 +580,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -609,6 +610,7 @@ impl ScalarIndex for BitmapIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: None,
         })
     }
 
@@ -803,6 +805,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
             index_version: BITMAP_INDEX_VERSION,
+            files: None,
         })
     }
 
