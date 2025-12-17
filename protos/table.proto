@@ -282,8 +282,9 @@ message IndexMetadata {
   optional uint32 base_id = 9;
 
   // List of files and their sizes for this index segment.
-  // This enables skipping HEAD calls when opening indices and provides
-  // visibility into index storage size via describe_indices().
+  // This enables skipping HEAD calls when opening indices and allows reporting
+  // of index sizes without extra IO.
+  // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
 }
 

@@ -1951,8 +1951,8 @@ mod tests {
     use futures::stream::TryStreamExt;
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::gen_batch;
     use lance_datagen::{array, BatchCount, Dimension, RowCount};
+    use lance_datagen::{gen_batch, ByteCount};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -5252,23 +5252,10 @@ mod tests {
     #[tokio::test]
     async fn test_scalar_index_file_sizes_captured() {
         // Test that file sizes are captured when creating a scalar index
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("values", DataType::Utf8, false),
-        ]));
-
-        let values = StringArray::from_iter_values(["hello", "world", "foo", "bar"]);
-        let record_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..4)),
-                Arc::new(values),
-            ],
-        )
-        .unwrap();
-
-        let reader =
-            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col("values", array::rand_utf8(ByteCount::from(10), false))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
 
         let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 
@@ -5313,29 +5300,13 @@ mod tests {
     #[tokio::test]
     async fn test_vector_index_file_sizes_captured() {
         // Test that file sizes are captured when creating a vector index
-        let num_rows = 300;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new(
+        let reader = gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
                 "vector",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
-                false,
-            ),
-        ]));
-
-        let float_arr = generate_random_array(4 * num_rows);
-        let vectors = FixedSizeListArray::try_new_from_values(float_arr, 4).unwrap();
-        let record_batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
-                Arc::new(vectors),
-            ],
-        )
-        .unwrap();
-
-        let reader =
-            RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
+                array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+            )
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
 
         let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 

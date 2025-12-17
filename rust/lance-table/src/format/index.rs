@@ -74,7 +74,8 @@ pub struct IndexMetadata {
     /// List of files and their sizes for this index segment.
     /// This enables skipping HEAD calls when opening indices and provides
     /// visibility into index storage size via describe_indices().
-    /// This is None for indices created before this field was added.
+    /// This is None if the file sizes are unknown. This happens for indices created
+    /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
 }
 
