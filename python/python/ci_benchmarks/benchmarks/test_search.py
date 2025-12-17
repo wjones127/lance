@@ -205,7 +205,10 @@ def test_basic_bitmap_search(
 @pytest.mark.io_memory_benchmark()
 @pytest.mark.parametrize("filt", BASIC_BTREE_FILTERS, ids=BASIC_BTREE_FILTER_LABELS)
 @pytest.mark.parametrize("payload", ["small_strings", "integers"])
-def test_io_mem_basic_btree_search(io_mem_benchmark, filt: str | None, payload: str):
+@pytest.mark.parametrize("hot", [False, True], ids=["cold", "hot"])
+def test_io_mem_basic_btree_search(
+    io_mem_benchmark, filt: str | None, payload: str, hot: bool
+):
     dataset_uri = get_dataset_uri("basic")
     ds = lance.dataset(dataset_uri)
 
@@ -221,4 +224,29 @@ def test_io_mem_basic_btree_search(io_mem_benchmark, filt: str | None, payload: 
             batch_size=32 * 1024,
         )
 
-    io_mem_benchmark(bench, ds)
+    io_mem_benchmark(bench, ds, warmup=hot)
+
+
+@pytest.mark.io_memory_benchmark()
+@pytest.mark.parametrize("filt", BASIC_BITMAP_FILTERS, ids=BASIC_BITMAP_FILTER_LABELS)
+@pytest.mark.parametrize("payload", ["small_strings", "integers"])
+@pytest.mark.parametrize("hot", [False, True], ids=["cold", "hot"])
+def test_io_mem_basic_bitmap_search(
+    io_mem_benchmark, filt: str | None, payload: str, hot: bool
+):
+    dataset_uri = get_dataset_uri("basic")
+    ds = lance.dataset(dataset_uri)
+
+    columns = []
+    if payload is not None:
+        columns = [payload]
+
+    def bench(dataset):
+        dataset.to_table(
+            columns=columns,
+            filter=filt,
+            with_row_id=True,
+            batch_size=32 * 1024,
+        )
+
+    io_mem_benchmark(bench, ds, warmup=hot)

@@ -92,6 +92,33 @@ To save results as JSON (Bencher Metric Format):
 pytest ... --benchmark-stats-json stats.json
 ```
 
+### Comparing Against a Baseline
+
+To compare IO/memory benchmarks across branches:
+
+```bash
+# On main branch, save a baseline
+git checkout main
+LD_PRELOAD=$(lance-memtest) pytest python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_bitmap_search -v --iom-save=main
+
+# On feature branch, compare against main
+git checkout feature-branch
+LD_PRELOAD=$(lance-memtest) pytest python/ci_benchmarks/benchmarks/test_search.py::test_io_mem_basic_bitmap_search -v --iom-compare=main
+```
+
+Output shows current values with percentage change and baseline values below:
+```
+======================== IO/Memory Benchmark Statistics ========================
+Comparing against: main (2025-12-17 14:30, commit abc1234)
+
+Test                                                             Peak Mem          Read Bytes
+---------------------------------------------------------------------------------------------
+test_io_mem_basic_bitmap_search[cold-integers-none]           154.2 MB (+18%)    76.3 MB (+0%)
+                                                          vs  130.5 MB              76.3 MB
+```
+
+Baselines are stored in `.benchmarks/` (already in `.gitignore`).
+
 ## Investigating memory use for a particular benchmark
 
 To investigate memory use for a particular benchmark, you can use the `bytehound` library.
