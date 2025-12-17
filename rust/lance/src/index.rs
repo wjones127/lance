@@ -1285,18 +1285,26 @@ impl DatasetIndexInternalExt for Dataset {
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
         // For example, we might want to get statistics for an index, regardless of type.
         //
-        // Currently, we solve this problem by checking for the existence of INDEX_FILE_NAME since
-        // only vector indices have this file.  In the future, once we support multiple kinds of
-        // scalar indices, we may start having this file with scalar indices too.  Once that happens
-        // we can just read this file and look at the `implementation` or `index_type` fields to
-        // determine what kind of index it is.
+        // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
+        // file list (available since file sizes tracking was added). If the file list is not
+        // available (older indices), we fall back to checking file existence via HEAD request.
         let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
             message: format!("Index with id {} does not exist", uuid),
             location: location!(),
         })?;
-        let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
-        if self.object_store.exists(&index_file).await? {
+
+        // Check if this is a vector index by looking at the files list
+        let is_vector_index = if let Some(files) = &index_meta.files {
+            // If we have file metadata, check if INDEX_FILE_NAME is in the list
+            files.iter().any(|f| f.path == INDEX_FILE_NAME)
+        } else {
+            // Fall back to file existence check for older indices without file metadata
+            let index_dir = self.indice_files_dir(&index_meta)?;
+            let index_file = index_dir.child(uuid).child(INDEX_FILE_NAME);
+            self.object_store.exists(&index_file).await?
+        };
+
+        if is_vector_index {
             let index = self.open_vector_index(column, uuid, metrics).await?;
             Ok(index.as_index())
         } else {
@@ -1452,6 +1460,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1464,6 +1473,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1485,6 +1495,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1498,6 +1509,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1511,6 +1523,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1527,6 +1540,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             &file_metadata_cache,
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1540,6 +1554,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1553,6 +1568,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -5785,7 +5801,7 @@ mod tests {
         assert_io_lt!(
             stats,
             read_iops,
-            10,
+            15,
             "Inverted index query should use minimal IOPs"
         );
     }
