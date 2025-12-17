@@ -5585,4 +5585,295 @@ mod tests {
             assert_all_indices_have_files(&dataset, "after remap").await;
         }
     }
+
+    #[tokio::test]
+    async fn test_btree_index_iops() {
+        // Test that querying a BTree index uses minimal IOPs (no HEAD requests)
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with a column suitable for BTree index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let values = Int32Array::from_iter_values((0..num_rows).map(|i| i % 100));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(values)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create BTree index
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("btree_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh to avoid cached state
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the BTree index
+        let results = dataset
+            .scan()
+            .filter("value = 50")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs - should be minimal (no HEAD requests)
+        let stats = dataset.object_store().io_stats_incremental();
+        // We expect reads for: index metadata + index pages + data files
+        // The key assertion is that we don't have extra HEAD requests
+        assert_io_lt!(
+            stats,
+            read_iops,
+            10,
+            "BTree index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_index_iops() {
+        // Test that querying a Bitmap index uses minimal IOPs (no HEAD requests)
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with low-cardinality column for Bitmap index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("category", DataType::Int32, false),
+        ]));
+
+        let num_rows = 1000;
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        // Low cardinality - only 10 unique values
+        let categories = Int32Array::from_iter_values((0..num_rows).map(|i| i % 10));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(categories)])
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create Bitmap index
+        dataset
+            .create_index(
+                &["category"],
+                IndexType::Bitmap,
+                Some("bitmap_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the Bitmap index
+        let results = dataset
+            .scan()
+            .filter("category = 5")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            10,
+            "Bitmap index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inverted_index_iops() {
+        // Test that querying an Inverted (FTS) index uses minimal IOPs
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with text column for Inverted index
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+
+        let num_rows = 100;
+        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let texts = StringArray::from_iter_values((0..num_rows).map(|i| {
+            if i % 3 == 0 {
+                format!("hello world document {}", i)
+            } else if i % 3 == 1 {
+                format!("goodbye universe text {}", i)
+            } else {
+                format!("random content item {}", i)
+            }
+        }));
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(texts)]).unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create Inverted index
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("inverted_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the Inverted index (full-text search)
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("hello".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            10,
+            "Inverted index query should use minimal IOPs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_index_iops() {
+        // Test that querying an IVF_PQ vector index uses minimal IOPs
+        let test_dir = TempStrDir::default();
+
+        // Create dataset with vector column
+        let dimension = 32;
+        let num_rows = 1000;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension,
+                ),
+                false,
+            ),
+        ]));
+
+        let ids = Int32Array::from_iter_values(0..num_rows);
+        let vectors: Vec<Option<Vec<Option<f32>>>> = (0..num_rows)
+            .map(|i| {
+                Some(
+                    (0..dimension)
+                        .map(|j| Some((i * dimension + j) as f32 / 1000.0))
+                        .collect(),
+                )
+            })
+            .collect();
+        let vector_array =
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vectors, dimension);
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vector_array)])
+                .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        // Create IVF_PQ index
+        let params = VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("ivf_pq_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset fresh
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+
+        // Reset IO stats before query
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Query using the IVF_PQ index (KNN search)
+        let query_vector: Vec<f32> = (0..dimension).map(|i| i as f32 / 1000.0).collect();
+        let results = dataset
+            .scan()
+            .nearest("vector", &Float32Array::from(query_vector), 10)
+            .unwrap()
+            .nprobes(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+
+        // Verify IOPs
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_lt!(
+            stats,
+            read_iops,
+            15,
+            "IVF_PQ index query should use minimal IOPs"
+        );
+    }
 }

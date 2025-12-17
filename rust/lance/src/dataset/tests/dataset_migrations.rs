@@ -8,7 +8,6 @@ use crate::dataset::optimize::{compact_files, CompactionOptions};
 use crate::dataset::InsertBuilder;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
-use arrow::record_batch;
 use lance_table::format::IndexMetadata;
 
 use crate::dataset::write::{WriteMode, WriteParams};
@@ -439,7 +438,8 @@ async fn test_index_file_size_migration() {
     let batch = arrow_array::record_batch!(
         ("id", Int64, [100, 101]),
         ("values", Utf8, ["value_100", "value_101"])
-    );
+    )
+    .unwrap();
     let dataset = InsertBuilder::new(Arc::new(dataset))
         .execute(vec![batch])
         .await
