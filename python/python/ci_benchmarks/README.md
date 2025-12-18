@@ -111,10 +111,10 @@ Output shows current values with percentage change and baseline values below:
 ======================== IO/Memory Benchmark Statistics ========================
 Comparing against: main (2025-12-17 14:30, commit abc1234)
 
-Test                                                             Peak Mem          Read Bytes
----------------------------------------------------------------------------------------------
-test_io_mem_basic_bitmap_search[cold-integers-none]           154.2 MB (+18%)    76.3 MB (+0%)
-                                                          vs  130.5 MB              76.3 MB
+Test                                                              Peak Mem          Read Bytes
+----------------------------------------------------------------------------------------------
+test_io_mem_basic_bitmap_search[cold-integers-none]          154.2 MB (+18%)     76.3 MB (+0%)
+                                                     vs      130.5 MB            76.3 MB
 ```
 
 Baselines are stored in `.benchmarks/` (already in `.gitignore`).

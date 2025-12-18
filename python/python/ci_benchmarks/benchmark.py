@@ -370,6 +370,27 @@ def _print_summary_no_compare(terminalreporter, results: List[BenchmarkResult]):
             )
 
 
+# ANSI color codes
+_GREEN = "\033[32m"
+_RED = "\033[31m"
+_RESET = "\033[0m"
+
+
+def _col(value: str, delta: str, vw: int, dw: int, color: str = "") -> str:
+    """Format a column with right-aligned value and optionally colored delta."""
+    if color:
+        return f"{value:>{vw}} {color}{delta:<{dw}}{_RESET}"
+    return f"{value:>{vw}} {delta:<{dw}}"
+
+
+def _delta_color(current: int, baseline: int, use_color: bool) -> str:
+    """Return ANSI color code for delta (green=improvement, red=regression)."""
+    if not use_color or current == baseline:
+        return ""
+    # For memory/IO metrics, lower is better
+    return _GREEN if current < baseline else _RED
+
+
 def _print_summary_with_compare(
     terminalreporter, results: List[BenchmarkResult], baseline: Baseline
 ):
@@ -384,98 +405,101 @@ def _print_summary_with_compare(
     name_width = max(len(r.name) for r in results)
     name_width = max(name_width, len("Test"))
 
-    # Column widths for comparison mode (value + delta)
-    col_width = 18
+    # Column widths: value portion and delta portion separately for alignment
+    vw = 10  # Width for the value (e.g., "13.8 MB")
+    dw = 7  # Width for the delta (e.g., "(+2%)")
+    cw = vw + 1 + dw  # Total column width
 
     if MEMTEST_AVAILABLE:
         terminalreporter.write_line(
-            f"{'Test':<{name_width}}  {'Peak Mem':>{col_width}}  "
-            f"{'Allocs':>{col_width}}  {'Read IOPS':>{col_width}}  "
-            f"{'Read Bytes':>{col_width}}"
+            f"{'Test':<{name_width}}  {'Peak Mem':>{cw}}  "
+            f"{'Allocs':>{cw}}  {'Read IOPS':>{cw}}  {'Read Bytes':>{cw}}"
         )
-        terminalreporter.write_line("-" * (name_width + 4 * col_width + 8))
+        terminalreporter.write_line("-" * (name_width + 4 * cw + 8))
     else:
         terminalreporter.write_line(
-            f"{'Test':<{name_width}}  "
-            f"{'Read IOPS':>{col_width}}  {'Read Bytes':>{col_width}}"
+            f"{'Test':<{name_width}}  {'Read IOPS':>{cw}}  {'Read Bytes':>{cw}}"
         )
-        terminalreporter.write_line("-" * (name_width + 2 * col_width + 4))
+        terminalreporter.write_line("-" * (name_width + 2 * cw + 4))
 
     sorted_results = sorted(results, key=lambda r: r.stats.read_bytes, reverse=True)
+    use_color = terminalreporter.hasmarkup
 
     for result in sorted_results:
         s = result.stats
-        base_stats = baseline.benchmarks.get(result.name)
+        b = baseline.benchmarks.get(result.name)
 
-        if base_stats is None:
+        if b is None:
             # New test, not in baseline
+            cols = []
             if MEMTEST_AVAILABLE:
-                terminalreporter.write_line(
-                    f"{result.name:<{name_width}}  "
-                    f"{_format_bytes(s.peak_bytes) + ' (new)':>{col_width}}  "
-                    f"{_format_count(s.total_allocations) + ' (new)':>{col_width}}  "
-                    f"{_format_iops(s.read_iops) + ' (new)':>{col_width}}  "
-                    f"{_format_bytes(s.read_bytes) + ' (new)':>{col_width}}"
-                )
-            else:
-                terminalreporter.write_line(
-                    f"{result.name:<{name_width}}  "
-                    f"{_format_iops(s.read_iops) + ' (new)':>{col_width}}  "
-                    f"{_format_bytes(s.read_bytes) + ' (new)':>{col_width}}"
-                )
+                cols.append(_col(_format_bytes(s.peak_bytes), "(new)", vw, dw))
+                cols.append(_col(_format_count(s.total_allocations), "(new)", vw, dw))
+            cols.append(_col(_format_iops(s.read_iops), "(new)", vw, dw))
+            cols.append(_col(_format_bytes(s.read_bytes), "(new)", vw, dw))
+            terminalreporter.write_line(
+                f"{result.name:<{name_width}}  " + "  ".join(cols)
+            )
+            terminalreporter.write_line("")
         else:
-            # Format current values with deltas
+            # Current values with deltas (colored: green=improvement, red=regression)
+            def delta_str(cur, base):
+                return f"({_format_delta(cur, base)})"
+
+            def colr(cur, base):
+                return _delta_color(cur, base, use_color)
+
+            cols = []
             if MEMTEST_AVAILABLE:
-                peak_mem_str = (
-                    f"{_format_bytes(s.peak_bytes)} "
-                    f"({_format_delta(s.peak_bytes, base_stats.peak_bytes)})"
+                cols.append(
+                    _col(
+                        _format_bytes(s.peak_bytes),
+                        delta_str(s.peak_bytes, b.peak_bytes),
+                        vw,
+                        dw,
+                        colr(s.peak_bytes, b.peak_bytes),
+                    )
                 )
-                delta = _format_delta(s.total_allocations, base_stats.total_allocations)
-                allocs_str = f"{_format_count(s.total_allocations)} ({delta})"
-                read_iops_str = (
-                    f"{_format_iops(s.read_iops)} "
-                    f"({_format_delta(s.read_iops, base_stats.read_iops)})"
+                cols.append(
+                    _col(
+                        _format_count(s.total_allocations),
+                        delta_str(s.total_allocations, b.total_allocations),
+                        vw,
+                        dw,
+                        colr(s.total_allocations, b.total_allocations),
+                    )
                 )
-                read_bytes_str = (
-                    f"{_format_bytes(s.read_bytes)} "
-                    f"({_format_delta(s.read_bytes, base_stats.read_bytes)})"
+            cols.append(
+                _col(
+                    _format_iops(s.read_iops),
+                    delta_str(s.read_iops, b.read_iops),
+                    vw,
+                    dw,
+                    colr(s.read_iops, b.read_iops),
                 )
-                terminalreporter.write_line(
-                    f"{result.name:<{name_width}}  "
-                    f"{peak_mem_str:>{col_width}}  "
-                    f"{allocs_str:>{col_width}}  "
-                    f"{read_iops_str:>{col_width}}  "
-                    f"{read_bytes_str:>{col_width}}"
+            )
+            cols.append(
+                _col(
+                    _format_bytes(s.read_bytes),
+                    delta_str(s.read_bytes, b.read_bytes),
+                    vw,
+                    dw,
+                    colr(s.read_bytes, b.read_bytes),
                 )
-                # Baseline values line
-                terminalreporter.write_line(
-                    f"{'vs':>{name_width}}  "
-                    f"{_format_bytes(base_stats.peak_bytes):>{col_width}}  "
-                    f"{_format_count(base_stats.total_allocations):>{col_width}}  "
-                    f"{_format_iops(base_stats.read_iops):>{col_width}}  "
-                    f"{_format_bytes(base_stats.read_bytes):>{col_width}}"
-                )
-            else:
-                read_iops_str = (
-                    f"{_format_iops(s.read_iops)} "
-                    f"({_format_delta(s.read_iops, base_stats.read_iops)})"
-                )
-                read_bytes_str = (
-                    f"{_format_bytes(s.read_bytes)} "
-                    f"({_format_delta(s.read_bytes, base_stats.read_bytes)})"
-                )
-                terminalreporter.write_line(
-                    f"{result.name:<{name_width}}  "
-                    f"{read_iops_str:>{col_width}}  "
-                    f"{read_bytes_str:>{col_width}}"
-                )
-                # Baseline values line
-                terminalreporter.write_line(
-                    f"{'vs':>{name_width}}  "
-                    f"{_format_iops(base_stats.read_iops):>{col_width}}  "
-                    f"{_format_bytes(base_stats.read_bytes):>{col_width}}"
-                )
-        terminalreporter.write_line("")
+            )
+            terminalreporter.write_line(
+                f"{result.name:<{name_width}}  " + "  ".join(cols)
+            )
+
+            # Baseline values line (empty delta for alignment)
+            vs_cols = []
+            if MEMTEST_AVAILABLE:
+                vs_cols.append(_col(_format_bytes(b.peak_bytes), "", vw, dw))
+                vs_cols.append(_col(_format_count(b.total_allocations), "", vw, dw))
+            vs_cols.append(_col(_format_iops(b.read_iops), "", vw, dw))
+            vs_cols.append(_col(_format_bytes(b.read_bytes), "", vw, dw))
+            terminalreporter.write_line(f"{'vs':>{name_width}}  " + "  ".join(vs_cols))
+            terminalreporter.write_line("")
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
