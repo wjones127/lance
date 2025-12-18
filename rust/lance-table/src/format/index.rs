@@ -142,6 +142,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             index_version: Some(idx.index_version),
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
+            files: Vec::new(),
         }
     }
 }
