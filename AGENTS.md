@@ -116,6 +116,22 @@ Code standards:
 Tests:
 * When writing unit tests, prefer using the `memory://` URI instead of creating
   a temporary directory.
+* When creating test RecordBatch data:
+    * Create random data using `datagen::gen_batch`. For example:
+      ```rust
+      let batches = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col("text", array::rand_utf8(ByteCount::from(10), false))
+        .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+      ```
+    * Create small deterministic data with `arrow_array::record_batch!()`. For example:
+      ```rust
+      let batch = record_batch!(
+            ("value", Int32, [None, Some(0), Some(5)]),
+            ("_rowid", UInt64, [0, 1, 2])
+        )
+        .unwrap();
+      ```
 * Use rstest to generate parameterized tests to cover more cases with fewer lines
   of code.
     * Use syntax `#[case::{name}(...)]` to provide human-readable names for each case.
