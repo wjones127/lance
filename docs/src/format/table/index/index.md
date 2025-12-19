@@ -87,7 +87,7 @@ The content of each index is stored at the `_indices/{UUID}` directory under the
 We call this location the **index directory**.
 The actual content stored in the index directory depends on the index type. These can be
 arbitrary files defined by the index implementation. However, often they are made up of
-Lance files containing the index data structures. The allows reuse of the existing Lance
+Lance files containing the index data structures. This allows reuse of the existing Lance
 file format code for reading and writing index data.
 
 ## Creating and Updating Index Segments
@@ -208,7 +208,7 @@ to existing row addresses. There are three ways to handle this:
    is the worst options for query performance.
 
 2. Immediately rewrite the index segments with the row addresses remapped. This approach
-   ensures the index is kept up-to-date, but it incurs singificant write ampliciation
+   ensures the index is kept up-to-date, but it incurs significant write amplification
    during compaction.
 
 3. Create a [Fragment Reuse Index](system/frag_reuse.md) that maps old row addresses to new
