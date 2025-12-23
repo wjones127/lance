@@ -469,6 +469,12 @@ impl InnerBuilder {
                     }
                 }
             }
+
+            // Drain remaining items in the queue
+            while let Some(rx) = queue.pop_front() {
+                let batch = rx.recv().expect("failed to receive batch");
+                final_tx.send(batch).expect("failed to send batch");
+            }
         });
     }
 
@@ -496,7 +502,7 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
 
         let (tx, mut batch_rx) = tokio::sync::mpsc::unbounded_channel();
-        let build_task = tokio::task::spawn_blocking(move || {
+        let _build_task = tokio::task::spawn_blocking(move || {
             Self::serialize_posting_lists(&docs, &posting_lists, tx);
         });
 
