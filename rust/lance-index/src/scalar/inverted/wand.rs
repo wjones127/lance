@@ -849,6 +849,7 @@ impl PositionIterator {
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::LargeBinaryBuilder;
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
@@ -870,13 +871,16 @@ mod tests {
         let freqs = vec![1; doc_ids.len()];
         let block_max_scores = block_max_scores.unwrap_or_else(|| vec![max_score; doc_ids.len()]);
         if is_compressed {
-            let blocks = compress_posting_list(
+            let mut builder = LargeBinaryBuilder::new();
+            compress_posting_list(
                 doc_ids.len(),
                 doc_ids.iter(),
                 freqs.iter(),
                 block_max_scores.into_iter(),
+                &mut builder,
             )
             .unwrap();
+            let blocks = builder.finish();
             PostingList::Compressed(CompressedPostingList::new(
                 blocks,
                 max_score,

@@ -33,26 +33,19 @@ pub fn compress_posting_list<'a>(
     doc_ids: impl Iterator<Item = &'a u32>,
     frequencies: impl Iterator<Item = &'a u32>,
     mut block_max_scores: impl Iterator<Item = f32>,
-) -> Result<arrow::array::LargeBinaryArray> {
+    builder: &mut LargeBinaryBuilder,
+) -> Result<()> {
     if length < BLOCK_SIZE {
         // directly do remainder compression to avoid overhead of creating buffer
-        let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(
-            doc_ids.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
-        compress_remainder(
-            frequencies.copied().collect::<Vec<_>>().as_slice(),
-            &mut builder,
-        )?;
+        compress_remainder(doc_ids.copied().collect::<Vec<_>>().as_slice(), builder)?;
+        compress_remainder(frequencies.copied().collect::<Vec<_>>().as_slice(), builder)?;
         builder.append_value("");
-        return Ok(builder.finish());
+        return Ok(());
     }
 
-    let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(BLOCK_SIZE), length * 3);
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
     let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
@@ -70,9 +63,9 @@ pub fn compress_posting_list<'a>(
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
         // delta encoding + bitpacking for doc ids
-        compress_sorted_block(&doc_id_buffer, &mut buffer, &mut builder)?;
+        compress_sorted_block(&doc_id_buffer, &mut buffer, builder)?;
         // bitpacking for frequencies
-        compress_block(&freq_buffer, &mut buffer, &mut builder)?;
+        compress_block(&freq_buffer, &mut buffer, builder)?;
         builder.append_value("");
         doc_id_buffer.clear();
         freq_buffer.clear();
@@ -83,11 +76,11 @@ pub fn compress_posting_list<'a>(
         // write the max score of the block
         let max_score = block_max_scores.next().unwrap();
         let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        compress_remainder(&doc_id_buffer, &mut builder)?;
-        compress_remainder(&freq_buffer, &mut builder)?;
+        compress_remainder(&doc_id_buffer, builder)?;
+        compress_remainder(&freq_buffer, builder)?;
         builder.append_value("");
     }
-    Ok(builder.finish())
+    Ok(())
 }
 
 #[inline]
@@ -123,11 +116,7 @@ fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<
     Ok(())
 }
 
-pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinaryArray> {
-    let mut builder = LargeBinaryBuilder::with_capacity(
-        positions.len().div_ceil(BLOCK_SIZE),
-        positions.len() * 4,
-    );
+pub fn compress_positions(positions: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
     // record the number of positions in the first binary
     let num_positions = positions.len() as u32;
     builder.append_value(num_positions.to_le_bytes().as_ref());
@@ -136,7 +125,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     for position_chunk in position_chunks {
         // delta encoding + bitpacking for positions
-        compress_sorted_block(position_chunk, &mut buffer, &mut builder)?;
+        compress_sorted_block(position_chunk, &mut buffer, builder)?;
         builder.append_value("");
     }
 
@@ -144,11 +133,11 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let length = positions.len();
     let remainder = length % BLOCK_SIZE;
     if remainder > 0 {
-        compress_remainder(&positions[length - remainder..], &mut builder)?;
+        compress_remainder(&positions[length - remainder..], builder)?;
         builder.append_value("");
     }
 
-    Ok(builder.finish())
+    Ok(())
 }
 
 /// decompress the posting list from a LargeBinaryArray
@@ -269,7 +258,7 @@ pub fn decompress_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Array;
+    use arrow::array::{Array, LargeBinaryBuilder};
     use itertools::Itertools;
     use rand::Rng;
 
@@ -286,12 +275,15 @@ mod tests {
             .collect();
         let block_max_scores =
             (0..num_rows.div_ceil(BLOCK_SIZE)).map(|_| rng.random_range(0.0..1.0));
-        let posting_list = compress_posting_list(
+        let mut posting_list_builder = LargeBinaryBuilder::new();
+        compress_posting_list(
             doc_ids.len(),
             doc_ids.iter(),
             frequencies.iter(),
             block_max_scores,
+            &mut posting_list_builder,
         )?;
+        let posting_list = posting_list_builder.finish();
         assert_eq!(posting_list.len(), num_rows.div_ceil(BLOCK_SIZE));
         let compressed_size =
             posting_list.value_data().len() + posting_list.value_offsets().len() * 8;
@@ -318,7 +310,9 @@ mod tests {
             .map(|_| rng.random())
             .sorted_unstable()
             .collect();
-        let compressed = compress_positions(&positions)?;
+        let mut compressed_builder = LargeBinaryBuilder::new();
+        compress_positions(&positions, &mut compressed_builder)?;
+        let compressed = compressed_builder.finish();
         assert_eq!(compressed.len(), num_positions.div_ceil(BLOCK_SIZE) + 1);
         let compressed_size = compressed.value_data().len() + compressed.value_offsets().len() * 8;
         let original_size = 2 * num_positions * 4;

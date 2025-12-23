@@ -12,19 +12,17 @@ use std::{collections::HashMap, ops::Range};
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
-use arrow::{
-    array::{
-        AsArray, LargeBinaryBuilder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
-    },
-    buffer::OffsetBuffer,
+use arrow::array::PrimitiveBuilder;
+use arrow::array::{
+    AsArray, LargeBinaryBuilder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
 };
+use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait,
     RecordBatch, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -833,6 +831,8 @@ impl InvertedPartition {
 #[derive(Debug, Clone)]
 pub enum TokenMap {
     HashMap(HashMap<String, u32>),
+    // TODO:
+    // HashMap(ArrowBytesMap),
     Fst(fst::Map<Vec<u8>>),
 }
 
@@ -940,13 +940,15 @@ impl TokenSet {
         let token_col = token_builder.finish();
         let token_id_col = token_id_builder.finish();
 
-        let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
-            arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
-        ]);
+        static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
+                arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
+            ]))
+        });
 
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            SCHEMA.clone(),
             vec![
                 Arc::new(token_col) as ArrayRef,
                 Arc::new(token_id_col) as ArrayRef,
@@ -974,14 +976,16 @@ impl TokenSet {
         total_length_builder.append_value(self.total_length as u64);
         let total_length_col = total_length_builder.finish();
 
-        let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(TOKEN_FST_BYTES_COL, DataType::LargeBinary, false),
-            arrow_schema::Field::new(TOKEN_NEXT_ID_COL, DataType::UInt32, false),
-            arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
-        ]);
+        static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(TOKEN_FST_BYTES_COL, DataType::LargeBinary, false),
+                arrow_schema::Field::new(TOKEN_NEXT_ID_COL, DataType::UInt32, false),
+                arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
+            ]))
+        });
 
         let batch = RecordBatch::try_new(
-            Arc::new(schema),
+            SCHEMA.clone(),
             vec![
                 Arc::new(fst_col) as ArrayRef,
                 Arc::new(next_id_col) as ArrayRef,
@@ -1098,11 +1102,19 @@ impl TokenSet {
         })
     }
 
-    pub fn add(&mut self, token: String) -> u32 {
+    pub fn add(&mut self, token: &str) -> u32 {
         let next_id = self.next_id();
         let len = token.len();
         let token_id = match self.tokens {
-            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
+            TokenMap::HashMap(ref mut map) => {
+                if let Some(&id) = map.get(token) {
+                    id
+                } else {
+                    let id = self.next_id;
+                    map.insert(token.to_string(), id);
+                    id
+                }
+            }
             _ => unreachable!("tokens must be HashMap while indexing"),
         };
 
@@ -1859,49 +1871,37 @@ impl PostingListBuilder {
     }
 
     // assume the posting list is sorted by doc id
-    pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
+    pub fn to_batch(
+        &self,
+        block_max_scores: Vec<f32>,
+        builder: &mut PostingListBatchBuilder,
+    ) -> Result<()> {
         let length = self.len();
         let max_score = block_max_scores.iter().copied().fold(f32::MIN, f32::max);
 
-        let schema = inverted_list_schema(self.has_positions());
-        let compressed = compress_posting_list(
+        compress_posting_list(
             self.doc_ids.len(),
             self.doc_ids.iter(),
             self.frequencies.iter(),
             block_max_scores.into_iter(),
+            builder.posting_builder.values(),
         )?;
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
-        let mut columns = vec![
-            Arc::new(ListArray::try_new(
-                Arc::new(Field::new("item", datatypes::DataType::LargeBinary, true)),
-                offsets,
-                Arc::new(compressed),
-                None,
-            )?) as ArrayRef,
-            Arc::new(Float32Array::from_iter_values(std::iter::once(max_score))) as ArrayRef,
-            Arc::new(UInt32Array::from_iter_values(std::iter::once(
-                self.len() as u32
-            ))) as ArrayRef,
-        ];
+        builder.posting_builder.append(true);
 
-        if let Some(positions) = self.positions.as_ref() {
-            let mut position_builder = ListBuilder::new(ListBuilder::with_capacity(
-                LargeBinaryBuilder::new(),
-                length,
-            ));
+        builder.max_score_builder.append_value(max_score);
+        builder.length_builder.append_value(self.len() as u32);
+
+        if let Some(position_builder) = &mut builder.positions_builder {
+            let positions = self.positions.as_ref().unwrap();
             for index in 0..length {
                 let positions_in_doc = positions.get(index);
-                let compressed = compress_positions(positions_in_doc)?;
-                let inner_builder = position_builder.values();
-                inner_builder.append_value(compressed.into_iter());
+                compress_positions(positions_in_doc, position_builder.values().values())?;
+                position_builder.values().append(true);
             }
             position_builder.append(true);
-            let position_col = position_builder.finish();
-            columns.push(Arc::new(position_col));
         }
 
-        let batch = RecordBatch::try_new(schema, columns)?;
-        Ok(batch)
+        Ok(())
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
@@ -1929,6 +1929,73 @@ impl PostingListBuilder {
         self.doc_ids = new_doc_ids;
         self.frequencies = new_frequencies;
         self.positions = new_positions;
+    }
+}
+
+/// Internal builder to generate PostingList RecordBatches.
+pub struct PostingListBatchBuilder {
+    posting_builder: ListBuilder<LargeBinaryBuilder>,
+    max_score_builder: PrimitiveBuilder<Float32Type>,
+    length_builder: PrimitiveBuilder<UInt32Type>,
+    positions_builder: Option<ListBuilder<ListBuilder<LargeBinaryBuilder>>>,
+}
+
+impl PostingListBatchBuilder {
+    pub fn with_capacity(builders: &[PostingListBuilder]) -> Self {
+        let total_length: usize = builders.iter().map(|builder| builder.len()).sum();
+        let item_capacity = total_length.div_ceil(BLOCK_SIZE);
+        let data_capacity = total_length * 3;
+        let posting_values = LargeBinaryBuilder::with_capacity(item_capacity, data_capacity);
+        let posting_builder = ListBuilder::with_capacity(posting_values, builders.len());
+
+        let max_score_builder = PrimitiveBuilder::<Float32Type>::with_capacity(builders.len());
+        let length_builder = PrimitiveBuilder::<UInt32Type>::with_capacity(builders.len());
+
+        let positions_builder = if builders
+            .first()
+            .map(|first| first.has_positions())
+            .unwrap_or(false)
+        {
+            let total_positions: usize = builders
+                .iter()
+                .map(|builder| {
+                    builder
+                        .positions
+                        .as_ref()
+                        .map(|pos| pos.positions.len())
+                        .unwrap_or_default()
+                })
+                .sum();
+            let inner_data_capacity = total_positions * 4;
+            let inner_item_capacity = total_positions / 4096;
+            let outer_item_capacity = total_length;
+            let positions_values =
+                LargeBinaryBuilder::with_capacity(inner_item_capacity, inner_data_capacity);
+            let positions_list = ListBuilder::with_capacity(positions_values, outer_item_capacity);
+            Some(ListBuilder::with_capacity(positions_list, builders.len()))
+        } else {
+            None
+        };
+
+        Self {
+            posting_builder,
+            max_score_builder,
+            length_builder,
+            positions_builder,
+        }
+    }
+
+    pub fn finish(mut self) -> std::result::Result<RecordBatch, ArrowError> {
+        let with_positions = self.positions_builder.is_some();
+        let schema = inverted_list_schema(with_positions);
+        let mut columns = Vec::with_capacity(if with_positions { 4 } else { 3 });
+        columns.push(Arc::new(self.posting_builder.finish()) as ArrayRef);
+        columns.push(Arc::new(self.max_score_builder.finish()) as ArrayRef);
+        columns.push(Arc::new(self.length_builder.finish()) as ArrayRef);
+        if let Some(mut positions_builder) = self.positions_builder {
+            columns.push(Arc::new(positions_builder.finish()) as ArrayRef);
+        }
+        RecordBatch::try_new(schema, columns)
     }
 }
 
@@ -2532,7 +2599,11 @@ mod tests {
 
         // BLOCK_SIZE + 3 elements should be reduced to BLOCK_SIZE + 1,
         // there are still 2 blocks.
-        let batch = builder.to_batch(vec![1.0, 2.0]).unwrap();
+        let mut batch_builder = PostingListBatchBuilder::with_capacity(&[]);
+        builder
+            .to_batch(vec![1.0, 2.0], &mut batch_builder)
+            .unwrap();
+        let batch = batch_builder.finish().unwrap();
         let (doc_ids, freqs) = decompress_posting_list(
             (n - removed.len()) as u32,
             batch[POSTING_COL]
@@ -2566,8 +2637,8 @@ mod tests {
         // 0: lance
         // 1: lake lake
         // 2: lake lake lake
-        builder.tokens.add("lance".to_owned());
-        builder.tokens.add("lake".to_owned());
+        builder.tokens.add("lance");
+        builder.tokens.add("lake");
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists.push(PostingListBuilder::new(false));
         builder.posting_lists[0].add(0, PositionRecorder::Count(1));
@@ -2625,7 +2696,7 @@ mod tests {
 
         // Create first partition with one token and posting list length 1
         let mut builder1 = InnerBuilder::new(0, false, TokenSetFormat::default());
-        builder1.tokens.add("test".to_owned());
+        builder1.tokens.add("test");
         builder1.posting_lists.push(PostingListBuilder::new(false));
         builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
         builder1.docs.append(100, 1); // row_id=100, num_tokens=1
@@ -2633,7 +2704,7 @@ mod tests {
 
         // Create second partition with one token and posting list length 4
         let mut builder2 = InnerBuilder::new(1, false, TokenSetFormat::default());
-        builder2.tokens.add("test".to_owned()); // Use same token to test cache prefix fix
+        builder2.tokens.add("test"); // Use same token to test cache prefix fix
         builder2.posting_lists.push(PostingListBuilder::new(false));
         builder2.posting_lists[0].add(0, PositionRecorder::Count(2));
         builder2.posting_lists[0].add(1, PositionRecorder::Count(1));

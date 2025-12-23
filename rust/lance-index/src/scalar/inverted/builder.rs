@@ -15,21 +15,21 @@ use crate::vector::graph::OrderedFloat;
 use arrow::datatypes;
 use arrow::{array::AsArray, compute::concat_batches};
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use deepsize::DeepSizeOf;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{iter_str_array, ARROW_EXT_NAME_KEY};
+use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::LanceCache, utils::tokio::spawn_cpu};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use snafu::location;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -427,6 +427,51 @@ impl InnerBuilder {
         Ok(())
     }
 
+    fn serialize_posting_list_batch(
+        docs_set: &DocSet,
+        batch: &[PostingListBuilder],
+    ) -> std::result::Result<RecordBatch, ArrowError> {
+        let mut builder = PostingListBatchBuilder::with_capacity(batch);
+        for posting_list in batch {
+            let block_max_scores = docs_set.calculate_block_max_scores(
+                posting_list.doc_ids.iter(),
+                posting_list.frequencies.iter(),
+            );
+            posting_list.to_batch(block_max_scores, &mut builder)?;
+        }
+        builder.finish()
+    }
+
+    fn serialize_posting_lists(
+        docs_set: &DocSet,
+        posting_lists: &[PostingListBuilder],
+        final_tx: tokio::sync::mpsc::UnboundedSender<std::result::Result<RecordBatch, ArrowError>>,
+    ) {
+        rayon::scope(|s| {
+            // Want to use CPU thread pool for serialization, but need to return
+            // data in order. By making this synchronous code, we can use rayon::scope
+            // and thus just pass plain points to the thread pool (rather than create
+            // pointers with 'static lifetimes).
+            let mut queue = VecDeque::with_capacity(get_num_compute_intensive_cpus());
+            // TODO: decide better chunk size
+            for posting_list_chunk in posting_lists.chunks(1024) {
+                let (tx, rx) = oneshot::channel();
+                s.spawn(|_| {
+                    let res = Self::serialize_posting_list_batch(docs_set, posting_list_chunk);
+                    tx.send(res).expect("should only serialize once");
+                });
+                queue.push_back(rx);
+
+                while queue.len() > get_num_compute_intensive_cpus() {
+                    if let Some(rx) = queue.pop_front() {
+                        let batch = rx.recv().expect("failed to receive batch");
+                        final_tx.send(batch).expect("failed to send batch");
+                    }
+                }
+            }
+        });
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn write_posting_lists(
         &mut self,
@@ -450,25 +495,21 @@ impl InnerBuilder {
         );
         let schema = inverted_list_schema(self.with_position);
 
-        let mut batches = stream::iter(posting_lists)
-            .map(|posting_list| {
-                let block_max_scores = docs.calculate_block_max_scores(
-                    posting_list.doc_ids.iter(),
-                    posting_list.frequencies.iter(),
-                );
-                spawn_cpu(move || posting_list.to_batch(block_max_scores))
-            })
-            .buffered(get_num_compute_intensive_cpus());
+        let (tx, mut batch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let build_task = tokio::task::spawn_blocking(move || {
+            Self::serialize_posting_lists(&docs, &posting_lists, tx);
+        });
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
         let mut buffer = Vec::new();
         let mut size_sum = 0;
-        while let Some(batch) = batches.try_next().await? {
-            num_posting_lists += 1;
+        while let Some(batch) = batch_rx.recv().await.transpose()? {
+            num_posting_lists += 1; // TODO: fix this metric
             size_sum += batch.get_array_memory_size();
             buffer.push(batch);
             if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
+                // TODO: why are we concatenating?
                 let batch = concat_batches(&schema, buffer.iter())?;
                 buffer.clear();
                 size_sum = 0;
@@ -487,6 +528,7 @@ impl InnerBuilder {
             }
         }
         if !buffer.is_empty() {
+            // TODO: why were we concatenating?
             let batch = concat_batches(&schema, buffer.iter())?;
             writer.write_record_batch(batch).await?;
         }
@@ -584,8 +626,7 @@ impl IndexWorker {
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
                     let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text) as usize;
+                    let token_id = self.builder.tokens.add(&token.text) as usize;
                     token_occurrences
                         .entry(token_id as u32)
                         .or_insert_with(|| PositionRecorder::new(with_position))
@@ -744,7 +785,7 @@ pub fn legacy_inverted_list_schema(with_position: bool) -> SchemaRef {
     Arc::new(arrow_schema::Schema::new(fields))
 }
 
-pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+static INVERTED_LIST_SCHEMA: LazyLock<[SchemaRef; 2]> = LazyLock::new(|| {
     let mut fields = vec![
         // we compress the posting lists (including row ids and frequencies),
         // and store the compressed posting lists, so it's a large binary array
@@ -760,22 +801,33 @@ pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
-    if with_position {
-        fields.push(arrow_schema::Field::new(
-            POSITION_COL,
+
+    let without_position = Arc::new(arrow_schema::Schema::new(fields.clone()));
+
+    fields.push(arrow_schema::Field::new(
+        POSITION_COL,
+        arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
             arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
-                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
-                    "item",
-                    arrow_schema::DataType::LargeBinary,
-                    true,
-                ))),
+                arrow_schema::DataType::LargeBinary,
                 true,
             ))),
-            false,
-        ));
+            true,
+        ))),
+        false,
+    ));
+    let with_position = Arc::new(arrow_schema::Schema::new(fields));
+
+    [without_position, with_position]
+});
+
+pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+    if with_position {
+        INVERTED_LIST_SCHEMA[1].clone()
+    } else {
+        INVERTED_LIST_SCHEMA[0].clone()
     }
-    Arc::new(arrow_schema::Schema::new(fields))
 }
 
 /// Flatten the string list stream into a string stream
