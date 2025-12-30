@@ -752,10 +752,9 @@ where
             positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
         ),
         ReadBatchParams::Ranges(_) => {
-            return Err(Error::Internal {
-                message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
-                location: location!(),
-            })
+            return Err(Error::internal(
+                "ReadBatchParams::Ranges should not be used in v1 files",
+            ))
         }
         ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..positions.value(*end).as_usize())

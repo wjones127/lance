@@ -539,14 +539,13 @@ impl FragmentScanner {
 
         let mut batch = batch
             .project_by_schema(&self.projection.as_ref().into())
-            .map_err(|err| Error::Internal {
-                message: format!(
+            .map_err(|err| {
+                Error::internal(format!(
                     "Failed to select schema {} from batch with schema {}\nInner error: {}",
                     self.projection,
                     batch.schema(),
                     err
-                ),
-                location: location!(),
+                ))
             })?;
 
         // Row id nor row address weren't part of the projection, so we need to

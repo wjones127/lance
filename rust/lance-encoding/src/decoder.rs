@@ -2499,13 +2499,7 @@ impl NextDecodeTask {
                 }
                 Ok(batch)
             }
-            Err(e) => {
-                let e = Error::Internal {
-                    message: format!("Error decoding batch: {}", e),
-                    location: location!(),
-                };
-                Err(e)
-            }
+            Err(e) => Err(Error::internal(format!("Error decoding batch: {}", e))),
         }
     }
 }

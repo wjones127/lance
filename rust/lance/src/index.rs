@@ -1000,11 +1000,11 @@ impl DatasetIndexExt for Dataset {
             .map(|frags| {
                 let mut sum = 0;
                 for frag in frags.iter() {
-                    sum += frag.num_rows().ok_or_else(|| Error::Internal {
-                        message: "Fragment should have row counts, please upgrade lance and \
-                                      trigger a single write to fix this"
-                            .to_string(),
-                        location: location!(),
+                    sum += frag.num_rows().ok_or_else(|| {
+                        Error::internal(
+                            "Fragment should have row counts, please upgrade lance and \
+                         trigger a single write to fix this",
+                        )
                     })?;
                 }
                 Ok(sum)
@@ -1029,8 +1029,9 @@ impl DatasetIndexExt for Dataset {
 
         let num_indexed_rows_per_delta = match res {
             Ok(rows) => rows,
-            Err(Error::Internal { message, .. })
-                if auto_migrate_corruption() && message.contains("trigger a single write") =>
+            Err(Error::Internal { source })
+                if auto_migrate_corruption()
+                    && source.message.contains("trigger a single write") =>
             {
                 return migrate_and_recompute(self, index_name).await;
             }
@@ -1044,13 +1045,10 @@ impl DatasetIndexExt for Dataset {
                     if auto_migrate_corruption() {
                         return migrate_and_recompute(self, index_name).await;
                     } else {
-                        return Err(Error::Internal {
-                            message:
-                                "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
-                                  and trigger a single write to fix this"
-                                    .to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(
+                            "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                             and trigger a single write to fix this",
+                        ));
                     }
                 }
             }
@@ -1344,10 +1342,9 @@ impl DatasetIndexInternalExt for Dataset {
                         )
                         .await
                     }
-                    None => Err(Error::Internal {
-                        message: "Index proto was missing implementation field".into(),
-                        location: location!(),
-                    }),
+                    None => Err(Error::internal(
+                        "Index proto was missing implementation field",
+                    )),
                 }
             }
 
@@ -1643,11 +1640,10 @@ impl DatasetIndexInternalExt for Dataset {
             idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
         }) {
             let field = index.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
-                message: format!(
+            let field = schema.field_by_id(field).ok_or_else(|| {
+                Error::internal(format!(
                     "Index referenced a field with id {field} which did not exist in the schema"
-                ),
-                location: location!(),
+                ))
             })?;
 
             // Build the full field path for nested fields

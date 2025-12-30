@@ -284,10 +284,10 @@ impl UpdateJob {
 
         let expected_schema = self.dataset.schema().into();
         if schema.as_ref() != &expected_schema {
-            return Err(Error::Internal {
-                message: format!("Expected schema {:?} but got {:?}", expected_schema, schema),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "Expected schema {:?} but got {:?}",
+                expected_schema, schema
+            )));
         }
 
         let updates_ref = self.updates.clone();
@@ -320,10 +320,9 @@ impl UpdateJob {
         )
         .await?;
 
-        let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
+        let removed_row_ids = row_id_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
 
         if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
             let fragment_sizes = new_fragments
@@ -334,12 +333,11 @@ impl UpdateJob {
                 fragment_sizes,
                 false,
             )
-            .map_err(|e| Error::Internal {
-                message: format!(
+            .map_err(|e| {
+                Error::internal(format!(
                     "Captured row ids not equal to number of rows written: {}",
                     e
-                ),
-                location: location!(),
+                ))
             })?;
             for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
                 let serialized = lance_table::rowids::write_row_ids(&sequence);

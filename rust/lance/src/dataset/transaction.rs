@@ -1617,10 +1617,9 @@ impl Transaction {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
                 } else {
-                    return Err(Error::Internal {
-                        message: "Cannot create a new dataset without a schema".to_string(),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(
+                        "Cannot create a new dataset without a schema",
+                    ));
                 }
             }
         };
@@ -1656,20 +1655,18 @@ impl Transaction {
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
+                .ok_or_else(|| {
+                    Error::internal(format!(
                         "No current manifest was provided while building manifest for operation {}",
                         self.operation.name()
-                    ),
-                    location: location!(),
+                    ))
                 });
 
         match &self.operation {
             Operation::Clone { .. } => {
-                return Err(Error::Internal {
-                    message: "Clone operation should not enter build_manifest.".to_string(),
-                    location: location!(),
-                })
+                return Err(Error::internal(
+                    "Clone operation should not enter build_manifest.",
+                ))
             }
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -1861,12 +1858,11 @@ impl Transaction {
                                 lance_table::format::RowDatasetVersionMeta::from_sequence(
                                     &created_at_seq,
                                 )
-                                .map_err(|e| Error::Internal {
-                                    message: format!(
+                                .map_err(|e| {
+                                    Error::internal(format!(
                                         "Failed to create created_at version metadata: {}",
                                         e
-                                    ),
-                                    location: location!(),
+                                    ))
                                 })?,
                             );
 
@@ -2627,10 +2623,10 @@ impl Transaction {
         let mut pure_update_frag_ids = Vec::new();
 
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if let Some(row_id_meta) = &fragment.row_id_meta {
                 let existing_row_count = match row_id_meta {
@@ -2654,10 +2650,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
-            let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
-                message: "Fragment does not have physical rows".into(),
-                location: location!(),
-            })? as u64;
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
 
             if fragment.row_id_meta.is_some() {
                 // we may meet merge insert case, it only has partial row ids.
@@ -2689,11 +2685,9 @@ impl Transaction {
                         let combined_sequence = match &fragment.row_id_meta {
                             Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
                             _ => {
-                                return Err(Error::Internal {
-                                    message: "Failed to deserialize existing row ID sequence"
-                                        .into(),
-                                    location: location!(),
-                                })
+                                return Err(Error::internal(
+                                    "Failed to deserialize existing row ID sequence",
+                                ))
                             }
                         };
 
@@ -2709,13 +2703,10 @@ impl Transaction {
                     }
                     Ordering::Greater => {
                         // More row IDs than physical rows - this shouldn't happen
-                        return Err(Error::Internal {
-                            message: format!(
-                                "Fragment has more row IDs ({}) than physical rows ({})",
-                                existing_row_count, physical_rows
-                            ),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(format!(
+                            "Fragment has more row IDs ({}) than physical rows ({})",
+                            existing_row_count, physical_rows
+                        )));
                     }
                 }
             } else {
@@ -3039,10 +3030,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
             None => {
-                return Err(Error::Internal {
-                    message: "Transaction message did not contain an operation".to_string(),
-                    location: location!(),
-                });
+                return Err(Error::internal(
+                    "Transaction message did not contain an operation",
+                ));
             }
         };
         Ok(Self {
@@ -3843,8 +3833,10 @@ mod tests {
         let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
 
         assert!(result.is_err());
-        if let Err(Error::Internal { message, .. }) = result {
-            assert!(message.contains("more row IDs (60) than physical rows (50)"));
+        if let Err(Error::Internal { source }) = result {
+            assert!(source
+                .message
+                .contains("more row IDs (60) than physical rows (50)"));
         } else {
             panic!("Expected Internal error about excess row IDs");
         }
@@ -3924,8 +3916,10 @@ mod tests {
         let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
 
         assert!(result.is_err());
-        if let Err(Error::Internal { message, .. }) = result {
-            assert!(message.contains("Fragment does not have physical rows"));
+        if let Err(Error::Internal { source }) = result {
+            assert!(source
+                .message
+                .contains("Fragment does not have physical rows"));
         } else {
             panic!("Expected Internal error about missing physical rows");
         }

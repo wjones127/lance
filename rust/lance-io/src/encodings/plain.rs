@@ -183,13 +183,10 @@ pub fn bytes_to_array(
     let layout = layout(data_type);
 
     if layout.buffers.len() != 1 {
-        return Err(Error::Internal {
-            message: format!(
-                "Can only convert datatypes that require one buffer, found {:?}",
-                data_type
-            ),
-            location: location!(),
-        });
+        return Err(Error::internal(format!(
+            "Can only convert datatypes that require one buffer, found {:?}",
+            data_type
+        )));
     }
 
     let buf: Buffer = if let BufferSpec::FixedWidth {

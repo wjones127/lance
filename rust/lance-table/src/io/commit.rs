@@ -230,21 +230,15 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
     type Error = Error;
 
     fn try_from(meta: object_store::ObjectMeta) -> Result<Self> {
-        let filename = meta.location.filename().ok_or_else(|| Error::Internal {
-            message: "ObjectMeta location does not have a filename".to_string(),
-            location: location!(),
-        })?;
-        let scheme =
-            ManifestNamingScheme::detect_scheme(filename).ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+        let filename = meta
+            .location
+            .filename()
+            .ok_or_else(|| Error::internal("ObjectMeta location does not have a filename"))?;
+        let scheme = ManifestNamingScheme::detect_scheme(filename)
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         let version = scheme
             .parse_version(filename)
-            .ok_or_else(|| Error::Internal {
-                message: format!("Invalid manifest filename: '{}'", filename),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal(format!("Invalid manifest filename: '{}'", filename)))?;
         Ok(Self {
             version,
             path: meta.location,
@@ -329,14 +323,11 @@ async fn current_manifest_path(
 
             while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
                 if entry_scheme != scheme {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
-                             Use `migrate_manifest_paths_v2` to migrate the directory.",
-                            scheme, entry_scheme
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                         Use `migrate_manifest_paths_v2` to migrate the directory.",
+                        scheme, entry_scheme
+                    )));
                 }
                 let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
@@ -824,10 +815,7 @@ impl From<Error> for CommitError {
 impl From<CommitError> for Error {
     fn from(e: CommitError) -> Self {
         match e {
-            CommitError::CommitConflict => Self::Internal {
-                message: "Commit conflict".to_string(),
-                location: location!(),
-            },
+            CommitError::CommitConflict => Self::internal("Commit conflict"),
             CommitError::OtherError(e) => e,
         }
     }

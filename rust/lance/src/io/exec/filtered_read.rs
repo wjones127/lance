@@ -1526,11 +1526,9 @@ impl FilteredReadExec {
                 let mut evaluated_index = None;
                 if let Some(index_input) = index_input {
                     let mut index_search = index_input.execute(partition, context)?;
-                    let index_search_result =
-                        index_search.next().await.ok_or_else(|| Error::Internal {
-                            message: "Index search did not yield any results".to_string(),
-                            location: location!(),
-                        })??;
+                    let index_search_result = index_search.next().await.ok_or_else(|| {
+                        Error::internal("Index search did not yield any results")
+                    })??;
                     evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
                         &index_search_result,
                     )?));
@@ -1756,11 +1754,7 @@ impl ExecutionPlan for FilteredReadExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() > 1 {
             Err(DataFusionError::External(
-                Error::Internal {
-                    message: "A FilteredReadExec cannot have two children".to_string(),
-                    location: location!(),
-                }
-                .into(),
+                Error::internal("A FilteredReadExec cannot have two children").into(),
             ))
         } else {
             let index_input = children.into_iter().next();

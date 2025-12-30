@@ -619,10 +619,9 @@ impl FileReader {
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
         if gbo_table.is_empty() {
-            return Err(Error::Internal {
-                message: "File did not contain any global buffers, schema expected".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected",
+            ));
         }
         let schema_start = gbo_table[0].position;
         let schema_size = gbo_table[0].size;
@@ -1519,10 +1518,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
             file_version,
         )?;
         if gbo_table.is_empty() {
-            return Err(Error::Internal {
-                message: "File did not contain any global buffers, schema expected".to_string(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected",
+            ));
         }
         let schema_start = gbo_table[0].position as usize;
         let schema_size = gbo_table[0].size as usize;

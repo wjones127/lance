@@ -388,10 +388,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
                 serde_json::map::Map::new()
             };
         let mut store_stats = serde_json::to_value(self.storage.metadata())?;
-        let store_stats = store_stats.as_object_mut().ok_or(Error::Internal {
-            message: "failed to get storage metadata".to_string(),
-            location: location!(),
-        })?;
+        let store_stats = store_stats
+            .as_object_mut()
+            .ok_or(Error::internal("failed to get storage metadata"))?;
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
@@ -488,10 +487,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let part = part_entry
                 .as_any()
                 .downcast_ref::<PartitionEntry<S, Q>>()
-                .ok_or(Error::Internal {
-                    message: "failed to downcast partition entry".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or(Error::internal("failed to downcast partition entry"))?;
             let batch = part.index.search(
                 query.key,
                 k,
@@ -539,10 +535,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let partition = partition
             .as_any()
             .downcast_ref::<PartitionEntry<S, Q>>()
-            .ok_or(Error::Internal {
-                message: "failed to downcast partition entry".to_string(),
-                location: location!(),
-            })?;
+            .ok_or(Error::internal("failed to downcast partition entry"))?;
         let store = &partition.storage;
         let schema = if with_vector {
             store.schema().clone()

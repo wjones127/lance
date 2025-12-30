@@ -469,10 +469,9 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
     fn cancel(self) {
-        (self.when_done)(Err(Error::Internal {
-            message: "Scheduler closed before I/O was completed".to_string(),
-            location: location!(),
-        }));
+        (self.when_done)(Err(Error::internal(
+            "Scheduler closed before I/O was completed",
+        )));
     }
 
     async fn run(self) {

@@ -237,10 +237,9 @@ impl GenericFileReader for V1Reader {
         _batch_size: u32,
         _projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        Err(Error::Internal {
-            message: "Attempt to perform FilteredRead on v1 files".to_string(),
-            location: location!(),
-        })
+        Err(Error::internal(
+            "Attempt to perform FilteredRead on v1 files",
+        ))
     }
 
     fn take_all_tasks(
@@ -1123,7 +1122,7 @@ impl FileFragment {
         if self.dataset.manifest.writer_version.is_some() && self.metadata.physical_rows.is_some() {
             Ok(self.metadata.physical_rows.unwrap())
         } else {
-            Err(Error::Internal { message: format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id()), location: location!() })
+            Err(Error::internal(format!("The method fast_physical_rows was called on a fragment that does not have the physical row count in the metadata. Fragment id: {}", self.id())))
         }
     }
 
@@ -1138,7 +1137,7 @@ impl FileFragment {
                 ..
             }) => Ok(*num_deleted),
             None => Ok(0),
-            _ => Err(Error::Internal { message: format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()), location: location!() }),
+            _ => Err(Error::internal(format!("The method fast_num_deletions was called on a fragment that does not have the deletion count in the metadata. Fragment id: {}", self.id()))),
         }
     }
 
@@ -1178,12 +1177,11 @@ impl FileFragment {
         let reader = self
             .open_reader(some_file, None, &FragReadConfig::default())
             .await?
-            .ok_or_else(|| Error::Internal {
-                message: format!(
+            .ok_or_else(|| {
+                Error::internal(format!(
                     "The data file {} did not have any fields contained in the dataset schema",
                     some_file.path
-                ),
-                location: location!(),
+                ))
             })?;
 
         Ok(reader.len() as usize)
@@ -1824,15 +1822,12 @@ impl FileFragment {
                 .filter(|x| *x >= physical_rows as u32)
                 .take(5)
                 .collect();
-            return Err(Error::Internal {
-                message: format!(
-                    "Deletion vector includes rows that aren't in the fragment. \
+            return Err(Error::internal(format!(
+                "Deletion vector includes rows that aren't in the fragment. \
                 Num physical rows {}; Deletion vector length: {}; \
                 Examples: {:?}",
-                    physical_rows, dv_len, examples
-                ),
-                location: location!(),
-            });
+                physical_rows, dv_len, examples
+            )));
         }
 
         self.metadata.deletion_file = write_deletion_file(
@@ -2265,10 +2260,9 @@ impl FragmentReader {
                     .collect(),
             ),
             ReadBatchParams::Ranges(_) => {
-                return Err(Error::Internal {
-                    message: "ReadBatchParams::Ranges should not be used in v1 files".to_string(),
-                    location: location!(),
-                })
+                return Err(Error::internal(
+                    "ReadBatchParams::Ranges should not be used in v1 files",
+                ))
             }
             ReadBatchParams::RangeFull => {
                 ReadBatchParams::Range(batch_offset..(batch_offset + rows_in_batch))
@@ -2496,13 +2490,10 @@ impl FragmentReader {
         // Note that row ranges at this point are physical and not logical.
         for range in ranges.as_ref() {
             if range.end > total_num_rows as u64 {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Invalid read of range {:?} for fragment {} with {} addressable rows",
-                        range, self.fragment_id, total_num_rows
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Invalid read of range {:?} for fragment {} with {} addressable rows",
+                    range, self.fragment_id, total_num_rows
+                )));
             }
             num_requested_rows += range.end - range.start;
         }

@@ -1701,13 +1701,10 @@ impl Dataset {
                 })?;
 
                 if !base_path.is_dataset_root {
-                    return Err(Error::Internal {
-                        message: format!(
-                            "base_path id {} is not a dataset root for deletion_file {:?}",
-                            base_id, deletion_file
-                        ),
-                        location: location!(),
-                    });
+                    return Err(Error::internal(format!(
+                        "base_path id {} is not a dataset root for deletion_file {:?}",
+                        base_id, deletion_file
+                    )));
                 }
                 base_path.extract_path(self.session.store_registry())
             }
@@ -2299,24 +2296,17 @@ impl Dataset {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::Internal {
-                    message: format!(
-                        "External row_id_meta is not supported yet. external file path: {}",
-                        external_file.path
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "External row_id_meta is not supported yet. external file path: {}",
+                    external_file.path
+                )));
             }
             for data_file in fragment.files.iter() {
                 let base_root = if let Some(base_id) = data_file.base_id {
                     let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
                     Path::parse(base_path.path.as_str())?
                 } else {
                     self.base.clone()
@@ -2329,13 +2319,9 @@ impl Dataset {
             if let Some(deletion_file) = &fragment.deletion_file {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
                     let base_path =
-                        self.manifest
-                            .base_paths
-                            .get(&base_id)
-                            .ok_or_else(|| Error::Internal {
-                                message: format!("base_id {} not found", base_id),
-                                location: location!(),
-                            })?;
+                        self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                            Error::internal(format!("base_id {} not found", base_id))
+                        })?;
                     Path::parse(base_path.path.as_str())?
                 } else {
                     self.base.clone()
@@ -2356,14 +2342,11 @@ impl Dataset {
 
         for index in &indices {
             let base_root = if let Some(base_id) = index.base_id {
-                let base_path =
-                    self.manifest
-                        .base_paths
-                        .get(&base_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: format!("base_id {} not found", base_id),
-                            location: location!(),
-                        })?;
+                let base_path = self
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
                 Path::parse(base_path.path.as_str())?
             } else {
                 self.base.clone()
@@ -2495,13 +2478,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     )?;
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::Internal {
-                                message: format!(
-                                    "Dataset version {} does not have a transaction file",
-                                    manifest_copy.version
-                                ),
-                                location: location!(),
-                            }
+                            Error::internal(format!(
+                                "Dataset version {} does not have a transaction file",
+                                manifest_copy.version
+                            ))
                         })?);
                     dataset
                         .metadata_cache

@@ -339,14 +339,11 @@ impl DeletionRestorer {
             // output should have the same fixed batch size (except the last batch)
             let is_last = self.is_exhausted();
             if batch.num_rows() != batch_size as usize && !is_last {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Fragment Updater: batch size mismatch: {} != {}",
-                        batch.num_rows(),
-                        batch_size
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Fragment Updater: batch size mismatch: {} != {}",
+                    batch.num_rows(),
+                    batch_size
+                )));
             }
         }
 

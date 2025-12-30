@@ -750,7 +750,6 @@ mod tests {
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use mock_instant::thread_local::MockClock;
-    use snafu::location;
 
     use super::*;
     use crate::blob::{blob_field, BlobArrayBuilder};
@@ -929,10 +928,7 @@ mod tests {
                 "block_commit",
                 Arc::new(|op, _| -> Result<()> {
                     if op.contains("copy") {
-                        return Err(Error::Internal {
-                            message: "Copy blocked".to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal("Copy blocked"));
                     }
                     Ok(())
                 }),
@@ -945,10 +941,7 @@ mod tests {
                 "block_delete_manifest",
                 Arc::new(|op, path| -> Result<()> {
                     if op.contains("delete") && path.extension() == Some("manifest") {
-                        Err(Error::Internal {
-                            message: "Delete manifest blocked".to_string(),
-                            location: location!(),
-                        })
+                        Err(Error::internal("Delete manifest blocked"))
                     } else {
                         Ok(())
                     }

@@ -61,10 +61,7 @@ pub async fn find_latest_mem_wal_generation(
     if let Some(latest_mem_wal) = generations.values().last() {
         Ok(Some(latest_mem_wal.clone()))
     } else {
-        Err(Error::Internal {
-            message: format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region),
-            location: location!(),
-        })
+        Err(Error::internal(format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region)))
     }
 }
 
@@ -170,10 +167,7 @@ pub async fn advance_mem_wal_generation(
 
                 Ok((added_mem_wal, updated_mem_wal, removed_mem_wal))
             } else {
-                Err(Error::Internal {
-                    message: format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region),
-                    location: location!(),
-                })
+                Err(Error::internal(format!("Encountered MemWAL index mapping that has a region with an empty list of generations: {}", region)))
             }
         } else {
             if let Some(expected_owner_id) = expected_owner_id {

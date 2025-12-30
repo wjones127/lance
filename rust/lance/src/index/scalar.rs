@@ -346,13 +346,13 @@ pub(crate) async fn infer_scalar_index_details(
     }
 
     let index_dir = dataset.indice_files_dir(index)?.child(uuid.clone());
-    let col = dataset.schema().field(column).ok_or(Error::Internal {
-        message: format!(
+    let col = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::internal(format!(
             "Index refers to column {} which does not exist in dataset schema",
             column
-        ),
-        location: location!(),
-    })?;
+        )))?;
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);

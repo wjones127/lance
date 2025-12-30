@@ -106,7 +106,6 @@ use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
-use snafu::location;
 use tracing::info;
 
 pub mod remapping;
@@ -799,10 +798,9 @@ async fn rewrite_files(
     log::info!("Compaction task {}: file written", task_id);
 
     let (row_id_map, changed_row_addrs) = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx.try_recv().map_err(|err| Error::Internal {
-            message: format!("Failed to receive row ids: {}", err),
-            location: location!(),
-        })?;
+        let captured_ids = row_ids_rx
+            .try_recv()
+            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
         // This code path is only when we use address style ids.
         let row_addrs = captured_ids.row_addrs(None).into_owned();
 
@@ -953,9 +951,8 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load created_at sequence (default to version 1 if missing)
         let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
-            version_meta.load_sequence().map_err(|e| Error::Internal {
-                message: format!("Failed to load created_at version sequence: {}", e),
-                location: location!(),
+            version_meta.load_sequence().map_err(|e| {
+                Error::internal(format!("Failed to load created_at version sequence: {}", e))
             })?
         } else {
             // Default: treat all rows as created at version 1
@@ -964,9 +961,11 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load last_updated_at sequence (default to same as created_at sequence)
         let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
-            version_meta.load_sequence().map_err(|e| Error::Internal {
-                message: format!("Failed to load last_updated_at version sequence: {}", e),
-                location: location!(),
+            version_meta.load_sequence().map_err(|e| {
+                Error::internal(format!(
+                    "Failed to load last_updated_at version sequence: {}",
+                    e
+                ))
             })?
         } else {
             created_at_seq.clone()

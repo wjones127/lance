@@ -115,10 +115,9 @@ pub fn merge_insert_action(
                 cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
             } else {
                 // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::Internal {
-                    message: "Schema required for UpdateIf parsing".into(),
-                    location: location!(),
-                });
+                return Err(crate::Error::internal(
+                    "Schema required for UpdateIf parsing",
+                ));
             }
         }
         WhenMatched::DoNothing => {}

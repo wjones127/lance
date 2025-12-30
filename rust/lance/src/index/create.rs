@@ -344,10 +344,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     .to_vector()
                     // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?;
+                    .ok_or(Error::internal("unable to cast index extension to vector"))?;
 
                 if train {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)

@@ -303,19 +303,17 @@ pub fn write_dataset_versions(sequence: &RowDatasetVersionSequence) -> Vec<u8> {
 
 /// Deserialize a dataset version sequence from bytes (following RowIdSequence pattern)
 pub fn read_dataset_versions(data: &[u8]) -> lance_core::Result<RowDatasetVersionSequence> {
-    let pb_sequence = pb::RowDatasetVersionSequence::decode(data).map_err(|e| Error::Internal {
-        message: format!("Failed to decode RowDatasetVersionSequence: {}", e),
-        location: location!(),
+    let pb_sequence = pb::RowDatasetVersionSequence::decode(data).map_err(|e| {
+        Error::internal(format!("Failed to decode RowDatasetVersionSequence: {}", e))
     })?;
 
     let segments = pb_sequence
         .runs
         .into_iter()
         .map(|pb_run| {
-            let positions_pb = pb_run.span.ok_or_else(|| Error::Internal {
-                message: "Missing positions in RowDatasetVersionRun".to_string(),
-                location: location!(),
-            })?;
+            let positions_pb = pb_run
+                .span
+                .ok_or_else(|| Error::internal("Missing positions in RowDatasetVersionRun"))?;
             let segment = U64Segment::try_from(positions_pb)?;
             Ok(RowDatasetVersionRun {
                 span: segment,

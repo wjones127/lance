@@ -401,10 +401,8 @@ impl Index for RTreeIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(self.metadata.clone()).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
-            location: location!(),
-        })
+        serde_json::to_value(self.metadata.clone())
+            .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
     }
 
     async fn prewarm(&self) -> Result<()> {

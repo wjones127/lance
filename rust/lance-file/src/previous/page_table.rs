@@ -59,13 +59,10 @@ impl PageTable {
         num_batches: i32,
     ) -> Result<Self> {
         if max_field_id < min_field_id {
-            return Err(Error::Internal {
-                message: format!(
-                    "max_field_id {} is less than min_field_id {}",
-                    max_field_id, min_field_id
-                ),
-                location: location!(),
-            });
+            return Err(Error::internal(format!(
+                "max_field_id {} is less than min_field_id {}",
+                max_field_id, min_field_id
+            )));
         }
 
         let field_ids = min_field_id..=max_field_id;
@@ -291,7 +288,10 @@ mod tests {
         // Returns an error if max_field_id is less than min_field_id
         let res = PageTable::load(reader.as_ref(), res, 1, 0, 1).await;
         assert!(res.is_err());
-        assert!(matches!(res.unwrap_err(), Error::Internal { message, .. }
-                if message.contains("max_field_id 0 is less than min_field_id 1")));
+        let err = res.unwrap_err();
+        assert!(matches!(err, Error::Internal { .. }));
+        assert!(err
+            .to_string()
+            .contains("max_field_id 0 is less than min_field_id 1"));
     }
 }

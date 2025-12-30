@@ -1458,12 +1458,11 @@ impl Scanner {
 
         if field_path.len() == 1 {
             // Simple top-level column
-            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| Error::Internal {
-                message: format!(
+            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create column expression for '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         } else {
             // Nested field - build a chain of GetFieldFunc calls
@@ -1481,12 +1480,11 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
-                message: format!(
+            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         }
     }
@@ -1589,11 +1587,10 @@ impl Scanner {
             let row_id_pos = output_expr
                 .iter()
                 .position(|(_, name)| name == ROW_ID)
-                .ok_or_else(|| Error::Internal {
-                    message:
-                        "user specified with_row_id but the _rowid column was not in the output"
-                            .to_string(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::internal(
+                        "user specified with_row_id but the _rowid column was not in the output",
+                    )
                 })?;
             if row_id_pos != output_expr.len() - 1 {
                 // Row id is not last column.  Need to rotate it to the last spot.
@@ -1603,12 +1600,14 @@ impl Scanner {
         }
 
         if self.legacy_with_row_addr {
-            let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
-                Error::Internal {
-                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
-                    location: location!(),
-                }
-            })?;
+            let row_addr_pos = output_expr
+                .iter()
+                .position(|(_, name)| name == ROW_ADDR)
+                .ok_or_else(|| {
+                    Error::internal(
+                        "user specified with_row_address but the _rowaddr column was not in the output",
+                    )
+                })?;
             if row_addr_pos != output_expr.len() - 1 {
                 // Row addr is not last column.  Need to rotate it to the last spot.
                 let row_addr_expr = output_expr.remove(row_addr_pos);

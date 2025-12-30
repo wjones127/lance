@@ -1417,10 +1417,7 @@ pub(crate) async fn open_vector_index_v2(
             {
                 ext.clone()
                     .to_vector()
-                    .ok_or(Error::Internal {
-                        message: "unable to cast index extension to vector".to_string(),
-                        location: location!(),
-                    })?
+                    .ok_or(Error::internal("unable to cast index extension to vector"))?
                     .load_index(dataset.clone(), column, uuid, reader)
                     .await?
             } else {

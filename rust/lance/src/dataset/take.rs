@@ -300,10 +300,7 @@ async fn do_take_rows(
 
         let returned_row_addr = one_batch
             .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::Internal {
-                message: "_rowaddr column not found".into(),
-                location: location!(),
-            })?
+            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
             .as_primitive::<UInt64Type>()
             .values();
 

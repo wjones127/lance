@@ -90,11 +90,9 @@ impl BlobStructuralEncoder {
                     let encoded_page = encoded_page?;
 
                     let PageEncoding::Structural(inner_layout) = encoded_page.description else {
-                        return Err(Error::Internal {
-                            message: "Expected inner encoding to return structural layout"
-                                .to_string(),
-                            location: location!(),
-                        });
+                        return Err(Error::internal(
+                            "Expected inner encoding to return structural layout",
+                        ));
                     };
 
                     let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);

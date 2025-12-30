@@ -105,10 +105,10 @@ pub fn normalize_dict_nulls(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
                 location: location!(),
             }),
         },
-        _ => Err(Error::Internal {
-            message: format!("Data type is not a dictionary: {}", array.data_type()),
-            location: location!(),
-        }),
+        _ => Err(Error::internal(format!(
+            "Data type is not a dictionary: {}",
+            array.data_type()
+        ))),
     }
 }
 

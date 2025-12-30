@@ -179,11 +179,8 @@ impl NGramPostingList {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let mut bitmap =
-            RoaringTreemap::deserialize_from(bitmap_bytes).map_err(|e| Error::Internal {
-                message: format!("Error deserializing ngram list: {}", e),
-                location: location!(),
-            })?;
+        let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
+            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
         if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
         }
@@ -400,10 +397,8 @@ impl Index for NGramIndex {
         let ngram_stats = NGramStatistics {
             num_ngrams: self.tokens.len(),
         };
-        serde_json::to_value(ngram_stats).map_err(|e| Error::Internal {
-            message: format!("Error serializing statistics: {}", e),
-            location: location!(),
-        })
+        serde_json::to_value(ngram_stats)
+            .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -609,10 +604,8 @@ impl NGramIndexSpillState {
         let bitmaps = postings
             .into_iter()
             .map(|bytes| {
-                RoaringTreemap::deserialize_from(bytes.expect_ok()?).map_err(|e| Error::Internal {
-                    message: format!("Error deserializing ngram list: {}", e),
-                    location: location!(),
-                })
+                RoaringTreemap::deserialize_from(bytes.expect_ok()?)
+                    .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))
             })
             .collect::<Result<Vec<_>>>()?;
 

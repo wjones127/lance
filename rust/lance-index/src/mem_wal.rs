@@ -272,9 +272,11 @@ impl Index for MemWalIndex {
             num_mem_wal: self.mem_wal_map.values().map(|m| m.len()).sum::<usize>() as u64,
             num_regions: self.mem_wal_map.len() as u64,
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize MemWAL index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize MemWAL index statistics: {}",
+                e
+            ))
         })
     }
 

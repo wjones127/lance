@@ -605,13 +605,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 instructions.preamble_action,
             );
             if item_range.end - item_range.start > chunk.items_in_chunk {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Item range {:?} is greater than chunk items in chunk {:?}",
-                        item_range, chunk.items_in_chunk
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Item range {:?} is greater than chunk items in chunk {:?}",
+                    item_range, chunk.items_in_chunk
+                )));
             }
 
             // Now we append the data to the output buffers
@@ -629,13 +626,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
         if let Some(dictionary) = &self.dictionary_data {
             // Don't decode here, that happens later (if needed)
             let DataBlock::FixedWidth(indices) = data else {
-                return Err(lance_core::Error::Internal {
-                    message: format!(
-                        "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
-                        data
-                    ),
-                    location: location!(),
-                });
+                return Err(lance_core::Error::internal(format!(
+                    "Expected FixedWidth DataBlock for dictionary indices, got {:?}",
+                    data
+                )));
             };
             data = DataBlock::Dictionary(DictionaryDataBlock::from_parts(
                 indices,
@@ -2023,10 +2017,9 @@ impl FullZipScheduler {
             PerValueDecompressor::Fixed(decompressor) => {
                 let bits_per_value = decompressor.bits_per_value();
                 if bits_per_value == 0 {
-                    return Err(lance_core::Error::Internal {
-                        message: "Invalid encoding: bits_per_value must be greater than 0".into(),
-                        location: location!(),
-                    });
+                    return Err(lance_core::Error::internal(
+                        "Invalid encoding: bits_per_value must be greater than 0",
+                    ));
                 }
                 if bits_per_value % 8 != 0 {
                     return Err(lance_core::Error::NotSupported {

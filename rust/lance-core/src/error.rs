@@ -6,6 +6,10 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+mod internal;
+
+pub use internal::InternalError;
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -59,8 +63,8 @@ pub enum Error {
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention { message: String, location: Location },
-    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"))]
-    Internal { message: String, location: Location },
+    #[snafu(transparent)]
+    Internal { source: InternalError },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed { message: String, location: Location },
     #[snafu(display("Unprocessable: {message}, {location}"))]
@@ -121,6 +125,16 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn internal(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::Internal {
+            source: InternalError {
+                message,
+                backtrace: std::backtrace::Backtrace::force_capture(),
+            },
+        }
+    }
+
     pub fn corrupt_file(
         path: object_store::path::Path,
         message: impl Into<String>,
@@ -176,11 +190,7 @@ pub trait LanceOptionExt<T> {
 impl<T> LanceOptionExt<T> for Option<T> {
     #[track_caller]
     fn expect_ok(self) -> Result<T> {
-        let location = std::panic::Location::caller().to_snafu_location();
-        self.ok_or_else(|| Error::Internal {
-            message: "Expected option to have value".to_string(),
-            location,
-        })
+        self.ok_or_else(|| Error::internal("Expected option to have value"))
     }
 }
 

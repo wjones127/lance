@@ -216,10 +216,7 @@ impl BitmapIndex {
                 .column(0)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::Internal {
-                    message: "Invalid bitmap column type".to_string(),
-                    location: location!(),
-                })?;
+                .ok_or_else(|| Error::internal("Invalid bitmap column type"))?;
             let bitmap_bytes = binary_bitmaps.value(0);
             let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -277,10 +274,7 @@ impl BitmapIndex {
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| Error::Internal {
-                message: "Invalid bitmap column type".to_string(),
-                location: location!(),
-            })?;
+            .ok_or_else(|| Error::internal("Invalid bitmap column type"))?;
         let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
@@ -386,9 +380,11 @@ impl Index for BitmapIndex {
         let stats = BitmapStatistics {
             num_bitmaps: self.index_map.len() + if !self.null_map.is_empty() { 1 } else { 0 },
         };
-        serde_json::to_value(stats).map_err(|e| Error::Internal {
-            message: format!("failed to serialize bitmap index statistics: {}", e),
-            location: location!(),
+        serde_json::to_value(stats).map_err(|e| {
+            Error::internal(format!(
+                "failed to serialize bitmap index statistics: {}",
+                e
+            ))
         })
     }
 
@@ -698,12 +694,8 @@ impl BitmapIndexPlugin {
         }
 
         // Finish file with metadata that allows lightweight statistics reads
-        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps }).map_err(|e| {
-            Error::Internal {
-                message: format!("failed to serialize bitmap statistics: {e}"),
-                location: location!(),
-            }
-        })?;
+        let stats_json = serde_json::to_string(&BitmapStatistics { num_bitmaps })
+            .map_err(|e| Error::internal(format!("failed to serialize bitmap statistics: {e}")))?;
         let mut metadata = HashMap::new();
         metadata.insert(INDEX_STATS_METADATA_KEY.to_string(), stats_json);
 
@@ -824,9 +816,8 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     ) -> Result<Option<serde_json::Value>> {
         let reader = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         if let Some(value) = reader.schema().metadata.get(INDEX_STATS_METADATA_KEY) {
-            let stats = serde_json::from_str(value).map_err(|e| Error::Internal {
-                message: format!("failed to parse bitmap statistics metadata: {e}"),
-                location: location!(),
+            let stats = serde_json::from_str(value).map_err(|e| {
+                Error::internal(format!("failed to parse bitmap statistics metadata: {e}"))
             })?;
             Ok(Some(stats))
         } else {

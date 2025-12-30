@@ -46,10 +46,9 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         let result = self.search(query, metrics).await?;
         match result {
             SearchResult::Exact(row_ids) => Ok(row_ids),
-            _ => Err(Error::Internal {
-                message: "Label list sub-index should return exact results".to_string(),
-                location: location!(),
-            }),
+            _ => Err(Error::internal(
+                "Label list sub-index should return exact results",
+            )),
         }
     }
 }

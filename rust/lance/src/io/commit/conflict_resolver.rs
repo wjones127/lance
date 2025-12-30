@@ -1356,13 +1356,10 @@ impl<'a> TransactionRebase<'a> {
             }
 
             if committed.len() > 1 {
-                return Err(Error::Internal {
-                    message: format!(
-                        "Committing multiple MemWALs is not supported, but found committed: {:?}",
-                        committed
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "Committing multiple MemWALs is not supported, but found committed: {:?}",
+                    committed
+                )));
             }
 
             if to_commit.len() > 1 {
@@ -1567,10 +1564,7 @@ impl<'a> TransactionRebase<'a> {
                 })
             } else {
                 // We shouldn't hit this.
-                Err(crate::Error::Internal {
-                    message: "We have a transaction that needs to be rebased, but we don't have any affected rows.".into(),
-                    location: location!(),
-                })
+                Err(crate::Error::internal("We have a transaction that needs to be rebased, but we don't have any affected rows."))
             }
         } else {
             Ok(Transaction {
@@ -1752,10 +1746,7 @@ async fn initial_fragments_for_rebase(
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {
-    Error::Internal {
-        message: format!("function called against a wrong operation: {}", op),
-        location: location!(),
-    }
+    Error::internal(format!("function called against a wrong operation: {}", op))
 }
 
 #[cfg(test)]

@@ -443,10 +443,7 @@ impl ProjectionPlan {
         )?;
         let batches = stream.try_collect::<Vec<_>>().await?;
         if batches.len() != 1 {
-            Err(Error::Internal {
-                message: "Expected exactly one batch".to_string(),
-                location: location!(),
-            })
+            Err(Error::internal("Expected exactly one batch"))
         } else {
             Ok(batches.into_iter().next().unwrap())
         }

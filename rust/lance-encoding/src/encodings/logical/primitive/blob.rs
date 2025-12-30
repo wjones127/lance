@@ -140,23 +140,18 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
 
         // Need to extract out the repdef information
         let DataBlock::Struct(descriptions) = &decoded.data else {
-            return Err(Error::Internal {
-                message: "Expected struct data block for descriptions".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected struct data block for descriptions",
+            ));
         };
         let mut description_children = descriptions.children.iter();
         let DataBlock::FixedWidth(positions) = description_children.next().expect_ok()? else {
-            return Err(Error::Internal {
-                message: "Expected fixed width data block for positions".into(),
-                location: location!(),
-            });
+            return Err(Error::internal(
+                "Expected fixed width data block for positions",
+            ));
         };
         let DataBlock::FixedWidth(sizes) = description_children.next().expect_ok()? else {
-            return Err(Error::Internal {
-                message: "Expected fixed width data block for sizes".into(),
-                location: location!(),
-            });
+            return Err(Error::internal("Expected fixed width data block for sizes"));
         };
         let positions = positions.data.borrow_to_typed_slice::<u64>();
         let sizes = sizes.data.borrow_to_typed_slice::<u64>();

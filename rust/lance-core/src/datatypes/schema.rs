@@ -640,13 +640,10 @@ impl Schema {
         // Validate this addition does not create any duplicate field names
         let field_names = self.fields.iter().map(|f| &f.name).collect::<HashSet<_>>();
         if field_names.len() != self.fields.len() {
-            Err(Error::Internal {
-                message: format!(
-                    "Attempt to add fields [{:?}] would lead to duplicate field names",
-                    fields.iter().map(|f| f.name()).collect::<Vec<_>>()
-                ),
-                location: location!(),
-            })
+            Err(Error::internal(format!(
+                "Attempt to add fields [{:?}] would lead to duplicate field names",
+                fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+            )))
         } else {
             Ok(())
         }

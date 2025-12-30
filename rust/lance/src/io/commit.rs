@@ -335,13 +335,10 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         // match the file version.  As a result, we need to check and see if they are out
         // of sync.
         if let Some(actual_file_version) =
-            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
-                message: format!(
-                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                    e
-                ),
-                location: location!(),
-            })? {
+            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::internal(format!(
+                "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
+                e
+            )))? {
                 if actual_file_version > data_storage_version {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
@@ -356,14 +353,11 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
         // match the data storage version.  This is a sanity assertion to prevent data corruption.
         if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
             if actual_file_version != data_storage_version {
-                return Err(Error::Internal {
-                    message: format!(
-                        "The operation added files with version {}.  However, the data storage version is {}.",
-                        actual_file_version,
-                        data_storage_version
-                    ),
-                    location: location!(),
-                });
+                return Err(Error::internal(format!(
+                    "The operation added files with version {}.  However, the data storage version is {}.",
+                    actual_file_version,
+                    data_storage_version
+                )));
             }
         }
     }
@@ -507,9 +501,8 @@ pub(crate) async fn migrate_fragments(
                             object_store
                                 .size(&dataset.base.child("data").child(file.path.clone()))
                                 .map_ok(|size| {
-                                    NonZero::new(size).ok_or_else(|| Error::Internal {
-                                        message: format!("File {} has size 0", file.path),
-                                        location: location!(),
+                                    NonZero::new(size).ok_or_else(|| {
+                                        Error::internal(format!("File {} has size 0", file.path))
                                     })
                                 })
                                 .await?
@@ -587,7 +580,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                 && !is_system_index(index)
         {
             debug_assert_eq!(index.fields.len(), 1);
-            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
+            let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
             let idx = dataset
                 .open_generic_index(
@@ -851,7 +844,7 @@ pub(crate) async fn commit_transaction(
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
-            return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+            return Err(Error::internal("more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions."));
         }
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {

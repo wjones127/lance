@@ -717,19 +717,12 @@ async fn collect_blob_files_v2(
                 let blob_id = blob_ids.value(idx);
                 let size = sizes.value(idx);
                 let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
+                let frag = dataset
+                    .get_fragment(frag_id as usize)
+                    .ok_or_else(|| Error::internal("Fragment not found"))?;
+                let data_file = frag
+                    .data_file_for_field(blob_field_id)
+                    .ok_or_else(|| Error::internal("Data file not found for blob field"))?;
 
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
@@ -740,19 +733,12 @@ async fn collect_blob_files_v2(
                 let size = sizes.value(idx);
                 let position = positions.value(idx);
                 let frag_id = RowAddress::from(*row_addr).fragment_id();
-                let frag =
-                    dataset
-                        .get_fragment(frag_id as usize)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Fragment not found".to_string(),
-                            location: location!(),
-                        })?;
-                let data_file =
-                    frag.data_file_for_field(blob_field_id)
-                        .ok_or_else(|| Error::Internal {
-                            message: "Data file not found for blob field".to_string(),
-                            location: location!(),
-                        })?;
+                let frag = dataset
+                    .get_fragment(frag_id as usize)
+                    .ok_or_else(|| Error::internal("Fragment not found"))?;
+                let data_file = frag
+                    .data_file_for_field(blob_field_id)
+                    .ok_or_else(|| Error::internal("Data file not found for blob field"))?;
                 let data_file_key = data_file_key_from_path(data_file.path.as_str());
                 let path = blob_path(&dataset.data_dir(), data_file_key, blob_id);
                 files.push(BlobFile::new_packed(dataset.clone(), path, position, size));

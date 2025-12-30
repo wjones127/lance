@@ -291,12 +291,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let part = ivf_index
                     .load_partition(part_id, false, &NoOpMetricsCollector)
                     .await?;
-                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
-                    Error::Internal {
-                        message: "failed to downcast partition entry".to_string(),
-                        location: location!(),
-                    },
-                )?;
+                let part = part
+                    .as_any()
+                    .downcast_ref::<PartitionEntry<S, Q>>()
+                    .ok_or(Error::internal("failed to downcast partition entry"))?;
 
                 let storage = part.storage.remap(&mapping)?;
                 let index = part.index.remap(&mapping, &storage)?;
