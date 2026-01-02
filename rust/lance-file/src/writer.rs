@@ -787,17 +787,21 @@ mod tests {
     use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
-    use arrow_array::{Int32Array, RecordBatch, UInt64Array};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
+    use futures::future::BoxFuture;
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
+    use lance_core::Error;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::decoder::{DecoderPlugins, PageEncoding};
+    use lance_encoding::encoder::{ColumnIndexSequence, EncodingOptions, FieldEncodingStrategy};
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
     use lance_io::utils::CachedFileSize;
+    use snafu::location;
 
     #[tokio::test]
     async fn test_basic_write() {
@@ -1449,5 +1453,118 @@ mod tests {
 
         // Verify first value matches what we wrote
         assert!(read_binary.value(0).iter().all(|&b| b == 42u8));
+    }
+
+    #[tokio::test]
+    async fn test_encoding_error() {
+        use lance_core::Result;
+        use lance_encoding::encoder::{EncodeTask, EncodedColumn, FieldEncoder, OutOfLineBuffers};
+        use lance_encoding::repdef::RepDefBuilder;
+        use lance_io::object_store::ObjectStore;
+
+        // Create a custom encoding that errors on a specific value
+        struct ErrorEncoding;
+
+        impl FieldEncoder for ErrorEncoding {
+            fn maybe_encode(
+                &mut self,
+                _array: ArrayRef,
+                _external_buffers: &mut OutOfLineBuffers,
+                _repdef: RepDefBuilder,
+                _row_number: u64,
+                _num_rows: u64,
+            ) -> Result<Vec<EncodeTask>> {
+                // TODO: error on the 50th value for testing that the error message
+                // includes the field offset.
+                return Err(Error::invalid_input(
+                    "Encountered forbidden value 999",
+                    location!(),
+                ));
+            }
+
+            fn flush(
+                &mut self,
+                _external_buffers: &mut OutOfLineBuffers,
+            ) -> Result<Vec<EncodeTask>> {
+                Ok(vec![])
+            }
+
+            fn finish(
+                &mut self,
+                _external_buffers: &mut OutOfLineBuffers,
+            ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+                unreachable!()
+            }
+
+            fn num_columns(&self) -> u32 {
+                1
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestEncodingStrategy;
+        // TODO: make this a wrapper around StructuralEncodingStrategy, so that
+        // most fields get encoded normally, but our field of choice is going
+        // to error while encoding.
+        impl FieldEncodingStrategy for TestEncodingStrategy {
+            fn create_field_encoder(
+                &self,
+                _encoding_strategy_root: &dyn FieldEncodingStrategy,
+                _field: &lance_core::datatypes::Field,
+                _column_index: &mut ColumnIndexSequence,
+                _options: &EncodingOptions,
+            ) -> Result<Box<dyn FieldEncoder>> {
+                Ok(Box::new(ErrorEncoding))
+            }
+        }
+
+        // Write a file with data that will trigger the error
+        // TODO: Have this be a nested column, so we can test that the error can
+        // show the full path to the field.
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let data_array = Int32Array::from_iter_values(vec![1, 2, 999, 4, 5]);
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data_array)]).unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::new(TestEncodingStrategy)),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        let Err(error) = writer.write_batch(&batch).await else {
+            panic!("Expected error during FileWriter creation due to encoding error");
+        };
+
+        let report = snafu::Report::from_error(error);
+        let error_message = format!("{}", report);
+        // TODO: this error message might not be the final format, but gives us
+        // an idea what we want: As the error bubbles up to the FileWriter level,
+        // we add context about what is happening.
+        assert_eq!(
+            error_message,
+            "Error: failed to encode batch
+            
+            Caused by this error:
+                0: failed to encode field `outer.inner`
+                1: failed to encode value 50 of 100
+                2: Encountered forbidden value 999"
+        );
     }
 }
