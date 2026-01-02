@@ -367,6 +367,7 @@ impl FileWriter {
                     })?;
                 let repdef = RepDefBuilder::default();
                 let num_rows = array.len() as u64;
+                let field_desc = format!("{} (id: {})", field.name, field.id);
                 let tasks = column_writer
                     .maybe_encode(
                         array.clone(),
@@ -375,17 +376,16 @@ impl FileWriter {
                         self.rows_written,
                         num_rows,
                     )
-                    .map_err(|e| Error::encoding_failed(&field.name, e, location!()))?;
+                    .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))?;
 
                 // Wrap each task to add field context for execution-time errors
-                let field_name = field.name.clone();
                 let tasks_with_context: Vec<EncodeTask> = tasks
                     .into_iter()
                     .map(|task| {
-                        let field_name = field_name.clone();
+                        let field_desc = field_desc.clone();
                         async move {
                             task.await
-                                .map_err(|e| Error::encoding_failed(&field_name, e, location!()))
+                                .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))
                         }
                         .boxed()
                     })
@@ -1593,10 +1593,10 @@ mod tests {
 
         let report = snafu::Report::from_error(error);
         let error_message = format!("{}", report);
-        // The error should include the field path for context
+        // The error should include the field path with ID for context
         assert!(
-            error_message.contains("failed to encode field `outer`"),
-            "Error should contain field context, got: {}",
+            error_message.contains("failed to encode field `outer (id:"),
+            "Error should contain field name and id, got: {}",
             error_message
         );
         assert!(
@@ -1721,10 +1721,10 @@ mod tests {
 
         let report = snafu::Report::from_error(error);
         let error_message = format!("{}", report);
-        // The error should include the field path for context
+        // The error should include the field path with ID for context
         assert!(
-            error_message.contains("failed to encode field `value`"),
-            "Error should contain field context, got: {}",
+            error_message.contains("failed to encode field `value (id:"),
+            "Error should contain field name and id, got: {}",
             error_message
         );
         assert!(

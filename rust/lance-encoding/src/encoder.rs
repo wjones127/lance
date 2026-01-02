@@ -520,8 +520,11 @@ impl StructuralEncodingStrategy {
                             Arc::new(root_field_metadata.clone()),
                         )?))
                     } else {
-                        let child_field_names: Vec<String> =
-                            field.children.iter().map(|f| f.name.clone()).collect();
+                        let child_fields: Vec<(String, i32)> = field
+                            .children
+                            .iter()
+                            .map(|f| (f.name.clone(), f.id))
+                            .collect();
                         let children_encoders = field
                             .children
                             .iter()
@@ -538,7 +541,7 @@ impl StructuralEncodingStrategy {
                         Ok(Box::new(StructStructuralEncoder::new(
                             options.keep_original_array,
                             children_encoders,
-                            child_field_names,
+                            child_fields,
                         )))
                     }
                 }

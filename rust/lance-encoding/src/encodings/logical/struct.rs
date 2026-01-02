@@ -394,19 +394,20 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
 pub struct StructStructuralEncoder {
     keep_original_array: bool,
     children: Vec<Box<dyn FieldEncoder>>,
-    child_field_names: Vec<String>,
+    /// (field_name, field_id) for each child, used for error context
+    child_fields: Vec<(String, i32)>,
 }
 
 impl StructStructuralEncoder {
     pub fn new(
         keep_original_array: bool,
         children: Vec<Box<dyn FieldEncoder>>,
-        child_field_names: Vec<String>,
+        child_fields: Vec<(String, i32)>,
     ) -> Self {
         Self {
             keep_original_array,
             children,
-            child_field_names,
+            child_fields,
         }
     }
 }
@@ -436,8 +437,9 @@ impl FieldEncoder for StructStructuralEncoder {
             .children
             .iter_mut()
             .zip(struct_array.columns().iter())
-            .zip(self.child_field_names.iter())
-            .map(|((encoder, arr), field_name)| {
+            .zip(self.child_fields.iter())
+            .map(|((encoder, arr), (field_name, field_id))| {
+                let field_desc = format!("{} (id: {})", field_name, field_id);
                 let tasks = encoder
                     .maybe_encode(
                         arr.clone(),
@@ -446,17 +448,16 @@ impl FieldEncoder for StructStructuralEncoder {
                         row_number,
                         num_rows,
                     )
-                    .map_err(|e| Error::encoding_failed(field_name, e, location!()))?;
+                    .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))?;
 
                 // Wrap each task to add field context for execution-time errors
-                let field_name = field_name.clone();
                 let tasks_with_context: Vec<EncodeTask> = tasks
                     .into_iter()
                     .map(|task| {
-                        let field_name = field_name.clone();
+                        let field_desc = field_desc.clone();
                         async move {
                             task.await
-                                .map_err(|e| Error::encoding_failed(&field_name, e, location!()))
+                                .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))
                         }
                         .boxed()
                     })
@@ -470,21 +471,21 @@ impl FieldEncoder for StructStructuralEncoder {
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         self.children
             .iter_mut()
-            .zip(self.child_field_names.iter())
-            .map(|(encoder, field_name)| {
+            .zip(self.child_fields.iter())
+            .map(|(encoder, (field_name, field_id))| {
+                let field_desc = format!("{} (id: {})", field_name, field_id);
                 let tasks = encoder
                     .flush(external_buffers)
-                    .map_err(|e| Error::encoding_failed(field_name, e, location!()))?;
+                    .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))?;
 
                 // Wrap each task to add field context for execution-time errors
-                let field_name = field_name.clone();
                 let tasks_with_context: Vec<EncodeTask> = tasks
                     .into_iter()
                     .map(|task| {
-                        let field_name = field_name.clone();
+                        let field_desc = field_desc.clone();
                         async move {
                             task.await
-                                .map_err(|e| Error::encoding_failed(&field_name, e, location!()))
+                                .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))
                         }
                         .boxed()
                     })
@@ -509,13 +510,13 @@ impl FieldEncoder for StructStructuralEncoder {
         let mut child_columns = self
             .children
             .iter_mut()
-            .zip(self.child_field_names.iter())
-            .map(|(child, field_name)| {
-                let field_name = field_name.clone();
+            .zip(self.child_fields.iter())
+            .map(|(child, (field_name, field_id))| {
+                let field_desc = format!("{} (id: {})", field_name, field_id);
                 let fut = child.finish(external_buffers);
                 async move {
                     fut.await
-                        .map_err(|e| Error::encoding_failed(&field_name, e, location!()))
+                        .map_err(|e| Error::encoding_failed(&field_desc, e, location!()))
                 }
                 .boxed()
             })
@@ -891,9 +892,9 @@ mod tests {
         }
 
         let children: Vec<Box<dyn FieldEncoder>> = vec![Box::new(ErrorEncoder)];
-        let child_names = vec!["inner_field".to_string()];
+        let child_fields = vec![("inner_field".to_string(), 42)];
 
-        let mut encoder = StructStructuralEncoder::new(false, children, child_names);
+        let mut encoder = StructStructuralEncoder::new(false, children, child_fields);
 
         let inner_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let struct_array: ArrayRef = Arc::new(StructArray::from(vec![(
@@ -913,8 +914,8 @@ mod tests {
         let error_message = format!("{}", report);
 
         assert!(
-            error_message.contains("failed to encode field `inner_field`"),
-            "Error should contain child field name, got: {}",
+            error_message.contains("failed to encode field `inner_field (id: 42)`"),
+            "Error should contain child field name and id, got: {}",
             error_message
         );
         assert!(
