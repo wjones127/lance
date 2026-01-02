@@ -787,8 +787,10 @@ mod tests {
     use crate::writer::{FileWriter, FileWriterOptions, ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES};
     use arrow_array::builder::{Float32Builder, Int32Builder};
     use arrow_array::{types::Float64Type, RecordBatchReader, StringArray};
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray, UInt64Array};
+    use arrow_schema::{
+        DataType, Field, Field as ArrowField, Fields, Schema, Schema as ArrowSchema,
+    };
     use futures::future::BoxFuture;
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -1458,7 +1460,9 @@ mod tests {
     #[tokio::test]
     async fn test_encoding_error() {
         use lance_core::Result;
-        use lance_encoding::encoder::{EncodeTask, EncodedColumn, FieldEncoder, OutOfLineBuffers};
+        use lance_encoding::encoder::{
+            EncodeTask, EncodedColumn, FieldEncoder, OutOfLineBuffers, StructuralEncodingStrategy,
+        };
         use lance_encoding::repdef::RepDefBuilder;
         use lance_io::object_store::ObjectStore;
 
@@ -1474,12 +1478,10 @@ mod tests {
                 _row_number: u64,
                 _num_rows: u64,
             ) -> Result<Vec<EncodeTask>> {
-                // TODO: error on the 50th value for testing that the error message
-                // includes the field offset.
-                return Err(Error::invalid_input(
+                Err(Error::invalid_input(
                     "Encountered forbidden value 999",
                     location!(),
-                ));
+                ))
             }
 
             fn flush(
@@ -1501,42 +1503,62 @@ mod tests {
             }
         }
 
+        // Wrapper that delegates to StructuralEncodingStrategy except for the target field
         #[derive(Debug)]
-        struct TestEncodingStrategy;
-        // TODO: make this a wrapper around StructuralEncodingStrategy, so that
-        // most fields get encoded normally, but our field of choice is going
-        // to error while encoding.
-        impl FieldEncodingStrategy for TestEncodingStrategy {
+        struct ErrorOnFieldEncodingStrategy {
+            inner: StructuralEncodingStrategy,
+            target_field_name: String,
+        }
+
+        impl FieldEncodingStrategy for ErrorOnFieldEncodingStrategy {
             fn create_field_encoder(
                 &self,
-                _encoding_strategy_root: &dyn FieldEncodingStrategy,
-                _field: &lance_core::datatypes::Field,
-                _column_index: &mut ColumnIndexSequence,
-                _options: &EncodingOptions,
+                encoding_strategy_root: &dyn FieldEncodingStrategy,
+                field: &lance_core::datatypes::Field,
+                column_index: &mut ColumnIndexSequence,
+                options: &EncodingOptions,
             ) -> Result<Box<dyn FieldEncoder>> {
-                Ok(Box::new(ErrorEncoding))
+                if field.name == self.target_field_name {
+                    return Ok(Box::new(ErrorEncoding));
+                }
+                self.inner.create_field_encoder(
+                    encoding_strategy_root,
+                    field,
+                    column_index,
+                    options,
+                )
             }
         }
 
-        // Write a file with data that will trigger the error
-        // TODO: Have this be a nested column, so we can test that the error can
-        // show the full path to the field.
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            DataType::Int32,
+        // Nested schema: outer struct containing an inner int32 field
+        let inner_field = ArrowField::new("inner", DataType::Int32, false);
+        let outer_field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![inner_field.clone()])),
             false,
-        )]));
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![outer_field]));
 
         let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let data_array = Int32Array::from_iter_values(vec![1, 2, 999, 4, 5]);
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data_array)]).unwrap();
+        let inner_array = Int32Array::from_iter_values(vec![1, 2, 999, 4, 5]);
+        let struct_array = StructArray::from(vec![(
+            Arc::new(inner_field),
+            Arc::new(inner_array) as ArrayRef,
+        )]);
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(struct_array)]).unwrap();
 
         let path = TempObjFile::default();
         let object_store = ObjectStore::local();
 
         let options = FileWriterOptions {
-            encoding_strategy: Some(Arc::new(TestEncodingStrategy)),
+            encoding_strategy: Some(Arc::new(ErrorOnFieldEncodingStrategy {
+                inner: StructuralEncodingStrategy::with_version(LanceFileVersion::V2_1),
+                // Note: targeting "outer" because StructuralEncodingStrategy creates child
+                // encoders internally without going through the strategy pattern.
+                target_field_name: "outer".to_string(),
+            })),
             format_version: Some(LanceFileVersion::V2_1),
             ..Default::default()
         };
@@ -1554,17 +1576,13 @@ mod tests {
 
         let report = snafu::Report::from_error(error);
         let error_message = format!("{}", report);
-        // TODO: this error message might not be the final format, but gives us
-        // an idea what we want: As the error bubbles up to the FileWriter level,
-        // we add context about what is happening.
+        // The error should include the field path for context
         assert_eq!(
             error_message,
-            "Error: failed to encode batch
-            
-            Caused by this error:
-                0: failed to encode field `outer.inner`
-                1: failed to encode value 50 of 100
-                2: Encountered forbidden value 999"
+            "Error: failed to encode field `outer`
+
+Caused by this error:
+  1: Encountered forbidden value 999"
         );
     }
 }
