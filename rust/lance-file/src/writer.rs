@@ -11,7 +11,7 @@ use arrow_array::RecordBatch;
 use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
@@ -367,13 +367,30 @@ impl FileWriter {
                     })?;
                 let repdef = RepDefBuilder::default();
                 let num_rows = array.len() as u64;
-                column_writer.maybe_encode(
-                    array.clone(),
-                    external_buffers,
-                    repdef,
-                    self.rows_written,
-                    num_rows,
-                )
+                let tasks = column_writer
+                    .maybe_encode(
+                        array.clone(),
+                        external_buffers,
+                        repdef,
+                        self.rows_written,
+                        num_rows,
+                    )
+                    .map_err(|e| Error::encoding_failed(&field.name, e, location!()))?;
+
+                // Wrap each task to add field context for execution-time errors
+                let field_name = field.name.clone();
+                let tasks_with_context: Vec<EncodeTask> = tasks
+                    .into_iter()
+                    .map(|task| {
+                        let field_name = field_name.clone();
+                        async move {
+                            task.await
+                                .map_err(|e| Error::encoding_failed(&field_name, e, location!()))
+                        }
+                        .boxed()
+                    })
+                    .collect();
+                Ok(tasks_with_context)
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -798,7 +815,7 @@ mod tests {
     use lance_core::Error;
     use lance_datagen::{array, gen_batch, BatchCount, RowCount};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::decoder::{DecoderPlugins, PageEncoding};
+    use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::encoder::{ColumnIndexSequence, EncodingOptions, FieldEncodingStrategy};
     use lance_encoding::version::LanceFileVersion;
     use lance_io::object_store::ObjectStore;
@@ -1577,12 +1594,143 @@ mod tests {
         let report = snafu::Report::from_error(error);
         let error_message = format!("{}", report);
         // The error should include the field path for context
-        assert_eq!(
-            error_message,
-            "Error: failed to encode field `outer`
+        assert!(
+            error_message.contains("failed to encode field `outer`"),
+            "Error should contain field context, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("Encountered forbidden value 999"),
+            "Error should contain original error message, got: {}",
+            error_message
+        );
+    }
 
-Caused by this error:
-  1: Encountered forbidden value 999"
+    #[tokio::test]
+    async fn test_encoding_error_during_execution() {
+        use futures::FutureExt;
+        use lance_core::Result;
+        use lance_encoding::encoder::{
+            EncodeTask, EncodedColumn, FieldEncoder, OutOfLineBuffers, StructuralEncodingStrategy,
+        };
+        use lance_encoding::repdef::RepDefBuilder;
+        use lance_io::object_store::ObjectStore;
+
+        // Create a custom encoding that errors during task execution (async phase)
+        struct ErrorEncodingOnExec;
+
+        impl FieldEncoder for ErrorEncodingOnExec {
+            fn maybe_encode(
+                &mut self,
+                _array: ArrayRef,
+                _external_buffers: &mut OutOfLineBuffers,
+                _repdef: RepDefBuilder,
+                _row_number: u64,
+                _num_rows: u64,
+            ) -> Result<Vec<EncodeTask>> {
+                // Return a task that will error when executed
+                Ok(vec![async {
+                    Err(Error::invalid_input(
+                        "Compression failed for forbidden value",
+                        location!(),
+                    ))
+                }
+                .boxed()])
+            }
+
+            fn flush(
+                &mut self,
+                _external_buffers: &mut OutOfLineBuffers,
+            ) -> Result<Vec<EncodeTask>> {
+                Ok(vec![])
+            }
+
+            fn finish(
+                &mut self,
+                _external_buffers: &mut OutOfLineBuffers,
+            ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+                unreachable!()
+            }
+
+            fn num_columns(&self) -> u32 {
+                1
+            }
+        }
+
+        // Wrapper that delegates to StructuralEncodingStrategy except for the target field
+        #[derive(Debug)]
+        struct ErrorOnFieldEncodingStrategy {
+            inner: StructuralEncodingStrategy,
+            target_field_name: String,
+        }
+
+        impl FieldEncodingStrategy for ErrorOnFieldEncodingStrategy {
+            fn create_field_encoder(
+                &self,
+                encoding_strategy_root: &dyn FieldEncodingStrategy,
+                field: &lance_core::datatypes::Field,
+                column_index: &mut ColumnIndexSequence,
+                options: &EncodingOptions,
+            ) -> Result<Box<dyn FieldEncoder>> {
+                if field.name == self.target_field_name {
+                    return Ok(Box::new(ErrorEncodingOnExec));
+                }
+                self.inner.create_field_encoder(
+                    encoding_strategy_root,
+                    field,
+                    column_index,
+                    options,
+                )
+            }
+        }
+
+        // Simple schema with one field
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let data_array = Int32Array::from_iter_values(vec![1, 2, 3, 4, 5]);
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data_array)]).unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+
+        let options = FileWriterOptions {
+            encoding_strategy: Some(Arc::new(ErrorOnFieldEncodingStrategy {
+                inner: StructuralEncodingStrategy::with_version(LanceFileVersion::V2_1),
+                target_field_name: "value".to_string(),
+            })),
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+
+        let mut writer = FileWriter::try_new(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+
+        let Err(error) = writer.write_batch(&batch).await else {
+            panic!("Expected error during encoding execution");
+        };
+
+        let report = snafu::Report::from_error(error);
+        let error_message = format!("{}", report);
+        // The error should include the field path for context
+        assert!(
+            error_message.contains("failed to encode field `value`"),
+            "Error should contain field context, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("Compression failed for forbidden value"),
+            "Error should contain original error message, got: {}",
+            error_message
         );
     }
 }

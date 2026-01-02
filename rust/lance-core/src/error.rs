@@ -118,6 +118,12 @@ pub enum Error {
         source: BoxedError,
         location: Location,
     },
+    #[snafu(display("failed to encode field `{field}`"))]
+    EncodingFailed {
+        field: String,
+        source: BoxedError,
+        location: Location,
+    },
 }
 
 impl Error {
@@ -161,6 +167,14 @@ impl Error {
             message,
             major_version,
             minor_version,
+            location,
+        }
+    }
+
+    pub fn encoding_failed(field: impl Into<String>, source: Self, location: Location) -> Self {
+        Self::EncodingFailed {
+            field: field.into(),
+            source: Box::new(source),
             location,
         }
     }
