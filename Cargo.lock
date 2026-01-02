@@ -4796,6 +4796,7 @@ dependencies = [
  "tracking-allocator",
  "url",
  "uuid",
+ "yansi",
 ]
 
 [[package]]

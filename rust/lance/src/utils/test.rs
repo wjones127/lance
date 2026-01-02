@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
-use snafu::location;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema as ArrowSchema;
@@ -445,80 +444,249 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     Ok(test_dir)
 }
 
-/// Trims whitespace from the start and end of each line in the string.
-fn trim_whitespace(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for line in s.lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            result.push_str(line);
-            result.push('\n');
+/// Result of matching a single line.
+#[derive(Debug)]
+enum LineMatch {
+    /// Line matched (possibly via wildcards). Contains captured wildcard content.
+    Matched(Vec<String>),
+    /// Line is extra (in actual but not expected).
+    Extra,
+    /// Line is missing (in expected but not actual).
+    Missing,
+}
+
+/// Result of comparing two strings.
+struct MatchResult {
+    lines: Vec<(String, LineMatch)>,
+}
+
+impl MatchResult {
+    fn has_mismatches(&self) -> bool {
+        self.lines
+            .iter()
+            .any(|(_, m)| matches!(m, LineMatch::Extra | LineMatch::Missing))
+    }
+}
+
+/// Match a line against a pattern with `...` wildcards.
+/// Returns `Some(captured_wildcards)` on match, `None` on mismatch.
+fn match_line_with_wildcards(actual: &str, pattern: &str) -> Option<Vec<String>> {
+    let pieces: Vec<&str> = pattern.split("...").collect();
+    let mut pos = 0;
+    let mut captures = Vec::new();
+
+    for (i, piece) in pieces.iter().enumerate() {
+        if i == 0 {
+            // First piece must match at start
+            if !actual.starts_with(piece) {
+                return None;
+            }
+            pos = piece.len();
+        } else if !piece.is_empty() {
+            // Non-empty piece after a wildcard: find it in the remaining string
+            let remaining = &actual[pos..];
+            let found_pos = remaining.find(piece)?;
+            // Capture what wildcard matched
+            if found_pos > 0 {
+                captures.push(remaining[..found_pos].to_string());
+            }
+            pos += found_pos + piece.len();
+        }
+        // Empty pieces (from trailing "...") are handled after the loop
+    }
+
+    // Handle trailing wildcard or check nothing remains
+    if pattern.ends_with("...") {
+        if pos < actual.len() {
+            captures.push(actual[pos..].to_string());
+        }
+    } else if pos < actual.len() {
+        return None;
+    }
+
+    Some(captures)
+}
+
+/// Compare actual and expected strings line by line, supporting `...` wildcards.
+fn compare_strings(actual: &str, expected: &str) -> MatchResult {
+    let actual_lines: Vec<&str> = actual
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let expected_lines: Vec<&str> = expected
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut result = MatchResult { lines: Vec::new() };
+    let mut actual_idx = 0;
+    let mut expected_idx = 0;
+
+    while actual_idx < actual_lines.len() || expected_idx < expected_lines.len() {
+        if actual_idx >= actual_lines.len() {
+            // Remaining expected lines are missing
+            result
+                .lines
+                .push((expected_lines[expected_idx].to_string(), LineMatch::Missing));
+            expected_idx += 1;
+            continue;
+        }
+
+        if expected_idx >= expected_lines.len() {
+            // Remaining actual lines are extra
+            result
+                .lines
+                .push((actual_lines[actual_idx].to_string(), LineMatch::Extra));
+            actual_idx += 1;
+            continue;
+        }
+
+        let actual_line = actual_lines[actual_idx];
+        let expected_line = expected_lines[expected_idx];
+
+        if let Some(captures) = match_line_with_wildcards(actual_line, expected_line) {
+            // Lines match
+            result
+                .lines
+                .push((actual_line.to_string(), LineMatch::Matched(captures)));
+            actual_idx += 1;
+            expected_idx += 1;
+        } else {
+            // Lines don't match - try to find a better alignment
+            // Look ahead in actual to see if expected_line matches later
+            let ahead_in_actual = actual_lines[actual_idx..]
+                .iter()
+                .position(|&l| match_line_with_wildcards(l, expected_line).is_some());
+
+            // Look ahead in expected to see if actual_line matches later
+            let ahead_in_expected = expected_lines[expected_idx..]
+                .iter()
+                .position(|&p| match_line_with_wildcards(actual_line, p).is_some());
+
+            match (ahead_in_actual, ahead_in_expected) {
+                (Some(a), Some(e)) if a <= e => {
+                    // actual has extra lines before the match
+                    result
+                        .lines
+                        .push((actual_line.to_string(), LineMatch::Extra));
+                    actual_idx += 1;
+                }
+                (Some(_), Some(_)) => {
+                    // expected has missing lines before the match
+                    result
+                        .lines
+                        .push((expected_line.to_string(), LineMatch::Missing));
+                    expected_idx += 1;
+                }
+                (Some(_), None) => {
+                    // actual has extra lines
+                    result
+                        .lines
+                        .push((actual_line.to_string(), LineMatch::Extra));
+                    actual_idx += 1;
+                }
+                (None, Some(_)) => {
+                    // expected has missing lines
+                    result
+                        .lines
+                        .push((expected_line.to_string(), LineMatch::Missing));
+                    expected_idx += 1;
+                }
+                (None, None) => {
+                    // Neither matches anywhere - mark expected as missing, actual as extra
+                    result
+                        .lines
+                        .push((expected_line.to_string(), LineMatch::Missing));
+                    result
+                        .lines
+                        .push((actual_line.to_string(), LineMatch::Extra));
+                    actual_idx += 1;
+                    expected_idx += 1;
+                }
+            }
         }
     }
-    if !result.is_empty() {
-        // Remove the last newline
-        result.pop();
-    }
+
     result
 }
 
-/// Asserts that the actual string matches the expected pattern.
-/// The pattern can contain "..." to match any content between specified pieces.
-/// The first piece must match from the start, middle pieces can appear anywhere,
-/// and the last piece must match at the end.
-pub fn assert_string_matches(actual: &str, expected_pattern: &str) -> lance_core::Result<()> {
-    let actual_cleaned = trim_whitespace(actual);
-    let expected = trim_whitespace(expected_pattern);
+/// Format the diff result with colors.
+#[cfg(test)]
+fn format_diff(result: &MatchResult) -> String {
+    use yansi::Paint;
 
-    let to_match = expected.split("...").collect::<Vec<_>>();
-    let num_pieces = to_match.len();
-    let mut remainder = actual_cleaned.as_str().trim_end_matches('\n');
+    let mut output = String::new();
+    output.push_str("string mismatch\n\n");
 
-    for (i, piece) in to_match.into_iter().enumerate() {
-        let res = match i {
-            0 => remainder.starts_with(piece),
-            _ if i == num_pieces - 1 => remainder.ends_with(piece),
-            _ => remainder.contains(piece),
-        };
-        if !res {
-            return Err(lance_core::Error::InvalidInput {
-                source: format!(
-                    "Expected string to match:\nExpected: {}\nActual: {}",
-                    expected_pattern, actual
-                )
-                .into(),
-                location: location!(),
-            });
+    for (line, match_type) in &result.lines {
+        match match_type {
+            LineMatch::Matched(wildcards) => {
+                output.push_str(&format!("  {}", line));
+                if !wildcards.is_empty() {
+                    let wildcard_info = format!("[... = {:?}]", wildcards);
+                    output.push_str(&format!("  {}", wildcard_info.dim()));
+                }
+                output.push('\n');
+            }
+            LineMatch::Extra => {
+                let extra_line = format!("+ {}", line);
+                output.push_str(&format!("{}\n", extra_line.red()));
+            }
+            LineMatch::Missing => {
+                let missing_line = format!("- {}", line);
+                output.push_str(&format!("{}\n", missing_line.green()));
+            }
         }
-        let idx = remainder.find(piece).unwrap();
-        remainder = &remainder[idx + piece.len()..];
     }
 
-    if !remainder.is_empty() {
-        return Err(lance_core::Error::InvalidInput {
-            source: format!(
-                "Expected string to match:\nExpected: {}\nActual: {}",
-                expected_pattern, actual
-            )
-            .into(),
-            location: location!(),
-        });
-    }
-
-    Ok(())
+    output
 }
 
-pub async fn assert_plan_node_equals(
-    plan_node: Arc<dyn ExecutionPlan>,
-    raw_expected: &str,
-) -> lance_core::Result<()> {
+/// Implementation function for the `assert_str_matches!` macro.
+/// Returns `Err(message)` if the strings don't match.
+#[cfg(test)]
+pub fn _assert_str_matches_impl(actual: &str, expected: &str) -> Result<(), String> {
+    let result = compare_strings(actual, expected);
+    if result.has_mismatches() {
+        Err(format_diff(&result))
+    } else {
+        Ok(())
+    }
+}
+
+/// Assert that actual string matches expected pattern with `...` wildcards.
+///
+/// Wildcards match any content within a single line:
+/// - `"foo ... bar"` matches `"foo 123 bar"`
+/// - `"foo ..."` matches `"foo anything"`
+///
+/// On failure, shows colored diff with wildcard captures.
+///
+/// # Example
+/// ```ignore
+/// assert_str_matches!("hello 123 world", "hello ... world");
+/// assert_str_matches!("line1\nline2 xyz", "line1\nline2 ...");
+/// ```
+#[macro_export]
+macro_rules! assert_str_matches {
+    ($actual:expr, $expected:expr $(,)?) => {{
+        let actual = $actual;
+        let expected = $expected;
+        if let Err(msg) = $crate::utils::test::_assert_str_matches_impl(actual, expected) {
+            panic!("{}\n  at {}:{}:{}", msg, file!(), line!(), column!());
+        }
+    }};
+}
+
+pub async fn assert_plan_node_equals(plan_node: Arc<dyn ExecutionPlan>, raw_expected: &str) {
     let raw_plan_desc = format!(
         "{}",
         datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
     );
 
-    // Use the extracted string matching logic
-    assert_string_matches(&raw_plan_desc, raw_expected)
+    assert_str_matches!(&raw_plan_desc, raw_expected);
 }
 
 #[cfg(test)]
@@ -724,5 +892,111 @@ mod tests {
         fn from(value: &'a TempStrDir) -> Self {
             WriteDestination::Uri(value.as_str())
         }
+    }
+
+    // Tests for assert_str_matches! macro
+
+    #[test]
+    fn test_str_matches_exact() {
+        crate::assert_str_matches!("hello world", "hello world");
+    }
+
+    #[test]
+    fn test_str_matches_wildcard_middle() {
+        crate::assert_str_matches!("foo 123 bar", "foo ... bar");
+    }
+
+    #[test]
+    fn test_str_matches_wildcard_end() {
+        crate::assert_str_matches!("prefix anything here", "prefix ...");
+    }
+
+    #[test]
+    fn test_str_matches_wildcard_start() {
+        crate::assert_str_matches!("anything prefix", "... prefix");
+    }
+
+    #[test]
+    fn test_str_matches_multiple_wildcards() {
+        crate::assert_str_matches!("a 1 b 2 c", "a ... b ... c");
+    }
+
+    #[test]
+    fn test_str_matches_multiline() {
+        crate::assert_str_matches!("line1\nline2 xyz\nline3", "line1\nline2 ...\nline3");
+    }
+
+    #[test]
+    fn test_str_matches_multiline_with_whitespace() {
+        crate::assert_str_matches!(
+            "  line1  \n  line2 xyz  \n  line3  ",
+            "line1\nline2 ...\nline3"
+        );
+    }
+
+    #[test]
+    fn test_str_matches_empty_wildcard() {
+        // Wildcard can match empty string
+        crate::assert_str_matches!("foobar", "foo...bar");
+    }
+
+    #[test]
+    #[should_panic(expected = "string mismatch")]
+    fn test_str_matches_mismatch_panics() {
+        crate::assert_str_matches!("foo", "bar");
+    }
+
+    #[test]
+    #[should_panic(expected = "string mismatch")]
+    fn test_str_matches_extra_line_panics() {
+        crate::assert_str_matches!("line1\nline2\nline3", "line1\nline3");
+    }
+
+    #[test]
+    #[should_panic(expected = "string mismatch")]
+    fn test_str_matches_missing_line_panics() {
+        crate::assert_str_matches!("line1\nline3", "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn test_match_line_with_wildcards_basic() {
+        // Exact match
+        assert!(super::match_line_with_wildcards("hello world", "hello world").is_some());
+        // Trailing wildcard
+        assert!(super::match_line_with_wildcards("hello world", "hello ...").is_some());
+        // Leading wildcard
+        assert!(super::match_line_with_wildcards("hello world", "... world").is_some());
+        // Just wildcard
+        assert!(super::match_line_with_wildcards("hello world", "...").is_some());
+        // Middle wildcard with content
+        assert!(super::match_line_with_wildcards("foo 123 bar", "foo ... bar").is_some());
+        // Middle wildcard with empty content (foobar matches foo...bar)
+        assert!(super::match_line_with_wildcards("foobar", "foo...bar").is_some());
+    }
+
+    #[test]
+    fn test_match_line_with_wildcards_captures() {
+        let captures = super::match_line_with_wildcards("foo 123 bar", "foo ... bar").unwrap();
+        assert_eq!(captures, vec!["123"]);
+
+        let captures = super::match_line_with_wildcards("a 1 b 2 c", "a ... b ... c").unwrap();
+        assert_eq!(captures, vec!["1", "2"]);
+
+        let captures = super::match_line_with_wildcards("prefix suffix", "prefix ...").unwrap();
+        assert_eq!(captures, vec!["suffix"]);
+
+        // Empty capture
+        let captures = super::match_line_with_wildcards("foobar", "foo...bar").unwrap();
+        assert!(captures.is_empty());
+    }
+
+    #[test]
+    fn test_match_line_with_wildcards_no_match() {
+        assert!(super::match_line_with_wildcards("hello world", "goodbye world").is_none());
+        assert!(super::match_line_with_wildcards("hello", "hello world").is_none());
+        assert!(super::match_line_with_wildcards("hello world", "hello wo").is_none());
+        // Pattern "hello ... world" requires something between the spaces
+        // "hello world" has only one space, so it doesn't match " world" at the right position
+        assert!(super::match_line_with_wildcards("hello world", "hello ... world").is_none());
     }
 }

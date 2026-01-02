@@ -2130,11 +2130,12 @@ mod tests {
     use crate::dataset::scanner::ColumnOrdering;
     use crate::index::vector::VectorIndexParams;
     use crate::{
+        assert_str_matches,
         dataset::{builder::DatasetBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams},
         session::Session,
         utils::test::{
-            assert_plan_node_equals, assert_string_matches, DatagenExt, FragmentCount,
-            FragmentRowCount, ThrottledStoreWrapper,
+            assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount,
+            ThrottledStoreWrapper,
         },
     };
     use arrow_array::types::Float32Type;
@@ -4000,7 +4001,7 @@ mod tests {
               row_id=true, row_addr=true, full_filter=--, refine_filter=--
             RepartitionExec: partitioning=RoundRobinBatch(...), input_partitions=1
               StreamingTableExec: partition_sizes=1, projection=[value, key]"
-        ).await.unwrap();
+        ).await;
     }
 
     #[tokio::test]
@@ -4047,7 +4048,7 @@ mod tests {
             LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
-        ).await.unwrap();
+        ).await;
     }
 
     #[tokio::test]
@@ -4094,7 +4095,7 @@ mod tests {
             LanceRead: uri=..., projection=[key], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--
           RepartitionExec...
             StreamingTableExec: partition_sizes=1, projection=[value, key]"
-        ).await.unwrap();
+        ).await;
     }
 
     #[tokio::test]
@@ -4250,12 +4251,17 @@ mod tests {
 
         // Also validate the full string structure with pattern matching
         let expected_pattern = "\
-MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
-  CoalescePartitionsExec...
-    HashJoinExec...
-      LanceRead...
-      StreamingTableExec: partition_sizes=1, projection=[id, name]";
-        assert_string_matches(&plan, expected_pattern).unwrap();
+MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep
+  CoalescePartitionsExec
+    ProjectionExec: expr=[...as __action]
+      ProjectionExec: expr=[...as __common_expr_1...
+        CoalesceBatchesExec...
+          HashJoinExec: mode=CollectLeft, join_type=Right, on=[(id@0, id@0)]...
+            CooperativeExec
+              LanceRead: uri=..., projection=[id], num_fragments=1...
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[id, name]";
+        assert_str_matches!(&plan, expected_pattern);
 
         // Test with explicit schema
         let source_schema = arrow_schema::Schema::from(dataset.schema());
@@ -4269,7 +4275,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         let verbose_plan = merge_insert_job.explain_plan(None, true).await.unwrap();
         assert!(verbose_plan.contains("MergeInsert"));
         // Verbose should also match the expected pattern
-        assert_string_matches(&verbose_plan, expected_pattern).unwrap();
+        assert_str_matches!(&verbose_plan, expected_pattern);
     }
 
     #[tokio::test]
@@ -4310,17 +4316,11 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             futures::stream::once(async { Ok(source_batch) }).boxed(),
         );
 
-        // Test analyze_plan. We enclose the analysis output string in brackets to make it easier
-        // to use assert_string_matches.  (That function requires a known string at the beginning
-        // and end.)
-        let mut analysis = String::from("[");
-        analysis.push_str(
-            &merge_insert_job
-                .analyze_plan(Box::pin(source_stream))
-                .await
-                .unwrap(),
-        );
-        analysis.push_str(&String::from("]"));
+        // Test analyze_plan
+        let analysis = merge_insert_job
+            .analyze_plan(Box::pin(source_stream))
+            .await
+            .unwrap();
 
         // Verify the analysis contains expected components
         assert!(analysis.contains("MergeInsert"));
@@ -4341,10 +4341,18 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
         );
 
         // Also validate the full string structure with pattern matching
-        let expected_pattern = "[...MergeInsert: elapsed=..., on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]
-    ...
-    StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=[]...]";
-        assert_string_matches(&analysis, expected_pattern).unwrap();
+        let expected_pattern = "\
+MergeInsert: elapsed=..., on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep, metrics=[...bytes_written=...num_deleted_rows=0, num_files_written=...num_inserted_rows=1, num_updated_rows=1]
+  CoalescePartitionsExec, elapsed=..., metrics=...
+    ProjectionExec: elapsed=..., expr=[...as __action]...
+      ProjectionExec: elapsed=..., expr=[...as __common_expr_1...
+        CoalesceBatchesExec: elapsed=...
+          HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right...
+            CooperativeExec, elapsed=...
+              LanceRead: elapsed=..., uri=..., projection=[id]...
+            RepartitionExec...
+              StreamingTableExec: partition_sizes=1, projection=[id, name], metrics=...";
+        assert_str_matches!(&analysis, expected_pattern);
         assert!(analysis.contains("bytes_written"));
         assert!(analysis.contains("num_files_written"));
         assert!(analysis.contains("elapsed_compute"));

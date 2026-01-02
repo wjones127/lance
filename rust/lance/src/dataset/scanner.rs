@@ -6725,7 +6725,8 @@ mod test {
         let mut scan = dataset.scan();
         plan(&mut scan)?;
         let exec_plan = scan.create_plan().await?;
-        assert_plan_node_equals(exec_plan, expected).await
+        assert_plan_node_equals(exec_plan, expected).await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -6761,8 +6762,7 @@ mod test {
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--",
         )
-        .await
-        .unwrap();
+        .await;
 
         scan.filter("s == ''").unwrap();
 
@@ -6774,8 +6774,7 @@ mod test {
   ProjectionExec: expr=[_rowid@1 as _rowid]
     LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=s = Utf8(\"\"), refine_filter=s = Utf8(\"\")",
         )
-        .await
-        .unwrap();
+        .await;
     }
 
     #[tokio::test]

@@ -122,7 +122,8 @@ impl SqlQuery {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::test::{assert_string_matches, DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::assert_str_matches;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -264,7 +265,7 @@ mod tests {
   "TableScan: foo projection=[x, y], full_filters=[foo.y >= Int32(100)]",
   "ProjectionExec: expr=[x@0 as x, y@1 as y]\n  CooperativeExec\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=10, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100)\n",
 ]], row_count: 2 }"#;
-        assert_string_matches(&plan, expected_pattern).unwrap();
+        assert_str_matches!(&plan, expected_pattern);
     }
 
     #[tokio::test]
@@ -299,7 +300,7 @@ mod tests {
 [
   "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
-        assert_string_matches(&plan, expected_pattern).unwrap();
+        assert_str_matches!(&plan, expected_pattern);
     }
 
     #[tokio::test]
