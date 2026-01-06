@@ -31,6 +31,43 @@ use uuid::Uuid;
 
 use arrow_array::RecordBatchReader;
 
+/// Normalize a field path to create a valid index name.
+///
+/// Converts field names to a safe identifier format:
+/// - Replaces non-alphanumeric/underscore characters with `_`
+/// - Collapses consecutive underscores
+/// - Strips leading/trailing underscores
+/// - Joins nested path segments with `_`
+fn normalize_index_name(fields: &[&str]) -> String {
+    let normalized: String = fields
+        .iter()
+        .map(|field| {
+            field
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("_")
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+
+    // Handle edge case where everything is stripped (e.g., "---")
+    if normalized.is_empty() {
+        "index".to_string()
+    } else {
+        normalized
+    }
+}
+
 pub struct CreateIndexBuilder<'a> {
     dataset: &'a mut Dataset,
     columns: Vec<String>,
@@ -135,7 +172,24 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        let index_name = if let Some(name) = self.name.take() {
+            name
+        } else {
+            // Generate normalized default name with collision handling
+            let normalized_column = normalize_index_name(&names);
+            let base_name = format!("{normalized_column}_idx");
+            let mut candidate = base_name.clone();
+            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
+                                 // Find unique name by appending numeric suffix if needed
+            while indices
+                .iter()
+                .any(|idx| idx.name == candidate && idx.fields != [field.id])
+            {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        };
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
             if idx.fields == [field.id] && !self.replace {
                 return Err(Error::Index {
@@ -446,6 +500,90 @@ mod tests {
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_linalg::distance::MetricType;
     use std::sync::Arc;
+
+    #[test]
+    fn test_normalize_index_name() {
+        // Basic normalization - special chars become underscore
+        assert_eq!(normalize_index_name(&["user-id"]), "user_id");
+        assert_eq!(normalize_index_name(&["user:id"]), "user_id");
+        assert_eq!(normalize_index_name(&["user.id"]), "user_id");
+
+        // Nested paths - segments joined with underscore
+        assert_eq!(
+            normalize_index_name(&["meta-data", "user-id"]),
+            "meta_data_user_id"
+        );
+
+        // Consecutive special chars collapse to single underscore
+        assert_eq!(normalize_index_name(&["user--id"]), "user_id");
+        assert_eq!(normalize_index_name(&["a..b"]), "a_b");
+
+        // Leading/trailing special chars are stripped
+        assert_eq!(normalize_index_name(&["--test--"]), "test");
+        assert_eq!(normalize_index_name(&["-user-id-"]), "user_id");
+
+        // Normal columns unchanged
+        assert_eq!(normalize_index_name(&["userId"]), "userId");
+        assert_eq!(normalize_index_name(&["user_id"]), "user_id");
+
+        // Empty input
+        assert_eq!(normalize_index_name(&[]), "index");
+
+        // All special chars -> fallback to "index"
+        assert_eq!(normalize_index_name(&["---"]), "index");
+
+        // Unicode alphanumeric preserved
+        assert_eq!(normalize_index_name(&["字段名"]), "字段名");
+        assert_eq!(normalize_index_name(&["字段-名"]), "字段_名");
+    }
+
+    #[tokio::test]
+    async fn test_index_name_collision_suffix() {
+        // When two columns normalize to the same default index name,
+        // the second index should get a numeric suffix.
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("user-id", DataType::Int32, false),
+            ArrowField::new("user:id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+
+        // Create index on first column - gets user_id_idx
+        CreateIndexBuilder::new(&mut dataset, &["user-id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "user_id_idx");
+
+        // Create index on second column - should get user_id_idx_2
+        CreateIndexBuilder::new(&mut dataset, &["user:id"], IndexType::BTree, &params)
+            .execute()
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let names: std::collections::HashSet<_> = indices.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains("user_id_idx"));
+        assert!(names.contains("user_id_idx_2"));
+    }
 
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
