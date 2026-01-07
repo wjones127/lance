@@ -429,8 +429,9 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     #[instrument(skip_all)]
-    async fn execute(mut self) -> Result<()> {
+    async fn execute(mut self) -> Result<IndexMetadata> {
         let new_idx = self.execute_uncommitted().await?;
+        let index_uuid = new_idx.uuid;
         let transaction = Transaction::new(
             new_idx.dataset_version,
             Operation::CreateIndex {
@@ -444,13 +445,23 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        Ok(())
+        // Fetch the committed index metadata from the dataset.
+        // This ensures we return the version that may have been modified by the commit.
+        let indices = self.dataset.load_indices().await?;
+        indices
+            .iter()
+            .find(|idx| idx.uuid == index_uuid)
+            .cloned()
+            .ok_or_else(|| Error::Internal {
+                message: format!("Index with UUID {} not found after commit", index_uuid),
+                location: location!(),
+            })
     }
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
-    type Output = Result<()>;
-    type IntoFuture = BoxFuture<'a, Result<()>>;
+    type Output = Result<IndexMetadata>;
+    type IntoFuture = BoxFuture<'a, Result<IndexMetadata>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
@@ -507,26 +518,22 @@ mod tests {
         let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
 
         // Create index on column with hyphen
-        CreateIndexBuilder::new(&mut dataset, &["user-id"], IndexType::BTree, &params)
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["user-id"], IndexType::BTree, &params)
             .execute()
             .await
             .unwrap();
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "user-id_idx");
+        assert_eq!(idx1.name, "user-id_idx");
 
         // Create index on column with colon
-        CreateIndexBuilder::new(&mut dataset, &["user:id"], IndexType::BTree, &params)
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["user:id"], IndexType::BTree, &params)
             .execute()
             .await
             .unwrap();
+        assert_eq!(idx2.name, "user:id_idx");
 
+        // Verify both indices exist
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2);
-        let names: std::collections::HashSet<_> = indices.iter().map(|i| i.name.as_str()).collect();
-        assert!(names.contains("user-id_idx"));
-        assert!(names.contains("user:id_idx"));
     }
 
     #[tokio::test]
@@ -543,28 +550,24 @@ mod tests {
 
         // (a) Explicit name on first index, default on second that would collide
         // Create index on "a" with explicit name "b_idx"
-        CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
             .name("b_idx".to_string())
             .execute()
             .await
             .unwrap();
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "b_idx");
+        assert_eq!(idx1.name, "b_idx");
 
         // Create index on "b" with default name - would be "b_idx" but that's taken
         // so it should get "b_idx_2"
-        CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+        let idx2 = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
             .execute()
             .await
             .unwrap();
+        assert_eq!(idx2.name, "b_idx_2");
 
+        // Verify both indices exist
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 2);
-        let names: std::collections::HashSet<_> = indices.iter().map(|i| i.name.as_str()).collect();
-        assert!(names.contains("b_idx"));
-        assert!(names.contains("b_idx_2"));
     }
 
     #[tokio::test]
@@ -581,14 +584,11 @@ mod tests {
 
         // (b) Default name on first, explicit same name on second should error
         // Create index on "a" with default name "a_idx"
-        CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+        let idx1 = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
             .execute()
             .await
             .unwrap();
-
-        let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].name, "a_idx");
+        assert_eq!(idx1.name, "a_idx");
 
         // Try to create index on "b" with explicit name "a_idx" - should error
         let result = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)

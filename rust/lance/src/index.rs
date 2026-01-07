@@ -602,7 +602,7 @@ impl DatasetIndexExt for Dataset {
             builder = builder.name(name);
         }
 
-        builder.replace(replace).await
+        builder.replace(replace).await.map(|_| ())
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {
