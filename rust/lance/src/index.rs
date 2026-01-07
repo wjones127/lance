@@ -594,7 +594,7 @@ impl DatasetIndexExt for Dataset {
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()> {
+    ) -> Result<IndexMetadata> {
         // Use the builder pattern with default train=true for backward compatibility
         let mut builder = self.create_index_builder(columns, index_type, params);
 
@@ -602,7 +602,7 @@ impl DatasetIndexExt for Dataset {
             builder = builder.name(name);
         }
 
-        builder.replace(replace).await.map(|_| ())
+        builder.replace(replace).await
     }
 
     async fn drop_index(&mut self, name: &str) -> Result<()> {

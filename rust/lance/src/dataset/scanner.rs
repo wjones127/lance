@@ -4146,7 +4146,8 @@ pub mod test_dataset {
                     &params,
                     true,
                 )
-                .await
+                .await?;
+            Ok(())
         }
 
         pub async fn make_scalar_index(&mut self) -> Result<()> {
@@ -4158,14 +4159,16 @@ pub mod test_dataset {
                     &ScalarIndexParams::default(),
                     true,
                 )
-                .await
+                .await?;
+            Ok(())
         }
 
         pub async fn make_fts_index(&mut self) -> Result<()> {
             let params = InvertedIndexParams::default().with_position(true);
             self.dataset
                 .create_index(&["s"], IndexType::Inverted, None, &params, true)
-                .await
+                .await?;
+            Ok(())
         }
 
         pub async fn append_new_data(&mut self) -> Result<()> {
