@@ -765,16 +765,17 @@ public class Dataset implements Closeable {
    * @param name the name of the created index
    * @param params index params
    * @param replace whether to replace the existing index
+   * @return the metadata of the created index
    * @deprecated please use {@link Dataset#createIndex(IndexOptions)} instead.
    */
   @Deprecated
-  public void createIndex(
+  public Index createIndex(
       List<String> columns,
       IndexType indexType,
       Optional<String> name,
       IndexParams params,
       boolean replace) {
-    createIndex(
+    return createIndex(
         IndexOptions.builder(columns, indexType, params)
             .replace(replace)
             .withIndexName(name.orElse(null))
@@ -785,11 +786,12 @@ public class Dataset implements Closeable {
    * Creates a new index on the dataset.
    *
    * @param options options for building index
+   * @return the metadata of the created index
    */
-  public void createIndex(IndexOptions options) {
+  public Index createIndex(IndexOptions options) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeCreateIndex(
+      return nativeCreateIndex(
           options.getColumns(),
           options.getIndexType().ordinal(),
           options.getIndexName(),
@@ -802,7 +804,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native void nativeCreateIndex(
+  private native Index nativeCreateIndex(
       List<String> columns,
       int indexTypeCode,
       Optional<String> name,
