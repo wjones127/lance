@@ -18,5 +18,5 @@ pub(crate) mod test_utils;
 
 pub use clustering::Clustering;
 
-type Error = ArrowError;
+use lance_core::Error;
 pub type Result<T> = std::result::Result<T, Error>;

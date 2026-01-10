@@ -97,9 +97,16 @@ impl TryFrom<&str> for DistanceType {
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
             "hamming" => Ok(Self::Hamming),
-            _ => Err(ArrowError::InvalidArgumentError(format!(
-                "Metric type '{s}' is not supported"
-            ))),
+            _ => {
+                let valid_distance_types = vec!["l2", "euclidean", "cosine", "dot", "hamming"];
+                let suggestion =
+                    lance_core::levenshtein::find_best_suggestion(s, &valid_distance_types);
+                let mut error_msg = format!("Metric type '{s}' is not supported");
+                if let Some(suggestion) = suggestion {
+                    error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
+                }
+                Err(ArrowError::InvalidArgumentError(error_msg))
+            }
         }
     }
 }
