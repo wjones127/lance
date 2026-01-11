@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::{write_fragments_internal, CommitBuilder, WriteParams, WriteStats};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -234,6 +234,8 @@ impl UpdateBuilder {
 pub struct UpdateResult {
     pub new_dataset: Arc<Dataset>,
     pub rows_updated: u64,
+    /// Statistics about the write operation.
+    pub stats: WriteStats,
 }
 
 #[derive(Debug)]
@@ -243,6 +245,7 @@ pub struct UpdateData {
     new_fragments: Vec<Fragment>,
     affected_rows: RowAddrTreeMap,
     num_updated_rows: u64,
+    stats: WriteStats,
 }
 
 #[derive(Debug, Clone)]
@@ -358,12 +361,18 @@ impl UpdateJob {
             .map(|f| f.physical_rows.unwrap() as u64)
             .sum::<u64>();
 
+        let mut stats = WriteStats::from_fragments(&new_fragments);
+        stats.rows_updated = num_updated_rows;
+        // Update uses rewrite rows mode, so rows_written = rows_updated
+        stats.rows_written = 0;
+
         Ok(UpdateData {
             removed_fragment_ids,
             old_fragments,
             new_fragments,
             affected_rows,
             num_updated_rows,
+            stats,
         })
     }
 
@@ -404,6 +413,7 @@ impl UpdateJob {
         Ok(UpdateResult {
             new_dataset: Arc::new(new_dataset),
             rows_updated: update_data.num_updated_rows,
+            stats: update_data.stats,
         })
     }
 
@@ -443,10 +453,10 @@ impl UpdateJob {
                     let fragment_id = fragment.id();
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
-                            Ok(Some(new_fragment)) => {
+                            Ok((Some(new_fragment), _)) => {
                                 Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
-                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                            Ok((None, _)) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
                         }
                     } else {
@@ -614,6 +624,14 @@ mod tests {
             .await
             .unwrap();
 
+        // Verify stats
+        assert_eq!(update_result.rows_updated, 30);
+        assert_eq!(update_result.stats.rows_updated, 30);
+        assert_eq!(update_result.stats.files_written, 1); // One new fragment
+        assert!(update_result.stats.bytes_written > 0);
+        assert_eq!(update_result.stats.rows_written, 0); // Update rewrites, not insert
+        assert_eq!(update_result.stats.rows_deleted, 0);
+
         let dataset = update_result.new_dataset;
         let actual_batches = dataset
             .scan()
@@ -764,7 +782,8 @@ mod tests {
             })
             .execute(vec![initial_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         let barrier = Arc::new(Barrier::new(concurrency as usize));
         let mut handles = Vec::new();
@@ -858,7 +877,8 @@ mod tests {
             })
             .execute(vec![initial_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         let barrier = Arc::new(Barrier::new(concurrency as usize));
         let mut handles = Vec::new();
@@ -1264,7 +1284,8 @@ mod tests {
             })
             .execute(vec![new_batch])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         assert_eq!(dataset.get_fragments().len(), 3);
 

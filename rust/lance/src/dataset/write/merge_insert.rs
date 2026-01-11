@@ -25,7 +25,7 @@ use assign_action::merge_insert_action;
 use inserted_rows::KeyExistenceFilter;
 
 use super::retry::{execute_with_retry, RetryConfig, RetryExecutor};
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::{write_fragments_internal, CommitBuilder, WriteParams, WriteStats};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -1713,10 +1713,10 @@ impl MergeInsertJob {
                     let fragment_id = fragment.id();
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
-                            Ok(Some(new_fragment)) => {
+                            Ok((Some(new_fragment), _)) => {
                                 Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                             }
-                            Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                            Ok((None, _)) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
                         }
                     } else {
@@ -1853,6 +1853,19 @@ pub struct MergeStats {
     pub num_files_written: u64,
     /// Number of duplicate source rows skipped (when SourceDedupeBehavior::FirstSeen)
     pub num_skipped_duplicates: u64,
+}
+
+impl MergeStats {
+    /// Returns write statistics in the common WriteStats format.
+    pub fn write_stats(&self) -> WriteStats {
+        WriteStats {
+            rows_written: self.num_inserted_rows,
+            rows_updated: self.num_updated_rows,
+            rows_deleted: self.num_deleted_rows,
+            files_written: self.num_files_written,
+            bytes_written: self.bytes_written,
+        }
+    }
 }
 
 pub struct UncommittedMergeInsert {
@@ -2334,6 +2347,14 @@ mod tests {
         assert_eq!(merge_stats.num_inserted_rows, stats[0]);
         assert_eq!(merge_stats.num_updated_rows, stats[1]);
         assert_eq!(merge_stats.num_deleted_rows, stats[2]);
+
+        // Verify write_stats() accessor returns consistent values
+        let write_stats = merge_stats.write_stats();
+        assert_eq!(write_stats.rows_written, merge_stats.num_inserted_rows);
+        assert_eq!(write_stats.rows_updated, merge_stats.num_updated_rows);
+        assert_eq!(write_stats.rows_deleted, merge_stats.num_deleted_rows);
+        assert_eq!(write_stats.files_written, merge_stats.num_files_written);
+        assert_eq!(write_stats.bytes_written, merge_stats.bytes_written);
 
         merged_dataset
     }
@@ -3553,7 +3574,8 @@ mod tests {
             })
             .execute(vec![initial_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         // do merge inserts in parallel based on the concurrency. Each will open the dataset,
         // signal they have opened, and then wait for a signal to proceed. Once the signal
@@ -3681,7 +3703,8 @@ mod tests {
             })
             .execute(vec![initial_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Start one merge insert, but don't commit it yet.
@@ -4006,7 +4029,8 @@ mod tests {
             })
             .execute(vec![initial_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         // Each merge insert will update one row. Combined, they should delete
         // all rows in the first fragment, and it should be dropped.
@@ -4360,7 +4384,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![initial])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Source with overlapping key 1
@@ -4441,7 +4466,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![initial])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Both jobs update/insert the same key 2
@@ -4530,7 +4556,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![initial])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Both jobs try to INSERT the same NEW key id=100 (doesn't exist in initial data)
@@ -4620,7 +4647,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![initial])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Create merge insert job based on version 1
@@ -4701,7 +4729,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![initial])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Create merge insert job based on version 1

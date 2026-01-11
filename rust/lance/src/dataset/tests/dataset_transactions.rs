@@ -161,7 +161,8 @@ async fn test_session_store_registry() {
         .with_params(&write_params)
         .execute(vec![batch.clone()])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     // Assert there is one active store.
     assert_eq!(registry.active_stores().len(), 1);
@@ -172,7 +173,8 @@ async fn test_session_store_registry() {
         .with_params(&write_params)
         .execute(vec![batch.clone()])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
         Arc::as_ptr(&dataset.object_store().inner),
@@ -192,7 +194,8 @@ async fn test_session_store_registry() {
         .with_params(&write_params2)
         .execute(vec![batch.clone()])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
         Arc::as_ptr(&dataset.object_store().inner),

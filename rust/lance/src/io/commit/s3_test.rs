@@ -330,7 +330,8 @@ async fn test_ddb_open_iops() {
         })
         .execute(vec![data.clone()])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
     let io_stats = dataset.object_store().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);

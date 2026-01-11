@@ -2417,7 +2417,8 @@ mod tests {
             })
             .execute(vec![new_data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         dataset
             .optimize_indices(&OptimizeOptions::merge(1))
             .await

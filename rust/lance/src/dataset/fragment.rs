@@ -1792,13 +1792,18 @@ impl FileFragment {
             return Ok(Some(self));
         }
 
-        self.write_deletions(deletion_vector).await
+        let (fragment, _bytes_written) = self.write_deletions(deletion_vector).await?;
+        Ok(fragment)
     }
 
+    /// Extend the deletion vector with new deletions.
+    ///
+    /// Returns `(Some(fragment), bytes_written)` if the fragment still has rows,
+    /// or `(None, 0)` if all rows are deleted.
     pub async fn extend_deletions(
         self,
         new_deletions: impl IntoIterator<Item = u32>,
-    ) -> Result<Option<Self>> {
+    ) -> Result<(Option<Self>, u64)> {
         let mut deletion_vector = self
             .get_deletion_vector()
             .await?
@@ -1811,12 +1816,15 @@ impl FileFragment {
         self.write_deletions(deletion_vector).await
     }
 
-    async fn write_deletions(mut self, deletion_vector: DeletionVector) -> Result<Option<Self>> {
+    async fn write_deletions(
+        mut self,
+        deletion_vector: DeletionVector,
+    ) -> Result<(Option<Self>, u64)> {
         let physical_rows = self.physical_rows().await?;
         if deletion_vector.len() == physical_rows
             && deletion_vector.contains_range(0..physical_rows as u32)
         {
-            return Ok(None);
+            return Ok((None, 0));
         } else if deletion_vector.len() >= physical_rows {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
@@ -1835,7 +1843,7 @@ impl FileFragment {
             });
         }
 
-        self.metadata.deletion_file = write_deletion_file(
+        let (deletion_file, bytes_written) = write_deletion_file(
             &self.dataset.base,
             self.metadata.id,
             self.dataset.version().version,
@@ -1843,8 +1851,9 @@ impl FileFragment {
             self.dataset.object_store(),
         )
         .await?;
+        self.metadata.deletion_file = deletion_file;
 
-        Ok(Some(self))
+        Ok((Some(self), bytes_written))
     }
 }
 
@@ -3924,7 +3933,8 @@ mod tests {
             .with_params(&write_params)
             .execute(vec![batch])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Assert file is small (< 4300 bytes)

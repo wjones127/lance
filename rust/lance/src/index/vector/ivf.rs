@@ -2846,7 +2846,8 @@ mod tests {
         let mut dataset = InsertBuilder::new("memory://")
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         // Create index
         dataset
@@ -2887,7 +2888,8 @@ mod tests {
         let mut dataset = InsertBuilder::new("memory://")
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         // Create index
         let index_params = VectorIndexParams::with_ivf_pq_params(
@@ -2931,7 +2933,8 @@ mod tests {
             })
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         check_index(&dataset, num_non_null, dims).await;
 
         // Optimize the index

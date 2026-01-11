@@ -83,10 +83,10 @@ pub(super) async fn apply_deletions(
                 let fragment_id = fragment.id();
                 if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                     match fragment.extend_deletions(*bitmap).await {
-                        Ok(Some(new_fragment)) => {
+                        Ok((Some(new_fragment), _)) => {
                             Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
                         }
-                        Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
+                        Ok((None, _)) => Ok(FragmentChange::Removed(fragment_id as u64)),
                         Err(e) => Err(e),
                     }
                 } else {

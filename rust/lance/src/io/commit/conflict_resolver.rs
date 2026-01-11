@@ -1516,7 +1516,7 @@ impl<'a> TransactionRebase<'a> {
                         }
                     }
 
-                    let new_deletion_file = write_deletion_file(
+                    let (new_deletion_file, _bytes_written) = write_deletion_file(
                         &dataset.base,
                         *fragment_id,
                         dataset.manifest.version,
@@ -1798,12 +1798,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+        let result = InsertBuilder::new("memory://")
             .with_params(&write_params)
             .execute(vec![data])
             .await
             .unwrap();
-        dataset
+        result.dataset
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters
@@ -1944,7 +1944,7 @@ mod tests {
 
         current_deletions.extend(delete_rows.iter().copied());
 
-        fragment.deletion_file = write_deletion_file(
+        let (deletion_file, _bytes_written) = write_deletion_file(
             &dataset.base,
             fragment.id,
             dataset.manifest.version,
@@ -1953,6 +1953,7 @@ mod tests {
         )
         .await
         .unwrap();
+        fragment.deletion_file = deletion_file;
 
         let deletion_file = fragment.deletion_file.as_ref().unwrap();
         let key = DeletionFileKey {

@@ -124,11 +124,11 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
-pub use write::update::{UpdateBuilder, UpdateJob};
+pub use write::update::{UpdateBuilder, UpdateJob, UpdateResult};
 #[allow(deprecated)]
 pub use write::{
-    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder,
-    WriteDestination, WriteMode, WriteParams,
+    write_fragments, AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, InsertBuilder,
+    InsertResult, WriteDestination, WriteMode, WriteParams, WriteStats,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -793,8 +793,11 @@ impl Dataset {
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        Box::pin(builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>))
-            .await
+        let result = Box::pin(
+            builder.execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>),
+        )
+        .await?;
+        Ok(result.dataset)
     }
 
     /// Write into a namespace-managed table with automatic credential vending.
@@ -969,12 +972,12 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
-        let new_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
+        let result = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
             .with_params(&write_params)
             .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
             .await?;
 
-        *self = new_dataset;
+        *self = result.dataset;
 
         Ok(())
     }

@@ -544,7 +544,8 @@ mod tests {
             })
             .execute(vec![batch])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         let io_stats = dataset.object_store().io_stats_incremental();
@@ -624,7 +625,8 @@ mod tests {
             .with_params(&write_params)
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         dataset.object_store().io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
@@ -681,7 +683,8 @@ mod tests {
             .with_params(&write_params)
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let original_dataset = Arc::new(dataset.clone());
 
         // Create 3 other transactions that happen concurrently.
@@ -741,7 +744,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://test")
             .execute(vec![batch])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
         let dataset = Arc::new(dataset);
 
         // Attempting to commit empty gives error

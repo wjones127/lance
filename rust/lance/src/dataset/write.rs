@@ -59,8 +59,40 @@ mod retry;
 pub mod update;
 
 pub use commit::CommitBuilder;
-pub use delete::DeleteBuilder;
-pub use insert::InsertBuilder;
+pub use delete::{DeleteBuilder, DeleteResult};
+pub use insert::{InsertBuilder, InsertResult};
+
+/// Statistics for write operations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WriteStats {
+    /// Number of rows written (inserted).
+    pub rows_written: u64,
+    /// Number of rows updated.
+    pub rows_updated: u64,
+    /// Number of rows deleted.
+    pub rows_deleted: u64,
+    /// Number of files written.
+    pub files_written: u64,
+    /// Total bytes written to storage.
+    pub bytes_written: u64,
+}
+
+impl WriteStats {
+    /// Calculate write stats from newly written fragments.
+    pub(crate) fn from_fragments(fragments: &[Fragment]) -> Self {
+        let mut stats = Self::default();
+        for fragment in fragments {
+            stats.rows_written += fragment.physical_rows.unwrap_or(0) as u64;
+            for data_file in &fragment.files {
+                if let Some(size) = data_file.file_size_bytes.get() {
+                    stats.bytes_written += u64::from(size);
+                }
+                stats.files_written += 1;
+            }
+        }
+        stats
+    }
+}
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]

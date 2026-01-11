@@ -1961,7 +1961,8 @@ mod tests {
                     })
                     .execute(new_data)
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .dataset;
 
             dataset
                 .optimize_indices(&OptimizeOptions::new().index_names(vec![

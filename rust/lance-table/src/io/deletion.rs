@@ -59,17 +59,17 @@ pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFil
 
 /// Write a deletion file for a fragment for a given deletion vector.
 ///
-/// Returns the deletion file if one was written. If no deletions were present,
-/// returns `Ok(None)`.
+/// Returns a tuple of (deletion_file, bytes_written). If no deletions were present,
+/// returns `Ok((None, 0))`.
 pub async fn write_deletion_file(
     base: &Path,
     fragment_id: u64,
     read_version: u64,
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
-) -> Result<Option<DeletionFile>> {
-    let deletion_file = match removed_rows {
-        DeletionVector::NoDeletions => None,
+) -> Result<(Option<DeletionFile>, u64)> {
+    let (deletion_file, bytes_written) = match removed_rows {
+        DeletionVector::NoDeletions => (None, 0),
         DeletionVector::Set(set) => {
             let id = rand::rng().random::<u64>();
             let deletion_file = DeletionFile {
@@ -101,11 +101,12 @@ pub async fn write_deletion_file(
                 // Drop writer so out is no longer borrowed.
             }
 
+            let bytes_written = out.len() as u64;
             object_store.put(&path, &out).await?;
 
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
-            Some(deletion_file)
+            (Some(deletion_file), bytes_written)
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::rng().random::<u64>();
@@ -121,14 +122,15 @@ pub async fn write_deletion_file(
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
 
+            let bytes_written = out.len() as u64;
             object_store.put(&path, &out).await?;
 
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
 
-            Some(deletion_file)
+            (Some(deletion_file), bytes_written)
         }
     };
-    Ok(deletion_file)
+    Ok((deletion_file, bytes_written))
 }
 
 #[instrument(
@@ -235,10 +237,11 @@ mod test {
         let (object_store, path) = ObjectStore::from_uri("memory:///no_deletion")
             .await
             .unwrap();
-        let file = write_deletion_file(&path, 0, 0, &dv, &object_store)
+        let (file, bytes_written) = write_deletion_file(&path, 0, 0, &dv, &object_store)
             .await
             .unwrap();
         assert!(file.is_none());
+        assert_eq!(bytes_written, 0);
     }
 
     #[tokio::test]
@@ -250,9 +253,10 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/write");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let (file, bytes_written) =
+            write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+                .await
+                .unwrap();
 
         assert!(matches!(
             file,
@@ -261,6 +265,7 @@ mod test {
                 ..
             })
         ));
+        assert!(bytes_written > 0);
 
         let file = file.unwrap();
         assert_eq!(file.read_version, read_version);
@@ -304,9 +309,10 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/bitmap");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let (file, bytes_written) =
+            write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+                .await
+                .unwrap();
 
         assert!(matches!(
             file,
@@ -315,6 +321,7 @@ mod test {
                 ..
             })
         ));
+        assert!(bytes_written > 0);
 
         let file = file.unwrap();
         assert_eq!(file.read_version, read_version);
@@ -346,7 +353,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/roundtrip");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let (file, _) = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 
@@ -365,7 +372,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/bitmap");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let (file, _) = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 

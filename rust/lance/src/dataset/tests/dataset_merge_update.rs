@@ -1058,14 +1058,16 @@ async fn test_replace_dataset() {
     let mut ds = InsertBuilder::new(&test_uri)
         .execute(vec![data1])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     ds.object_store().remove_dir_all(test_path).await.unwrap();
 
     let ds2 = InsertBuilder::new(&test_uri)
         .execute(vec![data2.clone()])
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     ds.checkout_latest().await.unwrap();
     let roundtripped = ds.scan().try_into_batch().await.unwrap();
@@ -1121,7 +1123,8 @@ async fn test_insert_skip_auto_cleanup() {
         .with_params(&write_params1)
         .execute_stream(data1)
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     assert_eq!(dataset2.version().version, 2);
 
@@ -1137,7 +1140,8 @@ async fn test_insert_skip_auto_cleanup() {
         .with_params(&write_params1)
         .execute_stream(data1_extra)
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     assert_eq!(dataset2_extra.version().version, 3);
 
@@ -1170,7 +1174,8 @@ async fn test_insert_skip_auto_cleanup() {
         .with_params(&write_params2)
         .execute_stream(data2)
         .await
-        .unwrap();
+        .unwrap()
+        .dataset;
 
     assert_eq!(dataset3.version().version, 4);
 

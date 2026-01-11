@@ -540,7 +540,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         let training_data = maybe_sample_training_data(&dataset, "mv", 1000)
             .await
@@ -568,7 +569,8 @@ mod tests {
         let dataset = InsertBuilder::new("memory://")
             .execute(vec![data])
             .await
-            .unwrap();
+            .unwrap()
+            .dataset;
 
         let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows)
             .await

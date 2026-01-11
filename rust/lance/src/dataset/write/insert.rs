@@ -32,6 +32,17 @@ use super::resolve_commit_handler;
 use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
+use super::WriteStats;
+
+/// Result of an insert operation.
+#[derive(Debug, Clone)]
+pub struct InsertResult {
+    /// The dataset after the insert.
+    pub dataset: Dataset,
+    /// Statistics about the write operation.
+    pub stats: WriteStats,
+}
+
 /// Insert or create a new dataset.
 ///
 /// There are different variants of `execute()` methods. Those with the `_stream`
@@ -65,15 +76,16 @@ impl<'a> InsertBuilder<'a> {
     /// Execute the insert operation with the given data.
     ///
     /// This writes the data fragments and commits them into the dataset.
-    pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        Self::do_commit(&context, transaction).await
+    pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<InsertResult> {
+        let (transaction, context, stats) = self.write_uncommitted_impl(data).await?;
+        let dataset = Self::do_commit(&context, transaction).await?;
+        Ok(InsertResult { dataset, stats })
     }
 
     /// Execute the insert operation with the given stream.
     ///
     /// This writes the data fragments and commits them into the dataset.
-    pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
+    pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<InsertResult> {
         let (stream, schema) = source.into_stream_and_schema().await?;
         self.execute_stream_impl(stream, schema).await
     }
@@ -82,9 +94,11 @@ impl<'a> InsertBuilder<'a> {
         &self,
         stream: SendableRecordBatchStream,
         schema: Schema,
-    ) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        Self::do_commit(&context, transaction).await
+    ) -> Result<InsertResult> {
+        let (transaction, context, stats) =
+            self.write_uncommitted_stream_impl(stream, schema).await?;
+        let dataset = Self::do_commit(&context, transaction).await?;
+        Ok(InsertResult { dataset, stats })
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -112,7 +126,7 @@ impl<'a> InsertBuilder<'a> {
     /// # }
     /// ```
     pub async fn execute_uncommitted(&self, data: Vec<RecordBatch>) -> Result<Transaction> {
-        self.write_uncommitted_impl(data).await.map(|(t, _)| t)
+        self.write_uncommitted_impl(data).await.map(|(t, _, _)| t)
     }
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
@@ -138,7 +152,7 @@ impl<'a> InsertBuilder<'a> {
     async fn write_uncommitted_impl(
         &self,
         data: Vec<RecordBatch>,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
+    ) -> Result<(Transaction, WriteContext<'_>, WriteStats)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
         // and write in parallel. https://github.com/lance-format/lance/issues/1980
         if data.is_empty() {
@@ -169,7 +183,7 @@ impl<'a> InsertBuilder<'a> {
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
         let (stream, schema) = source.into_stream_and_schema().await?;
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        let (transaction, _, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Ok(transaction)
     }
 
@@ -177,7 +191,7 @@ impl<'a> InsertBuilder<'a> {
         &self,
         stream: SendableRecordBatchStream,
         schema: Schema,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
+    ) -> Result<(Transaction, WriteContext<'_>, WriteStats)> {
         let mut context = self.resolve_context().await?;
 
         info!(
@@ -204,9 +218,10 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
+        let stats = WriteStats::from_fragments(&written_fragments);
         let transaction = Self::build_transaction(schema, written_fragments, &context)?;
 
-        Ok((transaction, context))
+        Ok((transaction, context, stats))
     }
 
     fn build_transaction(
@@ -444,7 +459,7 @@ mod test {
     #[tokio::test]
     async fn test_pass_session() {
         let session = Arc::new(Session::new(0, 0, Default::default()));
-        let dataset = InsertBuilder::new("memory://")
+        let result = InsertBuilder::new("memory://")
             .with_params(&WriteParams {
                 session: Some(session.clone()),
                 ..Default::default()
@@ -456,7 +471,10 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(Arc::as_ptr(&dataset.session()), Arc::as_ptr(&session));
+        assert_eq!(
+            Arc::as_ptr(&result.dataset.session()),
+            Arc::as_ptr(&session)
+        );
     }
 
     #[tokio::test]
@@ -473,13 +491,14 @@ mod test {
             vec![Arc::new(StructArray::new_empty_fields(1, None))],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+        let result = InsertBuilder::new("memory://")
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await
             .unwrap();
 
         assert_eq!(
-            dataset
+            result
+                .dataset
                 .count_rows(Some("empties IS NOT NULL".to_string()))
                 .await
                 .unwrap(),
@@ -493,7 +512,7 @@ mod test {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
 
-        let dataset = InsertBuilder::new("memory://blob-version-guard")
+        let result = InsertBuilder::new("memory://blob-version-guard")
             .execute_stream(RecordBatchIterator::new(
                 vec![Ok(batch.clone())],
                 schema.clone(),
@@ -501,7 +520,7 @@ mod test {
             .await
             .unwrap();
 
-        let dataset = Arc::new(dataset);
+        let dataset = Arc::new(result.dataset);
         let params = WriteParams {
             mode: WriteMode::Overwrite,
             data_storage_version: Some(LanceFileVersion::V2_2),
@@ -514,5 +533,27 @@ mod test {
             .await;
 
         assert!(matches!(result, Err(Error::InvalidInput { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_insert_stats() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+
+        let result = InsertBuilder::new("memory://test_insert_stats")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+
+        // Verify stats
+        assert_eq!(result.stats.rows_written, 100);
+        assert_eq!(result.stats.files_written, 1);
+        assert!(result.stats.bytes_written > 0);
+        assert_eq!(result.stats.rows_updated, 0);
+        assert_eq!(result.stats.rows_deleted, 0);
     }
 }
