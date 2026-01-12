@@ -6,7 +6,8 @@ use std::ops::Range;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 
-use lance_core::Result;
+use lance_core::{Error, Result};
+use snafu::location;
 
 pub mod buffer;
 pub mod compression;
@@ -88,8 +89,21 @@ impl BufferScheduler {
         Self { data }
     }
 
-    fn satisfy_request(&self, req: Range<u64>) -> Bytes {
-        self.data.slice(req.start as usize..req.end as usize)
+    fn satisfy_request(&self, req: Range<u64>) -> Result<Bytes> {
+        let start = req.start as usize;
+        let end = req.end as usize;
+        if end > self.data.len() {
+            return Err(Error::io(
+                format!(
+                    "byte range {}..{} out of bounds for buffer of size {}",
+                    start,
+                    end,
+                    self.data.len()
+                ),
+                location!(),
+            ));
+        }
+        Ok(self.data.slice(start..end))
     }
 }
 
@@ -99,10 +113,12 @@ impl EncodingsIo for BufferScheduler {
         ranges: Vec<Range<u64>>,
         _priority: u64,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        std::future::ready(Ok(ranges
-            .into_iter()
-            .map(|range| self.satisfy_request(range))
-            .collect::<Vec<_>>()))
+        std::future::ready(
+            ranges
+                .into_iter()
+                .map(|range| self.satisfy_request(range))
+                .collect::<Result<Vec<_>>>(),
+        )
         .boxed()
     }
 }
