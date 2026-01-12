@@ -53,6 +53,13 @@ pub const VECTOR_INDEX_VERSION: u32 = 1;
 pub const MAX_PARTITION_SIZE_FACTOR: usize = 4;
 pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
 
+/// Minimum number of vectors required to train a vector index.
+/// If fewer vectors are available, an empty index will be created instead.
+pub const MIN_VECTORS_FOR_TRAINING: usize = 256;
+
+/// Number of vectors per IVF partition used when calculating automatic partition count.
+pub const VECTORS_PER_PARTITION: usize = 256;
+
 pub mod pb {
     #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));

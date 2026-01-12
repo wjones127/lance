@@ -4632,6 +4632,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             ),
         ]));
 
+        // Need >= 256 total rows for vector index to be trained (not empty)
         let mut dataset = lance_datagen::gen_batch()
             .col("key", array::step_custom::<UInt32Type>(1, 1))
             .col("value", array::step_custom::<UInt32Type>(10, 10))
@@ -4647,9 +4648,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             )
             .into_ram_dataset_with_params(
                 FragmentCount::from(2),
-                FragmentRowCount::from(3),
+                FragmentRowCount::from(150),
                 Some(WriteParams {
-                    max_rows_per_file: 3,
+                    max_rows_per_file: 150,
                     enable_stable_row_ids: true,
                     ..Default::default()
                 }),
@@ -4746,6 +4747,7 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
 
     #[tokio::test]
     async fn test_sub_schema_upsert_fragment_bitmap() {
+        // Need >= 256 total rows for vector index to be trained (not empty)
         let mut dataset = lance_datagen::gen_batch()
             .col("key", array::step_custom::<UInt32Type>(1, 1))
             .col("value", array::step_custom::<UInt32Type>(10, 10))
@@ -4761,9 +4763,9 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             )
             .into_ram_dataset_with_params(
                 FragmentCount::from(2),
-                FragmentRowCount::from(3),
+                FragmentRowCount::from(150),
                 Some(WriteParams {
-                    max_rows_per_file: 3,
+                    max_rows_per_file: 150,
                     enable_stable_row_ids: true,
                     ..Default::default()
                 }),
@@ -4827,7 +4829,8 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
             ),
         ]));
 
-        let upsert_keys = UInt32Array::from(vec![2, 5]);
+        // Keys 5 is in fragment 0, key 160 is in fragment 1 - ensure both fragments are updated
+        let upsert_keys = UInt32Array::from(vec![5, 160]);
         let upsert_vecs = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0]),
             4,

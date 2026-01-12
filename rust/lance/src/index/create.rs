@@ -21,7 +21,9 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams, LANCE_SCALAR_INDEX},
 };
-use lance_index::{scalar::CreatedIndex, IndexParams, IndexType, VECTOR_INDEX_VERSION};
+use lance_index::{
+    scalar::CreatedIndex, IndexParams, IndexType, MIN_VECTORS_FOR_TRAINING, VECTOR_INDEX_VERSION,
+};
 use lance_table::format::IndexMetadata;
 use snafu::location;
 use std::{future::IntoFuture, sync::Arc};
@@ -163,6 +165,8 @@ impl<'a> CreateIndexBuilder<'a> {
             })?,
             None => Uuid::new_v4(),
         };
+        // Track whether training actually happened (may differ from `train` due to auto-fallback)
+        let mut actually_trained = train;
         let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
@@ -280,7 +284,26 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                if train {
+                // Auto-fallback to empty index if there are too few vectors
+                let effective_train = if train {
+                    let num_rows = self.dataset.count_rows(None).await?;
+                    if num_rows < MIN_VECTORS_FOR_TRAINING {
+                        log::info!(
+                            "Dataset has {} rows, fewer than {} required for training. \
+                            Creating empty vector index instead.",
+                            num_rows,
+                            MIN_VECTORS_FOR_TRAINING
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                actually_trained = effective_train;
+
+                if effective_train {
                     // this is a large future so move it to heap
                     Box::pin(build_vector_index(
                         self.dataset,
@@ -335,7 +358,15 @@ impl<'a> CreateIndexBuilder<'a> {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
                         .await?;
                 } else {
-                    todo!("create empty vector index when train=false");
+                    return Err(Error::NotSupported {
+                        source: format!(
+                            "Creating empty vector indices with train=False is not supported \
+                            for custom index extension '{}'.",
+                            name
+                        )
+                        .into(),
+                        location: location!(),
+                    });
                 }
                 CreatedIndex {
                     index_details: vector_index_details(),
@@ -364,7 +395,7 @@ impl<'a> CreateIndexBuilder<'a> {
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
+            fragment_bitmap: if actually_trained {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
                     None => Some(

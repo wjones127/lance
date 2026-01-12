@@ -20,6 +20,7 @@ use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::writer::FileWriter;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -29,10 +30,12 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::{
     hnsw::{
         builder::HnswBuildParams,
@@ -44,20 +47,250 @@ use lance_index::vector::{
     VectorIndex,
 };
 use lance_index::{
-    DatasetIndexExt, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
-    VECTOR_INDEX_VERSION,
+    DatasetIndexExt, IndexMetadata as LanceIndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME,
+    INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, VECTOR_INDEX_VERSION,
 };
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::IndexMetadata;
 use object_store::path::Path;
-use serde::Serialize;
+use prost::Message;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
 use super::{pb, vector_index_details, DatasetIndexInternalExt, IndexParams};
+use crate::dataset::index::LanceIndexStoreExt;
+
+/// Metadata key for storing empty vector index configuration
+pub const EMPTY_VECTOR_INDEX_CONFIG_KEY: &str = "lance:empty_vector_index_config";
+
+/// Configuration stored in an empty vector index file.
+/// This allows optimize_indices() to train the index later with the same parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmptyVectorIndexConfig {
+    /// Index type: "IVF_PQ", "IVF_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_SQ"
+    pub index_type: String,
+    /// Distance metric type: "L2", "cosine", "dot"
+    pub metric_type: String,
+    /// Number of IVF partitions (optional, can use default)
+    pub num_partitions: Option<usize>,
+    /// Target partition size for automatic partition calculation
+    pub target_partition_size: Option<usize>,
+    /// Number of sub-vectors for PQ quantization
+    pub num_sub_vectors: Option<usize>,
+    /// Number of bits for PQ/SQ quantization
+    pub num_bits: Option<usize>,
+    /// HNSW m parameter (number of edges)
+    pub hnsw_m: Option<usize>,
+    /// HNSW ef_construction parameter
+    pub hnsw_ef_construction: Option<usize>,
+}
+
+impl EmptyVectorIndexConfig {
+    /// Derive the index type string (e.g., "IVF_PQ", "IVF_HNSW_SQ") from VectorIndexParams
+    fn derive_index_type(params: &VectorIndexParams) -> String {
+        let has_hnsw = params
+            .stages
+            .iter()
+            .any(|s| matches!(s, StageParams::Hnsw(_)));
+        let quantizer = params.stages.iter().find_map(|s| match s {
+            StageParams::PQ(_) => Some("PQ"),
+            StageParams::SQ(_) => Some("SQ"),
+            StageParams::RQ(_) => Some("RQ"),
+            _ => None,
+        });
+
+        match (has_hnsw, quantizer) {
+            (true, Some(q)) => format!("IVF_HNSW_{}", q),
+            (true, None) => "IVF_HNSW_FLAT".to_string(),
+            (false, Some(q)) => format!("IVF_{}", q),
+            (false, None) => "IVF_FLAT".to_string(),
+        }
+    }
+
+    /// Create an EmptyVectorIndexConfig from VectorIndexParams
+    pub fn from_params(params: &VectorIndexParams) -> Self {
+        let index_type_str = Self::derive_index_type(params);
+        Self::from_params_with_type(params, &index_type_str)
+    }
+
+    /// Create an EmptyVectorIndexConfig from VectorIndexParams with explicit index type
+    pub fn from_params_with_type(params: &VectorIndexParams, index_type_str: &str) -> Self {
+        let mut config = Self {
+            index_type: index_type_str.to_string(),
+            metric_type: params.metric_type.to_string(),
+            num_partitions: None,
+            target_partition_size: None,
+            num_sub_vectors: None,
+            num_bits: None,
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+        };
+
+        for stage in &params.stages {
+            match stage {
+                StageParams::Ivf(ivf) => {
+                    config.num_partitions = ivf.num_partitions;
+                    config.target_partition_size = ivf.target_partition_size;
+                }
+                StageParams::Hnsw(hnsw) => {
+                    config.hnsw_m = Some(hnsw.m);
+                    config.hnsw_ef_construction = Some(hnsw.ef_construction);
+                }
+                StageParams::PQ(pq) => {
+                    config.num_sub_vectors = Some(pq.num_sub_vectors);
+                    config.num_bits = Some(pq.num_bits);
+                }
+                StageParams::SQ(sq) => {
+                    config.num_bits = Some(sq.num_bits as usize);
+                }
+                StageParams::RQ(rq) => {
+                    config.num_bits = Some(rq.num_bits as usize);
+                }
+            }
+        }
+
+        config
+    }
+
+    /// Convert the config back to VectorIndexParams for training
+    pub fn to_vector_index_params(&self) -> Result<VectorIndexParams> {
+        let metric_type =
+            DistanceType::try_from(self.metric_type.as_str()).map_err(|_| Error::Index {
+                message: format!("Invalid metric type: {}", self.metric_type),
+                location: location!(),
+            })?;
+
+        // Build IVF params
+        let mut ivf = IvfBuildParams::default();
+        if let Some(num_partitions) = self.num_partitions {
+            ivf.num_partitions = Some(num_partitions);
+        }
+        if let Some(target_partition_size) = self.target_partition_size {
+            ivf.target_partition_size = Some(target_partition_size);
+        }
+
+        // Build the appropriate index based on type
+        let params = match self.index_type.as_str() {
+            "IVF_FLAT" => VectorIndexParams::with_ivf_flat_params(metric_type, ivf),
+            "IVF_PQ" => {
+                let mut pq = PQBuildParams::default();
+                if let Some(num_sub_vectors) = self.num_sub_vectors {
+                    pq.num_sub_vectors = num_sub_vectors;
+                }
+                if let Some(num_bits) = self.num_bits {
+                    pq.num_bits = num_bits;
+                }
+                VectorIndexParams::with_ivf_pq_params(metric_type, ivf, pq)
+            }
+            "IVF_SQ" => {
+                let mut sq = SQBuildParams::default();
+                if let Some(num_bits) = self.num_bits {
+                    sq.num_bits = num_bits as u16;
+                }
+                VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
+            }
+            "IVF_HNSW_FLAT" => {
+                let mut hnsw = HnswBuildParams::default();
+                if let Some(m) = self.hnsw_m {
+                    hnsw.m = m;
+                }
+                if let Some(ef_construction) = self.hnsw_ef_construction {
+                    hnsw.ef_construction = ef_construction;
+                }
+                VectorIndexParams::ivf_hnsw(metric_type, ivf, hnsw)
+            }
+            "IVF_HNSW_PQ" => {
+                let mut hnsw = HnswBuildParams::default();
+                if let Some(m) = self.hnsw_m {
+                    hnsw.m = m;
+                }
+                if let Some(ef_construction) = self.hnsw_ef_construction {
+                    hnsw.ef_construction = ef_construction;
+                }
+                let mut pq = PQBuildParams::default();
+                if let Some(num_sub_vectors) = self.num_sub_vectors {
+                    pq.num_sub_vectors = num_sub_vectors;
+                }
+                if let Some(num_bits) = self.num_bits {
+                    pq.num_bits = num_bits;
+                }
+                VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf, hnsw, pq)
+            }
+            "IVF_HNSW_SQ" => {
+                let mut hnsw = HnswBuildParams::default();
+                if let Some(m) = self.hnsw_m {
+                    hnsw.m = m;
+                }
+                if let Some(ef_construction) = self.hnsw_ef_construction {
+                    hnsw.ef_construction = ef_construction;
+                }
+                let mut sq = SQBuildParams::default();
+                if let Some(num_bits) = self.num_bits {
+                    sq.num_bits = num_bits as u16;
+                }
+                VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Unsupported index type: {}", self.index_type),
+                    location: location!(),
+                });
+            }
+        };
+
+        Ok(params)
+    }
+
+    /// Load an EmptyVectorIndexConfig from an existing empty index.
+    /// Returns Ok(None) if the index is not an empty vector index.
+    pub async fn load_from_index(
+        dataset: &Dataset,
+        index_meta: &lance_table::format::IndexMetadata,
+    ) -> Result<Option<Self>> {
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::IndexStore;
+        use lance_index::INDEX_FILE_NAME;
+
+        // Only check if the fragment_bitmap is empty
+        let is_empty = index_meta
+            .fragment_bitmap
+            .as_ref()
+            .map(|bm| bm.is_empty())
+            .unwrap_or(false);
+
+        if !is_empty {
+            return Ok(None);
+        }
+
+        let index_store =
+            LanceIndexStore::from_dataset_for_existing(dataset, index_meta).map_err(|e| {
+                Error::Index {
+                    message: format!("Failed to open index store: {}", e),
+                    location: location!(),
+                }
+            })?;
+
+        let Ok(reader) = index_store.open_index_file(INDEX_FILE_NAME).await else {
+            return Ok(None); // Not an empty vector index file
+        };
+
+        let Some(config_json) = reader.schema().metadata.get(EMPTY_VECTOR_INDEX_CONFIG_KEY) else {
+            return Ok(None); // No config metadata, not an empty vector index
+        };
+
+        let config: Self = serde_json::from_str(config_json).map_err(|e| Error::Index {
+            message: format!("Failed to parse empty vector index config: {}", e),
+            location: location!(),
+        })?;
+
+        Ok(Some(config))
+    }
+}
+
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
 
@@ -788,26 +1021,78 @@ pub(crate) async fn build_vector_index_incremental(
     Ok(())
 }
 
-/// Build an empty vector index without training on data
+/// Build an empty vector index without training on data.
+///
+/// This creates a minimal index file that stores the index configuration,
+/// allowing the index to be trained later via optimize_indices().
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn build_empty_vector_index(
-    _dataset: &Dataset,
-    column: &str,
-    name: &str,
-    _uuid: &str,
-    _params: &VectorIndexParams,
+    dataset: &Dataset,
+    _column: &str,
+    _name: &str,
+    uuid: &str,
+    params: &VectorIndexParams,
 ) -> Result<()> {
-    // For now, return a NotImplementedError to indicate this functionality
-    // is still being developed
-    Err(Error::NotSupported {
-        source: format!(
-            "Creating empty vector indices with train=False is not yet implemented. \
-            Index '{}' for column '{}' cannot be created without training.",
-            name, column
-        )
-        .into(),
-        location: location!(),
-    })
+    // Create the empty index config from params
+    let config = EmptyVectorIndexConfig::from_params(params);
+    let config_json = serde_json::to_string(&config)?;
+
+    // Create an empty IVF model (0 partitions)
+    let empty_ivf = IvfModel::empty();
+    let ivf_pb = pb::Ivf::try_from(&empty_ivf)?;
+
+    // Create the index file path
+    let index_dir = dataset.indices_dir().child(uuid);
+    let index_path = index_dir.child(INDEX_FILE_NAME);
+
+    // Create a minimal schema for the empty index file
+    // We need at least one column - use a placeholder
+    let arrow_schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "_empty",
+        arrow_schema::DataType::Int32,
+        true,
+    )]);
+    let schema: lance_core::datatypes::Schema = (&arrow_schema).try_into()?;
+
+    // Write the empty index file with metadata
+    let object_store = dataset.object_store();
+    let mut writer = FileWriter::try_new(
+        object_store.create(&index_path).await?,
+        schema,
+        Default::default(),
+    )?;
+
+    // Add the index metadata
+    let index_metadata = LanceIndexMetadata {
+        index_type: config.index_type.clone(),
+        distance_type: params.metric_type.to_string(),
+    };
+    writer.add_schema_metadata(
+        INDEX_METADATA_SCHEMA_KEY,
+        serde_json::to_string(&index_metadata)?,
+    );
+
+    // Add the IVF metadata (empty)
+    let ivf_buffer_pos = writer
+        .add_global_buffer(ivf_pb.encode_to_vec().into())
+        .await?;
+    writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+
+    // Add the empty vector index config for later training
+    writer.add_schema_metadata(EMPTY_VECTOR_INDEX_CONFIG_KEY, config_json);
+
+    // Mark this as an empty index
+    writer.add_schema_metadata(DISTANCE_TYPE_KEY, params.metric_type.to_string());
+
+    writer.finish().await?;
+
+    log::info!(
+        "Created empty vector index {} with type {}",
+        uuid,
+        config.index_type
+    );
+
+    Ok(())
 }
 
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string(), num_rows = mapping.len()))]
@@ -1066,6 +1351,23 @@ pub async fn initialize_vector_index(
 
     // Vector indices currently support only single fields, use the first one
     let column_name = field_names[0];
+
+    // Check if the source index is an empty vector index
+    if let Some(empty_config) =
+        EmptyVectorIndexConfig::load_from_index(source_dataset, source_index).await?
+    {
+        // Create an empty index on target with the same configuration
+        let params = empty_config.to_vector_index_params()?;
+        let new_uuid = Uuid::new_v4().to_string();
+        return build_empty_vector_index(
+            target_dataset,
+            column_name,
+            &source_index.name,
+            &new_uuid,
+            &params,
+        )
+        .await;
+    }
 
     let source_vector_index = source_dataset
         .open_vector_index(
@@ -1734,7 +2036,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Create IVF_PQ index on source
+        // Create IVF_PQ index on source (train=true to actually build the index)
         let params = VectorIndexParams::ivf_pq(10, 8, 16, MetricType::L2, 50);
         source_dataset
             .create_index(
@@ -1742,7 +2044,7 @@ mod tests {
                 IndexType::Vector,
                 Some("vector_ivf_pq".to_string()),
                 &params,
-                false,
+                true,
             )
             .await
             .unwrap();

@@ -950,6 +950,22 @@ impl DatasetIndexExt for Dataset {
         let mut index_typename: Option<String> = None;
 
         for meta in metadatas.iter() {
+            // Check if this is an empty vector index
+            if let Some(config) =
+                vector::EmptyVectorIndexConfig::load_from_index(self, meta).await?
+            {
+                if index_typename.is_none() {
+                    index_typename = Some(config.index_type.clone());
+                }
+                // Empty indices have no statistics to report
+                indices_stats.push(serde_json::json!({
+                    "index_type": config.index_type,
+                    "num_rows": 0,
+                    "is_empty": true,
+                }));
+                continue;
+            }
+
             let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(self, meta)?);
             let index_details = scalar::fetch_index_details(self, &field_path, meta).await?;
             if index_uri.is_none() {

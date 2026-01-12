@@ -56,6 +56,7 @@ use lance::dataset::{
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
+use lance::index::vector::EmptyVectorIndexConfig;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -699,14 +700,22 @@ impl Dataset {
                     .collect::<Vec<_>>();
 
                 let ds = self_.ds.clone();
+                let idx_clone = idx.clone();
                 let idx_type = match rt().block_on(Some(self_.py()), async {
-                    if let Some(system_index_type) = infer_system_index_type(idx) {
+                    if let Some(system_index_type) = infer_system_index_type(&idx_clone) {
                         Ok::<_, lance::Error>(system_index_type.to_string())
                     } else {
+                        // Check if this is an empty vector index first
+                        if let Some(config) =
+                            EmptyVectorIndexConfig::load_from_index(&ds, &idx_clone).await?
+                        {
+                            return Ok::<_, lance::Error>(config.index_type);
+                        }
+
                         let idx = ds
                             .open_generic_index(
                                 &field_paths[0],
-                                &idx.uuid.to_string(),
+                                &idx_clone.uuid.to_string(),
                                 &NoOpMetricsCollector,
                             )
                             .await?;

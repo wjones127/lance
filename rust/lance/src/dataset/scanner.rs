@@ -3034,7 +3034,17 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+        // Find an index for this column, excluding empty indices (created with train=False).
+        // Empty indices have an empty fragment_bitmap and should fall through to brute force.
+        let index = indices.iter().find(|i| {
+            i.fields.contains(&column_id)
+                && !i
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bm| bm.is_empty())
+                    .unwrap_or(false)
+        });
+        if let Some(index) = index {
             log::trace!("index found for vector search");
             // There is an index built for the column.
             // We will use the index.

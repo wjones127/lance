@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::CreatedIndex;
+use lance_index::scalar::{CreatedIndex, IndexStore};
 use lance_index::VECTOR_INDEX_VERSION;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -16,11 +16,13 @@ use snafu::location;
 use uuid::Uuid;
 
 use super::vector::ivf::optimize_vector_indices;
+use super::vector::{build_vector_index, EmptyVectorIndexConfig, EMPTY_VECTOR_INDEX_CONFIG_KEY};
 use super::DatasetIndexInternalExt;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::Dataset;
 use crate::index::scalar::load_training_data;
 use crate::index::vector_index_details;
+use lance_index::INDEX_FILE_NAME;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -84,6 +86,31 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         })?;
 
     let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+
+    // Check if the first index is an empty vector index (created with train=False).
+    // An empty vector index has the EMPTY_VECTOR_INDEX_CONFIG_KEY metadata.
+    // Note: we can't just check for empty fragment_bitmap, because a trained index
+    // initialized on an empty dataset also has an empty fragment_bitmap.
+    let is_empty_vector_index = if old_indices.len() == 1 {
+        EmptyVectorIndexConfig::load_from_index(&dataset, old_indices[0])
+            .await?
+            .is_some()
+    } else {
+        false
+    };
+
+    if is_empty_vector_index {
+        // This is an empty vector index that needs to be trained from scratch
+        return train_empty_vector_index(
+            dataset.clone(),
+            old_indices[0],
+            unindexed,
+            &field_path,
+            column.nullable,
+        )
+        .await;
+    }
+
     let mut indices = Vec::with_capacity(old_indices.len());
     for idx in old_indices {
         let index = dataset
@@ -211,6 +238,102 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap: frag_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
+    }))
+}
+
+/// Train an empty vector index from scratch.
+///
+/// This is called when optimize_indices() encounters an empty vector index
+/// that was created with train=False. It reads the stored configuration
+/// and trains a new index using all available data.
+async fn train_empty_vector_index<'a>(
+    dataset: Arc<Dataset>,
+    old_index: &'a IndexMetadata,
+    unindexed: &[Fragment],
+    field_path: &str,
+    _column_nullable: bool,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    // Read the empty index config from the index file using LanceIndexStore
+    let index_store = LanceIndexStore::from_dataset_for_existing(dataset.as_ref(), old_index)
+        .map_err(|e| Error::Index {
+            message: format!("Failed to open index store: {}", e),
+            location: location!(),
+        })?;
+
+    let reader = index_store
+        .open_index_file(INDEX_FILE_NAME)
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("Failed to open index file: {}", e),
+            location: location!(),
+        })?;
+
+    let config_json = reader
+        .schema()
+        .metadata
+        .get(EMPTY_VECTOR_INDEX_CONFIG_KEY)
+        .ok_or_else(|| Error::Index {
+            message: format!(
+                "Empty vector index {} does not contain configuration metadata. \
+                Cannot train from scratch.",
+                old_index.uuid
+            ),
+            location: location!(),
+        })?;
+
+    let config: EmptyVectorIndexConfig =
+        serde_json::from_str(config_json).map_err(|e| Error::Index {
+            message: format!("Failed to parse empty vector index config: {}", e),
+            location: location!(),
+        })?;
+
+    // Convert the config back to VectorIndexParams
+    let vec_params = config.to_vector_index_params()?;
+
+    // Create a new UUID for the trained index
+    let new_uuid = Uuid::new_v4();
+
+    // Get all fragments (unindexed ones since the index was empty)
+    let all_fragments: Vec<Fragment> = if unindexed.is_empty() {
+        // No unindexed fragments, nothing to do
+        log::info!(
+            "Empty vector index {} has no data to train on",
+            old_index.uuid
+        );
+        return Ok(None);
+    } else {
+        unindexed.to_vec()
+    };
+
+    log::info!(
+        "Training empty vector index {} from scratch with {} fragments",
+        old_index.uuid,
+        all_fragments.len()
+    );
+
+    // Build the vector index
+    build_vector_index(
+        dataset.as_ref(),
+        field_path,
+        &old_index.name,
+        &new_uuid.to_string(),
+        &vec_params,
+        None, // No frag reuse index for training from scratch
+    )
+    .await?;
+
+    // Calculate the fragment bitmap for the new index
+    let mut frag_bitmap = RoaringBitmap::new();
+    for frag in &all_fragments {
+        frag_bitmap.insert(frag.id as u32);
+    }
+
+    Ok(Some(IndexMergeResults {
+        new_uuid,
+        removed_indices: vec![old_index],
+        new_fragment_bitmap: frag_bitmap,
+        new_index_version: VECTOR_INDEX_VERSION as i32,
+        new_index_details: vector_index_details(),
     }))
 }
 
