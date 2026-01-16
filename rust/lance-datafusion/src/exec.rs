@@ -418,7 +418,9 @@ fn get_session_cache() -> &'static Mutex<HashMap<SessionContextCacheKey, CachedS
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let key = SessionContextCacheKey::from_options(options);
-    let mut cache = get_session_cache().lock().unwrap();
+    let mut cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     // If key exists, update access time and return
     if let Some(entry) = cache.get_mut(&key) {
