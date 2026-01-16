@@ -929,3 +929,106 @@ impl ExecutionPlan for StrictBatchSizeExec {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_context_cache() {
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create first session with default options
+        let opts1 = LanceExecutionOptions::default();
+        let _ctx1 = get_session_context(&opts1);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Same options should reuse cached session (no new entry)
+        let _ctx1_again = get_session_context(&opts1);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 1);
+        }
+
+        // Different options should create new entry
+        let opts2 = LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        };
+        let _ctx2 = get_session_context(&opts2);
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_session_context_cache_lru_eviction() {
+        let cache = get_session_cache();
+
+        // Clear any existing entries from other tests
+        cache.lock().unwrap().clear();
+
+        // Create 4 different configurations to fill the cache
+        let configs: Vec<LanceExecutionOptions> = (0..4)
+            .map(|i| LanceExecutionOptions {
+                mem_pool_size: Some((i + 1) as u64 * 1024 * 1024),
+                ..Default::default()
+            })
+            .collect();
+
+        for config in &configs {
+            let _ctx = get_session_context(config);
+        }
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+        }
+
+        // Access config[0] to make it more recently used than config[1]
+        // (config[0] was inserted first, so without this access it would be evicted)
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let _ctx = get_session_context(&configs[0]);
+
+        // Add a 5th configuration - should evict config[1] (now least recently used)
+        let opts5 = LanceExecutionOptions {
+            mem_pool_size: Some(5 * 1024 * 1024),
+            ..Default::default()
+        };
+        let _ctx5 = get_session_context(&opts5);
+
+        {
+            let cache_guard = cache.lock().unwrap();
+            assert_eq!(cache_guard.len(), 4);
+
+            // config[0] should still be present (was accessed recently)
+            let key0 = SessionContextCacheKey::from_options(&configs[0]);
+            assert!(
+                cache_guard.contains_key(&key0),
+                "config[0] should still be cached after recent access"
+            );
+
+            // config[1] should be evicted (was least recently used)
+            let key1 = SessionContextCacheKey::from_options(&configs[1]);
+            assert!(
+                !cache_guard.contains_key(&key1),
+                "config[1] should have been evicted"
+            );
+
+            // New config should be present
+            let key5 = SessionContextCacheKey::from_options(&opts5);
+            assert!(
+                cache_guard.contains_key(&key5),
+                "new config should be cached"
+            );
+        }
+    }
+}
