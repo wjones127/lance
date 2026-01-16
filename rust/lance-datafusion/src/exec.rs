@@ -416,6 +416,17 @@ fn get_session_cache() -> &'static Mutex<HashMap<SessionContextCacheKey, CachedS
     SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn get_max_cache_size() -> usize {
+    const DEFAULT_CACHE_SIZE: usize = 4;
+    static MAX_CACHE_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_CACHE_SIZE.get_or_init(|| {
+        std::env::var("LANCE_SESSION_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_SIZE)
+    })
+}
+
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let key = SessionContextCacheKey::from_options(options);
     let mut cache = get_session_cache()
@@ -429,8 +440,7 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     }
 
     // Evict least recently used entry if cache is full
-    const MAX_CACHE_SIZE: usize = 4;
-    if cache.len() >= MAX_CACHE_SIZE {
+    if cache.len() >= get_max_cache_size() {
         if let Some(lru_key) = cache
             .iter()
             .min_by_key(|(_, v)| v.last_access)
