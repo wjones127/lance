@@ -2,12 +2,21 @@
 
 ## Overview
 
-A Lance schema defines the structure of data stored in a Lance table.
-Lance schemas have a 1-1 correspondence with Apache Arrow schemas, supporting all standard Arrow data types plus Lance-specific extensions.
-Each field in the schema has a unique integer ID that enables schema evolution without rewriting data.
+A Lance schema defines the structure of data stored in a Lance table. Schemas
+consist of fields that represent columns, including nested fields for complex types.
+Each field in the schema has a unique integer ID.
+
+<details>
+<summary>Schema protobuf message</summary>
+
+```protobuf
+%%% proto.message.lance.file.Schema %%%
+```
+</details>
 
 ## Data Types
 
+Lance represents data types as strings called "logical types" for serialization.
 Lance represents Arrow data types as strings called "logical types" for serialization.
 The following table shows the mapping between logical type strings and Arrow data types.
 
@@ -110,7 +119,6 @@ The extension type name is stored in `ARROW:extension:name` and extension metada
 |-------------|-----------|-------------|
 | `blob` | lance.blob | Large binary objects stored separately |
 | `json` | lance.json | JSON data stored as binary |
-| `fixed_size_list:lance.bfloat16:{size}` | lance.bfloat16 | BFloat16 vectors |
 
 ## Field Structure
 
@@ -166,7 +174,9 @@ They enable schema evolution by providing stable references to fields across tab
 
 ### Tombstoning
 
-When a column is dropped or replaced, its field ID is marked as `-2` (tombstoned) rather than deleted.
+When a column is dropped or replaced, its field can be removed from the schema.
+However, data files have a list of fields they contain based on field IDs. In this
+list, the dropped field's ID is marked as tombstoned with a value of `-2`.
 This allows older data files to remain valid while the field is ignored in newer reads.
 
 ### Example
@@ -179,7 +189,6 @@ name: string
 location: struct
   lat: float64
   lon: float64
-tags: list<string>
 ```
 
 Field IDs would be assigned as:
@@ -191,8 +200,6 @@ Field IDs would be assigned as:
 | location | 2 | -1 |
 | location.lat | 3 | 2 |
 | location.lon | 4 | 2 |
-| tags | 5 | -1 |
-| tags.item | 6 | 5 |
 
 ## Schema Evolution
 

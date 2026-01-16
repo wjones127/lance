@@ -129,7 +129,7 @@ message Field {
   /// Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
 
-  // Logical types, support parameterized Arrow Type.
+  // Logical types, represented as strings.
   //
   // PARENT types will always have logical type "struct".
   //
