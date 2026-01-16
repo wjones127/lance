@@ -36,7 +36,11 @@ use arrow_array::RecordBatchReader;
 /// Joins field names with `.` to create the base index name.
 /// For example: `["meta-data", "user-id"]` -> `"meta-data.user-id"`
 fn default_index_name(fields: &[&str]) -> String {
-    fields.join(".")
+    if fields.iter().any(|f| f.contains('.')) {
+        format_field_path(fields)
+    } else {
+        fields.join(".")
+    }
 }
 
 pub struct CreateIndexBuilder<'a> {
@@ -499,6 +503,12 @@ mod tests {
         assert_eq!(
             default_index_name(&["MetaData", "userId"]),
             "MetaData.userId"
+        );
+
+        // Path with dots in field names - escape
+        assert_eq!(
+            default_index_name(&["meta.data", "user.id"]),
+            "`meta.data`.`user.id`"
         );
 
         // Empty input
