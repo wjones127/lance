@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -385,28 +385,68 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     ctx
 }
 
-static DEFAULT_SESSION_CONTEXT: LazyLock<SessionContext> =
-    LazyLock::new(|| new_session_context(&LanceExecutionOptions::default()));
+/// Cache key for session contexts based on resolved configuration values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionContextCacheKey {
+    mem_pool_size: u64,
+    max_temp_directory_size: u64,
+    target_partition: Option<usize>,
+    use_spilling: bool,
+}
 
-static DEFAULT_SESSION_CONTEXT_WITH_SPILLING: LazyLock<SessionContext> = LazyLock::new(|| {
-    new_session_context(&LanceExecutionOptions {
-        use_spilling: true,
-        ..Default::default()
-    })
-});
+impl SessionContextCacheKey {
+    fn from_options(options: &LanceExecutionOptions) -> Self {
+        Self {
+            mem_pool_size: options.mem_pool_size(),
+            max_temp_directory_size: options.max_temp_directory_size(),
+            target_partition: options.target_partition,
+            use_spilling: options.use_spilling(),
+        }
+    }
+}
+
+struct CachedSessionContext {
+    context: SessionContext,
+    last_access: std::time::Instant,
+}
+
+fn get_session_cache() -> &'static Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>> {
+    static SESSION_CACHE: OnceLock<Mutex<HashMap<SessionContextCacheKey, CachedSessionContext>>> =
+        OnceLock::new();
+    SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE
-        && options.max_temp_directory_size() == DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
-        && options.target_partition.is_none()
-    {
-        return if options.use_spilling() {
-            DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone()
-        } else {
-            DEFAULT_SESSION_CONTEXT.clone()
-        };
+    let key = SessionContextCacheKey::from_options(options);
+    let mut cache = get_session_cache().lock().unwrap();
+
+    // If key exists, update access time and return
+    if let Some(entry) = cache.get_mut(&key) {
+        entry.last_access = std::time::Instant::now();
+        return entry.context.clone();
     }
-    new_session_context(options)
+
+    // Evict least recently used entry if cache is full
+    const MAX_CACHE_SIZE: usize = 4;
+    if cache.len() >= MAX_CACHE_SIZE {
+        if let Some(lru_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.last_access)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&lru_key);
+        }
+    }
+
+    let context = new_session_context(options);
+    cache.insert(
+        key,
+        CachedSessionContext {
+            context: context.clone(),
+            last_access: std::time::Instant::now(),
+        },
+    );
+    context
 }
 
 fn get_task_context(
