@@ -946,8 +946,12 @@ impl ExecutionPlan for StrictBatchSizeExec {
 mod tests {
     use super::*;
 
+    // Serialize cache tests since they share global state
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_session_context_cache() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let cache = get_session_cache();
 
         // Clear any existing entries from other tests
@@ -983,6 +987,7 @@ mod tests {
 
     #[test]
     fn test_session_context_cache_lru_eviction() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let cache = get_session_cache();
 
         // Clear any existing entries from other tests
