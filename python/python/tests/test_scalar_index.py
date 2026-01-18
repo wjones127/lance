@@ -663,6 +663,11 @@ def test_filter_with_fts_index(dataset):
         assert query == row.as_py()
 
 
+def test_create_scalar_index_fts_alias(dataset):
+    dataset.create_scalar_index("doc", index_type="FTS", with_position=False)
+    assert any(idx["type"] == "Inverted" for idx in dataset.list_indices())
+
+
 def test_multi_index_create(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
@@ -1970,6 +1975,39 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "LabelList"
+
+
+def test_label_list_index_array_contains(tmp_path: Path):
+    # Include lists with NULL items to ensure NULL needle behavior matches
+    # non-index execution.
+    tbl = pa.table(
+        {"labels": [["foo", "bar"], ["bar"], ["baz"], ["qux", None], [None], [], None]}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    expected_null_rows = dataset.to_table(
+        filter="array_contains(labels, NULL)"
+    ).num_rows
+
+    dataset.create_scalar_index("labels", index_type="LABEL_LIST")
+
+    result = dataset.to_table(filter="array_contains(labels, 'foo')")
+    assert result.num_rows == 1
+
+    result = dataset.to_table(filter="array_contains(labels, 'bar')")
+    assert result.num_rows == 2
+
+    result = dataset.to_table(filter="array_contains(labels, 'oof')")
+    assert result.num_rows == 0
+
+    explain = dataset.scanner(filter="array_contains(labels, 'foo')").explain_plan()
+    assert "ScalarIndexQuery" in explain
+
+    # NULL needle: preserve semantics (must match pre-index execution) and avoid
+    # using the LABEL_LIST index.
+    actual_null_rows = dataset.to_table(filter="array_contains(labels, NULL)").num_rows
+    assert actual_null_rows == expected_null_rows
+    explain = dataset.scanner(filter="array_contains(labels, NULL)").explain_plan()
+    assert "ScalarIndexQuery" not in explain
 
 
 def test_create_index_empty_dataset(tmp_path: Path):

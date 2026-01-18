@@ -433,7 +433,6 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
-        s3_credentials_refresh_offset_seconds: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -463,7 +462,6 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
-            s3_credentials_refresh_offset_seconds=s3_credentials_refresh_offset_seconds,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -1996,6 +1994,14 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate, conflict_retries, retry_timeout)
 
+    def truncate_table(self) -> None:
+        """
+        Truncate the dataset by deleting all rows.
+        The schema is preserved and a new version is created.
+        """
+        self._ds.truncate_table()
+        self._list_indices_res = None
+
     def insert(
         self,
         data: ReaderLike,
@@ -2026,7 +2032,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def merge_insert(
         self,
-        on: Union[str, Iterable[str]],
+        on: Optional[Union[str, Iterable[str]]] = None,
     ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
@@ -2058,10 +2064,15 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
 
-        on: Union[str, Iterable[str]]
+        on: Optional[Union[str, Iterable[str]]], default None
             A column (or columns) to join on.  This is how records from the
             source table and target table are matched.  Typically this is some
             kind of key or id column.
+
+            If ``on`` is not provided (or is ``None``), the merge insert
+            operation will use the dataset's unenforced primary key as defined
+            in the schema metadata. If no primary key is configured and
+            ``on`` is None, a :class:`ValueError` will be raised.
 
         Examples
         --------
@@ -2212,6 +2223,49 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.latest_version()
 
+    @property
+    def initial_storage_options(self) -> Optional[Dict[str, str]]:
+        """
+        Get the initial storage options used to open this dataset.
+
+        This returns the options that were provided when the dataset was opened,
+        without any refresh from the provider. Returns None if no storage options
+        were provided.
+        """
+        return self._ds.initial_storage_options()
+
+    def latest_storage_options(self) -> Optional[Dict[str, str]]:
+        """
+        Get the latest storage options, potentially refreshed from the provider.
+
+        If a storage options provider was configured and credentials are expiring,
+        this will refresh them.
+
+        Returns
+        -------
+        Optional[Dict[str, str]]
+            - Storage options dict if configured (static or refreshed from provider)
+            - None if no storage options were configured for this dataset
+
+        Raises
+        ------
+        IOError
+            If an error occurs while fetching/refreshing options from the provider
+        """
+        return self._ds.latest_storage_options()
+
+    @property
+    def storage_options_accessor(self):
+        """
+        Get the storage options accessor for this dataset.
+
+        The accessor bundles static storage options and optional dynamic provider,
+        handling caching and refresh logic internally.
+
+        Returns None if neither storage options nor a provider were configured.
+        """
+        return self._ds.storage_options_accessor()
+
     def checkout_version(
         self, version: int | str | Tuple[Optional[str], Optional[int]]
     ) -> "LanceDataset":
@@ -2338,6 +2392,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
+            Literal["FTS"],
             Literal["NGRAM"],
             Literal["ZONEMAP"],
             Literal["BLOOMFILTER"],
@@ -2397,8 +2452,9 @@ class LanceDataset(pa.dataset.Dataset):
         * ``LABEL_LIST``. A special index that is used to index list
           columns whose values have small cardinality.  For example, a column that
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
-          with a ``LABEL_LIST`` index.  This index can only speedup queries with
-          ``array_has_any`` or ``array_has_all`` filters.
+          with a ``LABEL_LIST`` index. This index can speed up list membership
+          filters such as ``array_has_any``, ``array_has_all``, and
+          ``array_has`` / ``array_contains``.
         * ``NGRAM``. A special index that is used to index string columns. This index
           creates a bitmap for each ngram in the string.  By default we use trigrams.
           This index can currently speed up queries using the ``contains`` function
@@ -2407,8 +2463,9 @@ class LanceDataset(pa.dataset.Dataset):
           called zones and stores summary statistics for each zone (min, max,
           null_count, nan_count, fragment_id, local_row_offset). It's very small but
           only effective if the column is at least approximately in sorted order.
-        * ``INVERTED``. It is used to index document columns. This index
-          can conduct full-text searches. For example, a column that contains any word
+        * ``INVERTED`` (alias: ``FTS``). It is used to index document columns. This
+          index can conduct full-text searches. For example, a column that contains any
+          word
           of query string "hello world". The results will be ranked by BM25.
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
@@ -2428,7 +2485,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"BLOOMFILTER"``, ``"RTREE"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -2548,6 +2605,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "ZONEMAP",
                 "LABEL_LIST",
                 "INVERTED",
+                "FTS",
                 "BLOOMFILTER",
                 "RTREE",
             ]:
@@ -2587,7 +2645,7 @@ class LanceDataset(pa.dataset.Dataset):
                     field_type
                 ):
                     raise TypeError(f"NGRAM index column {column} must be a string")
-            elif index_type in ["INVERTED"]:
+            elif index_type in ["INVERTED", "FTS"]:
                 value_type = field_type
                 if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
                     value_type = field_type.value_type
@@ -3298,7 +3356,7 @@ class LanceDataset(pa.dataset.Dataset):
             These paths provide more efficient opening of datasets with many
             versions on object stores. This parameter has no effect if the dataset
             already exists. To migrate an existing dataset, instead use the
-            :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
+            :meth:`migrate_manifest_paths_v2` method. Default is True. WARNING:
             turning this on will make the dataset unreadable for older versions
             of Lance (prior to 0.17.0).
         detached : bool, optional
@@ -4550,7 +4608,10 @@ class ScannerBuilder:
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
-            setter(value)
+            if isinstance(value, dict):
+                setter(**value)
+            else:
+                setter(value)
         return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
@@ -5480,7 +5541,7 @@ def write_dataset(
         Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
     ] = None,
     use_legacy_format: Optional[bool] = None,
-    enable_v2_manifest_paths: bool = False,
+    enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
@@ -5489,8 +5550,6 @@ def write_dataset(
     target_bases: Optional[List[str]] = None,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
-    ignore_namespace_table_storage_options: bool = False,
-    s3_credentials_refresh_offset_seconds: Optional[int] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -5544,7 +5603,7 @@ def write_dataset(
         These paths provide more efficient opening of datasets with many
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
-        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
+        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
         These row ids are stable after compaction operations, but not after updates.
@@ -5592,29 +5651,16 @@ def write_dataset(
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
         Must be provided together with `namespace`. Cannot be used with `uri`.
-    ignore_namespace_table_storage_options : bool, default False
-        If True, ignore the storage options returned by the namespace and only use
-        the provided `storage_options` parameter. The storage options provider will
-        not be created, so credentials will not be automatically refreshed.
-        This is useful when you want to use your own credentials instead of the
-        namespace-provided credentials.
-    s3_credentials_refresh_offset_seconds : optional, int
-        The number of seconds before credential expiration to trigger a refresh.
-        Default is 60 seconds. Only applicable when using AWS S3 with temporary
-        credentials. For example, if set to 60, credentials will be refreshed
-        when they have less than 60 seconds remaining before expiration. This
-        should be set shorter than the credential lifetime to avoid using
-        expired credentials.
 
     Notes
     -----
     When using `namespace` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
+    - Storage options from describe_table() will be used automatically
     - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
-      storage options refresh (unless `ignore_namespace_table_storage_options=True`)
+      storage options refresh
     - Initial storage options from describe_table() will be merged with
-      any provided `storage_options` (unless
-      `ignore_namespace_table_storage_options=True`)
+      any provided `storage_options`
     """
     # Validate that user provides either uri OR (namespace + table_id), not both
     has_uri = uri is not None
@@ -5696,11 +5742,8 @@ def write_dataset(
                 f"Namespace did not return a table location in {mode} response"
             )
 
-        # Check if we should ignore namespace storage options
-        if ignore_namespace_table_storage_options:
-            namespace_storage_options = None
-        else:
-            namespace_storage_options = response.storage_options
+        # Use namespace storage options
+        namespace_storage_options = response.storage_options
 
         # Set up storage options and provider
         if namespace_storage_options:
@@ -5762,12 +5805,6 @@ def write_dataset(
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
-
-    # Add s3_credentials_refresh_offset_seconds if specified
-    if s3_credentials_refresh_offset_seconds is not None:
-        params["s3_credentials_refresh_offset_seconds"] = (
-            s3_credentials_refresh_offset_seconds
-        )
 
     if commit_lock:
         if not callable(commit_lock):
