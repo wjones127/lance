@@ -269,7 +269,8 @@ jobs:
         run: |
           rustup toolchain install ${{ matrix.msrv }}
       - name: cargo +${{ matrix.msrv }} check
-        env: RUSTUP_TOOLCHAIN=${{ matrix.msrv }}
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.msrv }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}
