@@ -119,6 +119,132 @@ The extension type name is stored in `ARROW:extension:name` and extension metada
 | `blob` | lance.blob | Large binary objects stored separately |
 | `json` | lance.json | JSON data stored as binary |
 
+## Physical Encodings
+
+Lance encodes values using a small set of physical buffer layouts. Multiple
+logical types share the same physical layout, allowing the encoding system to
+optimize based on data characteristics rather than semantic type. These layouts
+generally match the [Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
+buffer layouts.
+
+### Fixed-Width Primitives
+
+Integer and floating-point types are stored as a contiguous buffer of fixed-size
+elements. Each value occupies a fixed number of bytes determined by the type.
+
+| Logical Types | Bytes per Value |
+|---------------|-----------------|
+| bool | 1 bit (packed) |
+| int8, uint8 | 1 |
+| int16, uint16, halffloat | 2 |
+| int32, uint32, float | 4 |
+| int64, uint64, double | 8 |
+
+Boolean values are bit-packed, with 8 values per byte.
+
+### Temporal Types
+
+Temporal types use the same fixed-width layout as integers, storing values as
+integer offsets from an epoch or start of day.
+
+| Logical Type | Storage | Interpretation |
+|--------------|---------|----------------|
+| date32 | int32 | Days since Unix epoch |
+| date64 | int64 | Milliseconds since Unix epoch |
+| time32 | int32 | Seconds or milliseconds since midnight |
+| time64 | int64 | Microseconds or nanoseconds since midnight |
+| timestamp | int64 | Time units since Unix epoch |
+| duration | int64 | Time units |
+
+### Decimal Types
+
+Decimal types are stored as fixed-width little-endian integers.
+
+| Logical Type | Bytes per Value |
+|--------------|-----------------|
+| decimal:128 | 16 |
+| decimal:256 | 32 |
+
+### Variable-Width Types
+
+String and binary types are stored using two buffers: a data buffer containing
+concatenated values, and an offsets buffer indicating where each value starts.
+
+| Component | Description |
+|-----------|-------------|
+| data | Concatenated UTF-8 strings or binary values |
+| offsets | Array of byte positions (length = num_values + 1) |
+
+The offset type determines the maximum total data size:
+
+| Logical Types | Offset Type | Max Data Size |
+|---------------|-------------|---------------|
+| string, binary | int32 | 2 GB |
+| large_string, large_binary | int64 | 8 EB |
+
+The physical encoding is identical for string vs binary and large_string vs
+large_binary - only the interpretation (UTF-8 text vs arbitrary bytes) and
+offset width differ.
+
+### Fixed-Size Binary
+
+Fixed-size binary is stored as a contiguous buffer where each value occupies
+exactly `size` bytes, similar to fixed-width primitives.
+
+### List Types
+
+List types use **repetition levels** to encode the list structure, inspired by the
+[Dremel paper](https://research.google/pubs/pub36632/). Child elements are stored
+in a flattened buffer, with repetition levels indicating where each list begins.
+
+Repetition levels are integers that mark list boundaries at each nesting depth.
+This encoding handles arbitrary nesting and empty lists efficiently. The
+distinction between `list` and `large_list` affects only the Arrow reconstruction,
+not the physical encoding.
+
+### Fixed-Size List Types
+
+Fixed-size lists do not require repetition levels since all lists have the same
+length. Values are stored as a flattened buffer of child elements.
+
+For `fixed_size_list:{type}:{size}`, row `i` contains elements at positions
+`[i * size, (i + 1) * size)` in the values buffer.
+
+### Struct Types
+
+Struct fields are encoded as separate columns, one for each child field. There
+is no physical "struct buffer" - the struct exists only as a logical grouping
+of its children.
+
+### Map Types
+
+Map types are encoded like lists, using repetition levels to encode the map
+structure. Each map entry is a struct with `key` and `value` fields.
+
+Keys must be non-nullable.
+
+### Dictionary Types
+
+Dictionary-encoded values are stored using two components:
+
+| Component | Description |
+|-----------|-------------|
+| indices | Integer indices into the dictionary |
+| dictionary | Unique values encoded according to their type |
+
+The index type (int8, int16, int32, int64) determines the maximum dictionary
+size. Indices reference positions in the dictionary buffer.
+
+### Nullability
+
+Nullability is encoded using **definition levels**, which indicate at what depth
+a value becomes null. This approach (inspired by the Dremel paper) efficiently
+combines nullability information from multiple nesting levels into a single buffer.
+
+For non-nested nullable fields, definition levels are equivalent to an inverted
+validity bitmap. For nested structures, definition levels compress multiple
+validity bitmaps into one.
+
 ## Field Structure
 
 Each field in the schema has the following properties.
