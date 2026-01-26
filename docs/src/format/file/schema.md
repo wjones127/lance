@@ -43,8 +43,10 @@ The following table shows the mapping between logical type strings and Arrow dat
 |-------------|------------|-------------|
 | `string` | Utf8 | UTF-8 string (32-bit offsets) |
 | `large_string` | LargeUtf8 | UTF-8 string (64-bit offsets) |
+| `string_view` | StringView | UTF-8 string view ("german-style strings") |
 | `binary` | Binary | Binary data (32-bit offsets) |
 | `large_binary` | LargeBinary | Binary data (64-bit offsets) |
+| `binary_view` | BinaryView | Binary data view |
 | `fixed_size_binary:{size}` | FixedSizeBinary(size) | Fixed-size binary data |
 
 ### Temporal Types
