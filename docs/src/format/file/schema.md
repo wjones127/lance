@@ -72,6 +72,8 @@ Examples:
 
 | Logical Type | Arrow Type | Description |
 |-------------|------------|-------------|
+| `decimal:32:{precision}:{scale}` | Decimal32(precision, scale) | 32-bit decimal |
+| `decimal:64:{precision}:{scale}` | Decimal64(precision, scale) | | 64-bit decimal |
 | `decimal:128:{precision}:{scale}` | Decimal128(precision, scale) | 128-bit decimal |
 | `decimal:256:{precision}:{scale}` | Decimal256(precision, scale) | 256-bit decimal |
 
