@@ -66,10 +66,8 @@ and an offsets buffer indicating where each value starts.
 | data | Concatenated UTF-8 strings or binary values |
 | offsets | Array of byte positions (length = num_values + 1) |
 
-| Data Types | Offset Width |
-|------------|--------------|
-| string (utf8), binary | 32-bit |
-| large_string (large_utf8), large_binary | 64-bit |
+The offsets can either be 32-bit or 64-bit. Either can be decoded into the small,
+large, or view Arrow data types.
 
 The encoding is identical for string vs binary—only the interpretation differs (UTF-8 text vs
 arbitrary bytes).
