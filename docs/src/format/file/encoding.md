@@ -32,6 +32,74 @@ string array might both be stored in the same layout but, at read time, we will 
 the size of the offsets returned to the user. There is no requirement the output Arrow type matches the input Arrow
 type. For example, it is acceptable to write an array as "large string" and then read it back as "string".
 
+### Data Layouts
+
+Multiple Arrow data types map to the same physical buffer layout. These layouts generally match the
+[Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html) buffer layouts.
+
+#### Fixed-Width Layout
+
+Integer, floating-point, boolean, temporal, decimal, and fixed-size binary types are stored as a contiguous
+buffer of fixed-size elements.
+
+| Data Types | Bits per Value |
+|------------|----------------|
+| bool | 1 (bit-packed, 8 values per byte) |
+| int8, uint8 | 8 |
+| int16, uint16, float16 | 16 |
+| int32, uint32, float32, date32, time32 | 32 |
+| int64, uint64, float64, date64, time64, timestamp, duration | 64 |
+| decimal128 | 128 |
+| decimal256 | 256 |
+| fixed_size_binary(N) | N × 8 |
+
+Temporal types store integer values representing offsets from an epoch (dates, timestamps) or start
+of day (times).
+
+#### Variable-Width Layout
+
+String and binary types are stored using two buffers: a data buffer containing concatenated values,
+and an offsets buffer indicating where each value starts.
+
+| Component | Description |
+|-----------|-------------|
+| data | Concatenated UTF-8 strings or binary values |
+| offsets | Array of byte positions (length = num_values + 1) |
+
+| Data Types | Offset Width |
+|------------|--------------|
+| string (utf8), binary | 32-bit |
+| large_string (large_utf8), large_binary | 64-bit |
+
+The encoding is identical for string vs binary—only the interpretation differs (UTF-8 text vs
+arbitrary bytes).
+
+#### Struct Layout
+
+Struct fields are encoded as separate columns, one per child field. There is no physical "struct
+buffer"—the struct exists only as a logical grouping. Nullability is handled via definition levels.
+
+#### List and Map Layout
+
+List and map types use repetition levels to encode the list structure (see
+[Repetition and Definition Levels](#repetition-and-definition-levels) below). Child elements are
+stored in a flattened buffer. The distinction between `list` and `large_list` affects only Arrow
+reconstruction, not the physical encoding.
+
+Map types are encoded as lists of key-value entry structs. Keys must be non-nullable.
+
+#### Fixed-Size List Layout
+
+Fixed-size lists do not require repetition levels since all lists have the same length. Child
+values are stored in a flattened buffer. For a fixed-size list of dimension `D`, row `i` contains
+elements at positions `[i × D, (i + 1) × D)` in the values buffer.
+
+#### Dictionary Layout
+
+Dictionary-encoded values use two components: an array of integer indices, and a dictionary of
+unique values encoded according to their type. The index type (int8, int16, int32, int64)
+determines the maximum dictionary size.
+
 ## Search Cache
 
 The search cache is a key component of the Lance file reader. Random access requires that we locate the physical
