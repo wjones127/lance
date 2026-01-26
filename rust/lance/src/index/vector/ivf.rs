@@ -2209,10 +2209,9 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        make_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-        RecordBatchReader, UInt64Array,
+        FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+        UInt64Array,
     };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
@@ -2228,11 +2227,9 @@ mod tests {
         generate_scaled_random_array, sample_without_replacement,
     };
     use rand::{rng, seq::SliceRandom};
-    use rstest::rstest;
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
-    use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
@@ -2790,146 +2787,6 @@ mod tests {
                 is_not_remapped,
             )
             .await;
-    }
-
-    struct TestPqParams {
-        num_sub_vectors: usize,
-        num_bits: usize,
-    }
-
-    impl TestPqParams {
-        fn small() -> Self {
-            Self {
-                num_sub_vectors: 2,
-                num_bits: 8,
-            }
-        }
-    }
-
-    // Clippy doesn't like that all start with Ivf but we might have some in the future
-    // that _don't_ start with Ivf so I feel it is meaningful to keep the prefix
-    #[allow(clippy::enum_variant_names)]
-    enum TestIndexType {
-        IvfPq { pq: TestPqParams },
-        IvfHnswPq { pq: TestPqParams, num_edges: usize },
-        IvfHnswSq { num_edges: usize },
-        IvfFlat,
-    }
-
-    struct CreateIndexCase {
-        metric_type: MetricType,
-        num_partitions: usize,
-        dimension: usize,
-        index_type: TestIndexType,
-    }
-
-    // We test L2 and Dot, because L2 PQ uses residuals while Dot doesn't,
-    // so they have slightly different code paths.
-    #[tokio::test]
-    #[rstest]
-    #[case::ivf_pq_l2(CreateIndexCase {
-        metric_type: MetricType::L2,
-        num_partitions: 2,
-        dimension: 16,
-        index_type: TestIndexType::IvfPq { pq: TestPqParams::small() },
-    })]
-    #[case::ivf_pq_dot(CreateIndexCase {
-        metric_type: MetricType::Dot,
-        num_partitions: 2,
-        dimension: 2000,
-        index_type: TestIndexType::IvfPq { pq: TestPqParams::small() },
-    })]
-    #[case::ivf_flat(CreateIndexCase { num_partitions: 1, metric_type: MetricType::Dot, dimension: 16, index_type: TestIndexType::IvfFlat })]
-    #[case::ivf_hnsw_pq(CreateIndexCase {
-        num_partitions: 2,
-        metric_type: MetricType::Dot,
-        dimension: 16,
-        index_type: TestIndexType::IvfHnswPq { pq: TestPqParams::small(), num_edges: 100 },
-    })]
-    #[case::ivf_hnsw_sq(CreateIndexCase {
-        metric_type: MetricType::Dot,
-        num_partitions: 2,
-        dimension: 16,
-        index_type: TestIndexType::IvfHnswSq { num_edges: 100 },
-    })]
-    async fn test_create_index_nulls(
-        #[case] test_case: CreateIndexCase,
-        #[values(IndexFileVersion::Legacy, IndexFileVersion::V3)] index_version: IndexFileVersion,
-    ) {
-        let mut index_params = match test_case.index_type {
-            TestIndexType::IvfPq { pq } => VectorIndexParams::with_ivf_pq_params(
-                test_case.metric_type,
-                IvfBuildParams::new(test_case.num_partitions),
-                PQBuildParams::new(pq.num_sub_vectors, pq.num_bits),
-            ),
-            TestIndexType::IvfHnswPq { pq, num_edges } => {
-                VectorIndexParams::with_ivf_hnsw_pq_params(
-                    test_case.metric_type,
-                    IvfBuildParams::new(test_case.num_partitions),
-                    HnswBuildParams::default().num_edges(num_edges),
-                    PQBuildParams::new(pq.num_sub_vectors, pq.num_bits),
-                )
-            }
-            TestIndexType::IvfFlat => {
-                VectorIndexParams::ivf_flat(test_case.num_partitions, test_case.metric_type)
-            }
-            TestIndexType::IvfHnswSq { num_edges } => VectorIndexParams::with_ivf_hnsw_sq_params(
-                test_case.metric_type,
-                IvfBuildParams::new(test_case.num_partitions),
-                HnswBuildParams::default().num_edges(num_edges),
-                SQBuildParams::default(),
-            ),
-        };
-        index_params.version(index_version);
-
-        let nrows = 2_000;
-        let data = gen_batch()
-            .col(
-                "vec",
-                array::rand_vec::<Float32Type>(Dimension::from(test_case.dimension as u32)),
-            )
-            .into_batch_rows(RowCount::from(nrows))
-            .unwrap();
-
-        // Make every other row null
-        let null_buffer = (0..nrows).map(|i| i % 2 == 0).collect::<BooleanBuffer>();
-        let null_buffer = NullBuffer::new(null_buffer);
-        let vectors = data["vec"]
-            .clone()
-            .to_data()
-            .into_builder()
-            .nulls(Some(null_buffer))
-            .build()
-            .unwrap();
-        let vectors = make_array(vectors);
-        let num_non_null = vectors.len() - vectors.logical_null_count();
-        let data = RecordBatch::try_new(data.schema(), vec![vectors]).unwrap();
-
-        let mut dataset = InsertBuilder::new("memory://")
-            .execute(vec![data])
-            .await
-            .unwrap();
-
-        // Create index
-        dataset
-            .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
-            .await
-            .unwrap();
-
-        let query = vec![0.0; test_case.dimension]
-            .into_iter()
-            .collect::<Float32Array>();
-        let results = dataset
-            .scan()
-            .nearest("vec", &query, 2_000)
-            .unwrap()
-            .ef(100_000)
-            .minimum_nprobes(2)
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(results.num_rows(), num_non_null);
-        assert_eq!(results["vec"].logical_null_count(), 0);
     }
 
     #[tokio::test]

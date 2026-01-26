@@ -13,4 +13,5 @@ mod utils;
 mod ivf_hnsw;
 mod ivf_pq;
 mod lifecycle;
+mod nulls;
 mod pq_model;
