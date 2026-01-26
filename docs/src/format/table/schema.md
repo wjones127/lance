@@ -17,7 +17,6 @@ Each field in the schema has a unique integer ID.
 ## Data Types
 
 Lance represents data types as strings called "logical types" for serialization.
-Lance represents Arrow data types as strings called "logical types" for serialization.
 The following table shows the mapping between logical type strings and Arrow data types.
 
 ### Primitive Types
