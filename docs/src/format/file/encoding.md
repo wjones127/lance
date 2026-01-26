@@ -47,8 +47,8 @@ buffer of fixed-size elements.
 | bool | 1 (bit-packed, 8 values per byte) |
 | int8, uint8 | 8 |
 | int16, uint16, float16 | 16 |
-| int32, uint32, float32, date32, time32 | 32 |
-| int64, uint64, float64, date64, time64, timestamp, duration | 64 |
+| int32, uint32, float32, date32, time32, decimal32 | 32 |
+| int64, uint64, float64, date64, time64, timestamp, duration, decimal64 | 64 |
 | decimal128 | 128 |
 | decimal256 | 256 |
 | fixed_size_binary(N) | N × 8 |
