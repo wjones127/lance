@@ -7,3 +7,5 @@
 mod query;
 #[cfg(feature = "slow_tests")]
 mod utils;
+#[cfg(feature = "slow_tests")]
+mod vector_index;
