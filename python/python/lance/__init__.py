@@ -50,6 +50,12 @@ if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
 
 
+class FieldNotFoundError(Exception):
+    """Raised when a requested field is not found in the schema."""
+
+    pass
+
+
 __all__ = [
     "Blob",
     "BlobArray",
@@ -59,6 +65,7 @@ __all__ = [
     "blob_field",
     "DatasetBasePath",
     "DataStatistics",
+    "FieldNotFoundError",
     "FieldStatistics",
     "FragmentMetadata",
     "Index",

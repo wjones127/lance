@@ -994,12 +994,10 @@ impl Scanner {
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
         let fields = query.columns();
         if !fields.is_empty() {
+            let schema = self.dataset.schema();
             for field in fields.iter() {
-                if self.dataset.schema().field(field).is_none() {
-                    return Err(Error::invalid_input(
-                        format!("Column {} not found", field),
-                        location!(),
-                    ));
+                if schema.field(field).is_none() {
+                    return Err(Error::field_not_found(field, schema.field_paths()));
                 }
             }
         }
@@ -1408,14 +1406,11 @@ impl Scanner {
                 return Ok(self);
             }
             // Verify early that the fields exist
+            let schema = self.dataset.schema();
             for column in ordering {
-                self.dataset
-                    .schema()
-                    .field(&column.column_name)
-                    .ok_or(Error::invalid_input(
-                        format!("Column {} not found", &column.column_name),
-                        location!(),
-                    ))?;
+                schema.field(&column.column_name).ok_or_else(|| {
+                    Error::field_not_found(&column.column_name, schema.field_paths())
+                })?;
             }
         }
         self.ordering = ordering;
@@ -1479,12 +1474,7 @@ impl Scanner {
         let lance_schema = dataset.schema();
         let field_path = lance_schema
             .resolve_case_insensitive(column_name)
-            .ok_or_else(|| {
-                Error::invalid_input(
-                    format!("Field '{}' not found in schema", column_name),
-                    location!(),
-                )
-            })?;
+            .ok_or_else(|| Error::field_not_found(column_name, lance_schema.field_paths()))?;
 
         if field_path.len() == 1 {
             // Simple top-level column

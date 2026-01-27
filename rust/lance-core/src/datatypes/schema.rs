@@ -50,19 +50,9 @@ impl FieldRef<'_> {
                 Ok(id)
             }
             FieldRef::ByPath(path) => {
-                let field = schema.field(path).ok_or_else(|| {
-                    let paths = schema.field_paths();
-                    let field_paths: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                    let suggestion = crate::levenshtein::find_best_suggestion(path, &field_paths);
-                    let mut error_msg = format!("Field '{}' not found in schema", path);
-                    if let Some(suggestion) = suggestion {
-                        error_msg = format!("{}. Did you mean '{}'?", error_msg, suggestion);
-                    }
-                    Error::InvalidInput {
-                        source: error_msg.into(),
-                        location: location!(),
-                    }
-                })?;
+                let field = schema
+                    .field(path)
+                    .ok_or_else(|| Error::field_not_found(path, schema.field_paths()))?;
                 Ok(field.id)
             }
         }
@@ -244,10 +234,7 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else if err_on_missing && first != ROW_ID && first != ROW_ADDR {
-                return Err(Error::Schema {
-                    message: format!("Column {} does not exist", col.as_ref()),
-                    location: location!(),
-                });
+                return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
             }
         }
 

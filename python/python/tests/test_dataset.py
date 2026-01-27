@@ -27,6 +27,7 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
+from lance import FieldNotFoundError
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
@@ -5094,3 +5095,32 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     assert distances == sorted(distances)
 
     assert "id" in result.column_names
+
+
+def test_file_not_field_not_found_error():
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "foo": ["a", "b", "c"],
+            "bar": [0.1, 0.2, 0.3],
+        }
+    )
+    ds = lance.write_dataset(data, "memory://")
+
+    with pytest.raises(FieldNotFoundError) as e:
+        ds.scanner(columns=["non_existent_field"]).to_table()
+        # Too different to suggest anything
+        expected = (
+            "FieldNotFoundError: Field 'non_existent_field' not found."
+            "\nAvailable fields: ['id', 'foo', 'bar']"
+        )
+        assert str(e.value) == expected
+
+    with pytest.raises(FieldNotFoundError) as e:
+        ds.scanner(columns=["baz"]).to_table()
+        # Close enough to suggest 'bar'
+        expected = (
+            "FieldNotFoundError: Field 'baz' not found. Did you mean 'bar'?"
+            "\nAvailable fields: ['id', 'foo', 'bar']"
+        )
+        assert str(e.value) == expected

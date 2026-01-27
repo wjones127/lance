@@ -12,14 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::LazyLock;
+
 use lance_namespace::error::NamespaceError;
 use pyo3::{
     exceptions::{PyIOError, PyNotImplementedError, PyRuntimeError, PyValueError},
     types::{PyAnyMethods, PyModule},
-    BoundObject, PyErr, PyResult, Python,
+    BoundObject, Py, PyAny, PyErr, PyResult, Python,
 };
 
 use lance::Error as LanceError;
+
+/// Lazily loads the FieldNotFoundError exception from the lance Python module.
+static PY_FIELD_NOT_FOUND_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
+    Python::attach(|py| {
+        py.import("lance")
+            .and_then(|lance| lance.getattr("FieldNotFoundError"))
+            .map(|err| err.unbind())
+    })
+});
 
 /// Try to convert a NamespaceError to the corresponding Python exception.
 /// Returns the appropriate Python exception from lance_namespace.errors module.
@@ -79,6 +90,23 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
                 LanceError::NotFound { .. } => self.value_error(),
                 LanceError::RefNotFound { .. } => self.value_error(),
                 LanceError::VersionNotFound { .. } => self.value_error(),
+                LanceError::FieldNotFound { source } => {
+                    let msg = source.to_string();
+                    match &*PY_FIELD_NOT_FOUND_ERROR {
+                        Ok(exc_type) => Python::attach(|py| {
+                            let exc_type = exc_type.bind(py);
+                            Err(PyErr::from_value(
+                                exc_type.call1((msg,)).expect("Failed to create exception"),
+                            ))
+                        }),
+                        Err(_) => {
+                            log::warn!(
+                                "Failed to import FieldNotFoundError from lance module, falling back to ValueError"
+                            );
+                            self.value_error()
+                        }
+                    }
+                }
                 LanceError::Namespace { source, .. } => {
                     // Try to downcast to NamespaceError and convert to proper Python exception
                     if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {

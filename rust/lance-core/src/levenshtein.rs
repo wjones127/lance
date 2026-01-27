@@ -74,23 +74,25 @@ pub fn levenshtein_distance(s1: &str, s2: &str) -> usize {
 /// assert_eq!(find_best_suggestion("vacter", &options), Some("vector"));
 /// assert_eq!(find_best_suggestion("hello", &options), None);
 /// ```
-pub fn find_best_suggestion(input: &str, options: &[&str]) -> Option<String> {
+pub fn find_best_suggestion<'a, 'b>(
+    input: &'a str,
+    options: &'b [impl AsRef<str>],
+) -> Option<&'b str> {
     let input_len = input.chars().count();
     if input_len == 0 {
         return None;
     }
 
     let threshold = input_len / 3;
-    let mut best_option: Option<(String, usize)> = None;
-
+    let mut best_option: Option<(&'b str, usize)> = None;
     for option in options {
-        let distance = levenshtein_distance(input, option);
+        let distance = levenshtein_distance(input, option.as_ref());
         if distance <= threshold {
             match &best_option {
-                None => best_option = Some((option.to_string(), distance)),
+                None => best_option = Some((option.as_ref(), distance)),
                 Some((_, best_distance)) => {
                     if distance < *best_distance {
-                        best_option = Some((option.to_string(), distance));
+                        best_option = Some((option.as_ref(), distance));
                     }
                 }
             }
@@ -112,7 +114,7 @@ mod tests {
         assert_eq!(levenshtein_distance("abc", "abc"), 0);
         assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
         assert_eq!(levenshtein_distance("hello", "world"), 4);
-        assert_eq!(levenshtein_distance("vector", "vector"), 1);
+        assert_eq!(levenshtein_distance("vector", "vector"), 0);
         assert_eq!(levenshtein_distance("vector", "vector"), 1);
         assert_eq!(levenshtein_distance("vacter", "vector"), 2);
     }
@@ -121,22 +123,10 @@ mod tests {
     fn test_find_best_suggestion() {
         let options = vec!["vector", "vector", "vector", "column", "table"];
 
-        assert_eq!(
-            find_best_suggestion("vacter", &options),
-            Some("vector".to_string())
-        );
-        assert_eq!(
-            find_best_suggestion("vectr", &options),
-            Some("vector".to_string())
-        );
-        assert_eq!(
-            find_best_suggestion("column", &options),
-            Some("column".to_string())
-        );
-        assert_eq!(
-            find_best_suggestion("tble", &options),
-            Some("table".to_string())
-        );
+        assert_eq!(find_best_suggestion("vacter", &options), Some("vector"));
+        assert_eq!(find_best_suggestion("vectr", &options), Some("vector"));
+        assert_eq!(find_best_suggestion("column", &options), Some("column"));
+        assert_eq!(find_best_suggestion("tble", &options), Some("table"));
 
         // Should return None if no good match
         assert_eq!(find_best_suggestion("hello", &options), None);
