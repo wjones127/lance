@@ -13,40 +13,38 @@ use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 
-use crate::dataset::blob::blob_version_from_config;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::datatypes::{
-    BlobVersion, Field, OnMissing, OnTypeMismatch, Projectable, Projection,
-};
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
     TRACE_DATASET_EVENTS,
 };
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, IndexType};
 use lance_io::object_store::{
-    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams,
+    LanceNamespaceStorageOptionsProvider, ObjectStore, ObjectStoreParams, StorageOptions,
+    StorageOptionsAccessor, StorageOptionsProvider,
 };
 use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    pb, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, write_manifest_file_to_path, CommitConfig, CommitError, CommitHandler,
     CommitLock, ManifestLocation, ManifestNamingScheme, VERSIONS_DIR,
 };
-use lance_table::io::manifest::read_manifest;
+use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -70,6 +68,7 @@ pub mod delta;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
+pub mod mem_wal;
 mod metadata;
 pub mod optimize;
 pub mod progress;
@@ -84,7 +83,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
-mod write;
+pub mod write;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -110,9 +109,12 @@ pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 use lance_core::box_error;
 pub use lance_core::ROW_ID;
-use lance_namespace::models::{CreateEmptyTableRequest, DescribeTableRequest};
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_namespace::models::{
+    CreateEmptyTableRequest, DeclareTableRequest, DeclareTableResponse, DescribeTableRequest,
+};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
-use lance_table::io::deletion::DELETIONS_DIR;
+use lance_table::io::deletion::{relative_deletion_file_path, DELETIONS_DIR};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -122,6 +124,7 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
+use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -186,7 +189,7 @@ impl std::fmt::Debug for Dataset {
 }
 
 /// Dataset Version
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct Version {
     /// version number
     pub version: u64,
@@ -332,47 +335,9 @@ impl ProjectionRequest {
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
 
-        // Separate data columns from system columns
-        // System columns need to be added to the schema manually since Schema::project
-        // doesn't include them (they're virtual columns)
-        let mut data_columns = Vec::new();
-        let mut system_fields = Vec::new();
-
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // For now we only support _rowid and _rowaddr in projections
-                if col == ROW_ID {
-                    system_fields.push(Field::try_from(ROW_ID_FIELD.clone()).unwrap());
-                } else if col == ROW_ADDR {
-                    system_fields.push(Field::try_from(ROW_ADDR_FIELD.clone()).unwrap());
-                }
-                // Note: Other system columns like _rowoffset are handled differently
-            } else {
-                data_columns.push(col.as_str());
-            }
-        }
-
-        // Project only the data columns
-        let mut schema = dataset_schema.project(&data_columns).unwrap();
-
-        // Add system fields in the order they appeared in the original columns list
-        // We need to reconstruct the proper order
-        let mut final_fields = Vec::new();
-        for col in &columns {
-            if lance_core::is_system_column(col) {
-                // Find and add the system field
-                if let Some(field) = system_fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            } else {
-                // Find and add the data field
-                if let Some(field) = schema.fields.iter().find(|f| &f.name == col) {
-                    final_fields.push(field.clone());
-                }
-            }
-        }
-
-        schema.fields = final_fields;
+        let schema = dataset_schema
+            .project_preserve_system_columns(&columns)
+            .unwrap();
         Self::Schema(Arc::new(schema))
     }
 
@@ -397,7 +362,6 @@ impl ProjectionRequest {
     }
 
     pub fn into_projection_plan(self, dataset: Arc<Dataset>) -> Result<ProjectionPlan> {
-        let blob_version = dataset.blob_version();
         match self {
             Self::Schema(schema) => {
                 // The schema might contain system columns (_rowid, _rowaddr) which are not
@@ -410,7 +374,7 @@ impl ProjectionRequest {
                 if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref(), blob_version)
+                    ProjectionPlan::from_schema(dataset, schema.as_ref())
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -418,10 +382,10 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection, blob_version)
+                    ProjectionPlan::from_schema(dataset, &projection)
                 }
             }
-            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns, blob_version),
+            Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
     }
 }
@@ -449,14 +413,19 @@ impl Dataset {
 
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
-        let ref_: refs::Ref = version.into();
-        match ref_ {
+        let reference: refs::Ref = version.into();
+        match reference {
             refs::Ref::Version(branch, version_number) => {
-                self.checkout_by_ref(version_number, branch).await
+                self.checkout_by_ref(version_number, branch.as_deref())
+                    .await
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                self.checkout_by_ref(Some(version_number), self.manifest.branch.as_deref())
+                    .await
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
-                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch)
+                self.checkout_by_ref(Some(tag_contents.version), tag_contents.branch.as_deref())
                     .await
             }
         }
@@ -487,7 +456,7 @@ impl Dataset {
 
     /// Check out the latest version of the branch
     pub async fn checkout_branch(&self, branch: &str) -> Result<Self> {
-        self.checkout_by_ref(None, Some(branch.to_string())).await
+        self.checkout_by_ref(None, Some(branch)).await
     }
 
     /// This is a two-phase operation:
@@ -550,14 +519,10 @@ impl Dataset {
         self.branches().list().await
     }
 
-    fn already_checked_out(
-        &self,
-        location: &ManifestLocation,
-        branch_name: Option<String>,
-    ) -> bool {
+    fn already_checked_out(&self, location: &ManifestLocation, branch_name: Option<&str>) -> bool {
         // We check the e_tag here just in case it has been overwritten. This can
         // happen if the table has been dropped then re-created recently.
-        self.manifest.branch == branch_name
+        self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
@@ -571,17 +536,9 @@ impl Dataset {
     async fn checkout_by_ref(
         &self,
         version_number: Option<u64>,
-        branch: Option<String>,
+        branch: Option<&str>,
     ) -> Result<Self> {
-        let new_location = if self.manifest.branch.as_ref() != branch.as_ref() {
-            if let Some(branch_name) = branch.as_deref() {
-                self.find_branch_location(branch_name)?
-            } else {
-                self.branch_location().find_main()?
-            }
-        } else {
-            self.branch_location()
-        };
+        let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
             self.commit_handler
@@ -597,7 +554,7 @@ impl Dataset {
                 .await?
         };
 
-        if self.already_checked_out(&manifest_location, branch.clone()) {
+        if self.already_checked_out(&manifest_location, branch) {
             return Ok(self.clone());
         }
 
@@ -813,63 +770,83 @@ impl Dataset {
     /// * `namespace` - The namespace to use for table management
     /// * `table_id` - The table identifier
     /// * `params` - Write parameters
-    /// * `ignore_namespace_table_storage_options` - If true, ignore storage options returned
-    ///   by the namespace and only use the storage options in params. The storage options
-    ///   provider will not be created, so credentials will not be automatically refreshed.
     pub async fn write_into_namespace(
         batches: impl RecordBatchReader + Send + 'static,
         namespace: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
         mut params: Option<WriteParams>,
-        ignore_namespace_table_storage_options: bool,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
         match write_params.mode {
             WriteMode::Create => {
-                let request = CreateEmptyTableRequest {
+                let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
-                    location: None,
-                    properties: None,
+                    ..Default::default()
                 };
-                let response =
-                    namespace
-                        .create_empty_table(request)
-                        .await
-                        .map_err(|e| Error::Namespace {
+                // Try declare_table first, fall back to deprecated create_empty_table
+                // for backward compatibility with older namespace implementations.
+                // create_empty_table support will be removed in 3.0.0.
+                #[allow(deprecated)]
+                let response = match namespace.declare_table(declare_request).await {
+                    Ok(resp) => resp,
+                    Err(Error::NotSupported { .. }) => {
+                        let fallback_request = CreateEmptyTableRequest {
+                            id: Some(table_id.clone()),
+                            ..Default::default()
+                        };
+                        let fallback_resp = namespace
+                            .create_empty_table(fallback_request)
+                            .await
+                            .map_err(|e| Error::Namespace {
+                                source: Box::new(e),
+                                location: location!(),
+                            })?;
+                        DeclareTableResponse {
+                            transaction_id: fallback_resp.transaction_id,
+                            location: fallback_resp.location,
+                            storage_options: fallback_resp.storage_options,
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::Namespace {
                             source: Box::new(e),
                             location: location!(),
-                        })?;
+                        });
+                    }
+                };
 
                 let uri = response.location.ok_or_else(|| Error::Namespace {
                     source: Box::new(std::io::Error::other(
-                        "Table location not found in create_empty_table response",
+                        "Table location not found in declare_table response",
                     )),
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                            namespace, table_id,
-                        ));
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> = Arc::new(
+                        LanceNamespaceStorageOptionsProvider::new(namespace, table_id),
+                    );
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 Self::write(batches, uri.as_str(), Some(write_params)).await
@@ -877,8 +854,7 @@ impl Dataset {
             WriteMode::Append | WriteMode::Overwrite => {
                 let request = DescribeTableRequest {
                     id: Some(table_id.clone()),
-                    version: None,
-                    with_table_uri: None,
+                    ..Default::default()
                 };
                 let response =
                     namespace
@@ -896,29 +872,32 @@ impl Dataset {
                     location: location!(),
                 })?;
 
-                // Set initial credentials and provider unless ignored
-                if !ignore_namespace_table_storage_options {
-                    if let Some(namespace_storage_options) = response.storage_options {
-                        let provider = Arc::new(LanceNamespaceStorageOptionsProvider::new(
+                // Set initial credentials and provider from namespace
+                if let Some(namespace_storage_options) = response.storage_options {
+                    let provider: Arc<dyn StorageOptionsProvider> =
+                        Arc::new(LanceNamespaceStorageOptionsProvider::new(
                             namespace.clone(),
                             table_id.clone(),
                         ));
 
-                        // Merge namespace storage options with any existing options
-                        let mut merged_options = write_params
-                            .store_params
-                            .as_ref()
-                            .and_then(|p| p.storage_options.clone())
-                            .unwrap_or_default();
-                        merged_options.extend(namespace_storage_options);
+                    // Merge namespace storage options with any existing options
+                    let mut merged_options = write_params
+                        .store_params
+                        .as_ref()
+                        .and_then(|p| p.storage_options().cloned())
+                        .unwrap_or_default();
+                    merged_options.extend(namespace_storage_options);
 
-                        let existing_params = write_params.store_params.take().unwrap_or_default();
-                        write_params.store_params = Some(ObjectStoreParams {
-                            storage_options: Some(merged_options),
-                            storage_options_provider: Some(provider),
-                            ..existing_params
-                        });
-                    }
+                    let accessor = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+                        merged_options,
+                        provider,
+                    ));
+
+                    let existing_params = write_params.store_params.take().unwrap_or_default();
+                    write_params.store_params = Some(ObjectStoreParams {
+                        storage_options_accessor: Some(accessor),
+                        ..existing_params
+                    });
                 }
 
                 // For APPEND/OVERWRITE modes, we must open the existing dataset first
@@ -926,11 +905,8 @@ impl Dataset {
                 // assumes no dataset exists and converts the mode to CREATE.
                 let mut builder = DatasetBuilder::from_uri(uri.as_str());
                 if let Some(ref store_params) = write_params.store_params {
-                    if let Some(ref storage_options) = store_params.storage_options {
-                        builder = builder.with_storage_options(storage_options.clone());
-                    }
-                    if let Some(ref provider) = store_params.storage_options_provider {
-                        builder = builder.with_storage_options_provider(provider.clone());
+                    if let Some(accessor) = &store_params.storage_options_accessor {
+                        builder = builder.with_storage_options_accessor(accessor.clone());
                     }
                 }
                 let dataset = Arc::new(builder.load().await?);
@@ -982,7 +958,7 @@ impl Dataset {
             uri: self.uri.clone(),
             branch: self.manifest.branch.clone(),
         };
-        current_location.find_branch(Some(branch_name.to_string()))
+        current_location.find_branch(Some(branch_name))
     }
 
     /// Get the full manifest of the dataset version.
@@ -1037,7 +1013,7 @@ impl Dataset {
             return Ok((cached_manifest, location));
         }
 
-        if self.already_checked_out(&location, self.manifest.branch.clone()) {
+        if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
@@ -1546,6 +1522,11 @@ impl Dataset {
         write::delete::delete(self, predicate).await
     }
 
+    /// Truncate the dataset by deleting all rows.
+    pub async fn truncate_table(&mut self) -> Result<()> {
+        self.delete("true").await
+    }
+
     /// Add new base paths to the dataset.
     ///
     /// This method allows you to register additional storage locations (buckets)
@@ -1591,11 +1572,22 @@ impl Dataset {
         &self.object_store
     }
 
-    /// Returns the storage options used when opening this dataset, if any.
+    /// Returns the initial storage options used when opening this dataset, if any.
+    ///
+    /// This returns the static initial options without triggering any refresh.
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    #[deprecated(since = "0.25.0", note = "Use initial_storage_options() instead")]
     pub fn storage_options(&self) -> Option<&HashMap<String, String>> {
+        self.initial_storage_options()
+    }
+
+    /// Returns the initial storage options without triggering any refresh.
+    ///
+    /// For the latest refreshed options, use [`Self::latest_storage_options`].
+    pub fn initial_storage_options(&self) -> Option<&HashMap<String, String>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options.as_ref())
+            .and_then(|params| params.storage_options())
     }
 
     /// Returns the storage options provider used when opening this dataset, if any.
@@ -1604,7 +1596,42 @@ impl Dataset {
     ) -> Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>> {
         self.store_params
             .as_ref()
-            .and_then(|params| params.storage_options_provider.clone())
+            .and_then(|params| params.storage_options_accessor.as_ref())
+            .and_then(|accessor| accessor.provider().cloned())
+    }
+
+    /// Returns the unified storage options accessor for this dataset, if any.
+    ///
+    /// The accessor handles both static and dynamic storage options with automatic
+    /// caching and refresh. Use [`StorageOptionsAccessor::get_storage_options`] to
+    /// get the latest options.
+    pub fn storage_options_accessor(&self) -> Option<Arc<StorageOptionsAccessor>> {
+        self.store_params
+            .as_ref()
+            .and_then(|params| params.get_accessor())
+    }
+
+    /// Returns the latest (possibly refreshed) storage options.
+    ///
+    /// If a dynamic storage options provider is configured, this will return
+    /// the cached options if still valid, or fetch fresh options if expired.
+    ///
+    /// For the initial static options without refresh, use [`Self::storage_options`].
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(options))` - Storage options are available (static or refreshed)
+    /// - `Ok(None)` - No storage options were configured for this dataset
+    /// - `Err(...)` - Error occurred while fetching/refreshing options from provider
+    pub async fn latest_storage_options(&self) -> Result<Option<StorageOptions>> {
+        // First check if we have an accessor (handles both static and dynamic options)
+        if let Some(accessor) = self.storage_options_accessor() {
+            let options = accessor.get_storage_options().await?;
+            return Ok(Some(options));
+        }
+
+        // Fallback to initial storage options if no accessor
+        Ok(self.initial_storage_options().cloned().map(StorageOptions))
     }
 
     pub fn data_dir(&self) -> Path {
@@ -1791,17 +1818,15 @@ impl Dataset {
     /// Similar to [Self::schema], but only returns fields that are not marked as blob columns
     /// Creates a new empty projection into the dataset schema
     pub fn empty_projection(self: &Arc<Self>) -> Projection {
-        Projection::empty(self.clone()).with_blob_version(self.blob_version())
+        Projection::empty(self.clone())
     }
 
     /// Creates a projection that includes all columns in the dataset
     pub fn full_projection(self: &Arc<Self>) -> Projection {
-        Projection::full(self.clone()).with_blob_version(self.blob_version())
+        Projection::full(self.clone())
     }
 
     /// Get fragments.
-    ///
-    /// If `filter` is provided, only fragments with the given name will be returned.
     pub fn get_fragments(&self) -> Vec<FileFragment> {
         let dataset = Arc::new(self.clone());
         self.manifest
@@ -2107,11 +2132,16 @@ impl Dataset {
     /// # use lance_table::io::commit::ManifestNamingScheme;
     /// # use lance_datagen::{array, RowCount, BatchCount};
     /// # use arrow_array::types::Int32Type;
+    /// # use lance::dataset::write::WriteParams;
     /// # let data = lance_datagen::gen_batch()
     /// #  .col("key", array::step::<Int32Type>())
     /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
     /// # let fut = async {
-    /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+    /// # let params = WriteParams {
+    /// #     enable_v2_manifest_paths: false,
+    /// #     ..Default::default()
+    /// # };
+    /// let mut dataset = Dataset::write(data, "memory://test", Some(params)).await.unwrap();
     /// assert_eq!(dataset.manifest_location().naming_scheme, ManifestNamingScheme::V1);
     ///
     /// dataset.migrate_manifest_paths_v2().await.unwrap();
@@ -2137,8 +2167,7 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let ref_ = version.into();
-        let (ref_name, version_number) = self.resolve_reference(ref_).await?;
+        let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -2149,11 +2178,109 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(store_params.unwrap_or_default())
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         builder.execute(transaction).await
+    }
+
+    /// Deep clone the target version into a new dataset at target_path.
+    /// This performs a server-side copy of all relevant dataset files (data files,
+    /// deletion files, and any external row-id files) into the target dataset
+    /// without loading data into memory.
+    ///
+    /// Parameters:
+    /// - `target_path`: the URI string to clone the dataset into.
+    /// - `version`: the version cloned from, could be a version number, branch head, or tag.
+    /// - `store_params`: the object store params to use for the new dataset.
+    pub async fn deep_clone(
+        &mut self,
+        target_path: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Self> {
+        use futures::StreamExt;
+
+        // Resolve source dataset and its manifest using checkout_version
+        let src_ds = self.checkout_version(version).await?;
+        let src_paths = src_ds.collect_paths().await?;
+
+        // Prepare target object store and base path
+        let (target_store, target_base) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+
+        // Prevent cloning into an existing target dataset
+        if self
+            .commit_handler
+            .resolve_latest_location(&target_base, &target_store)
+            .await
+            .is_ok()
+        {
+            return Err(Error::DatasetAlreadyExists {
+                uri: target_path.to_string(),
+                location: location!(),
+            });
+        }
+
+        let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
+            let mut path = base.clone();
+            for seg in relative_path.split('/') {
+                if !seg.is_empty() {
+                    path = path.child(seg);
+                }
+            }
+            path
+        };
+
+        // TODO: Leverage object store bulk copy for efficient deep_clone
+        //
+        // All cloud storage providers support batch copy APIs that would provide significant
+        // performance improvements. We use single file copy before we have upstream support.
+        //
+        // Tracked by: https://github.com/lance-format/lance/issues/5435
+        let io_parallelism = self.object_store.io_parallelism();
+        let copy_futures = src_paths
+            .iter()
+            .map(|(relative_path, base)| {
+                let store = Arc::clone(&target_store);
+                let src_path = build_absolute_path(relative_path, base);
+                let target_path = build_absolute_path(relative_path, &target_base);
+                async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
+            })
+            .collect::<Vec<_>>();
+
+        futures::stream::iter(copy_futures)
+            .buffer_unordered(io_parallelism)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        // Record a Clone operation and commit via CommitBuilder
+        let ref_name = src_ds.manifest.branch.clone();
+        let ref_version = src_ds.manifest_location.version;
+        let clone_op = Operation::Clone {
+            is_shallow: false,
+            ref_name,
+            ref_version,
+            ref_path: src_ds.uri().to_string(),
+            branch_name: None,
+        };
+        let txn = Transaction::new(ref_version, clone_op, None);
+        let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
+            .with_store_params(store_params.clone().unwrap_or_default())
+            .with_object_store(target_store.clone())
+            .with_commit_handler(self.commit_handler.clone())
+            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+        let new_ds = builder.execute(txn).await?;
+        Ok(new_ds)
     }
 
     async fn resolve_reference(&self, reference: refs::Ref) -> Result<(Option<String>, u64)> {
@@ -2162,19 +2289,111 @@ impl Dataset {
                 if let Some(version_number) = version_number {
                     Ok((branch, version_number))
                 } else {
+                    let branch_location = self.branch_location().find_branch(branch.as_deref())?;
                     let version_number = self
                         .commit_handler
-                        .resolve_latest_location(&self.base, &self.object_store)
+                        .resolve_latest_location(&branch_location.path, &self.object_store)
                         .await?
                         .version;
                     Ok((branch, version_number))
                 }
+            }
+            refs::Ref::VersionNumber(version_number) => {
+                Ok((self.manifest.branch.clone(), version_number))
             }
             refs::Ref::Tag(tag_name) => {
                 let tag_contents = self.tags().get(tag_name.as_str()).await?;
                 Ok((tag_contents.branch, tag_contents.version))
             }
         }
+    }
+
+    /// Collect all (relative_path, path) of the dataset files.
+    async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
+        let mut file_paths: Vec<(String, Path)> = Vec::new();
+        for fragment in self.manifest.fragments.iter() {
+            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+                return Err(Error::Internal {
+                    message: format!(
+                        "External row_id_meta is not supported yet. external file path: {}",
+                        external_file.path
+                    ),
+                    location: location!(),
+                });
+            }
+            for data_file in fragment.files.iter() {
+                let base_root = if let Some(base_id) = data_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((
+                    format!("{}/{}", DATA_DIR, data_file.path.clone()),
+                    base_root,
+                ));
+            }
+            if let Some(deletion_file) = &fragment.deletion_file {
+                let base_root = if let Some(base_id) = deletion_file.base_id {
+                    let base_path =
+                        self.manifest
+                            .base_paths
+                            .get(&base_id)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!("base_id {} not found", base_id),
+                                location: location!(),
+                            })?;
+                    Path::parse(base_path.path.as_str())?
+                } else {
+                    self.base.clone()
+                };
+                file_paths.push((
+                    relative_deletion_file_path(fragment.id, deletion_file),
+                    base_root,
+                ));
+            }
+        }
+
+        let indices = read_manifest_indexes(
+            self.object_store.as_ref(),
+            &self.manifest_location,
+            &self.manifest,
+        )
+        .await?;
+
+        for index in &indices {
+            let base_root = if let Some(base_id) = index.base_id {
+                let base_path =
+                    self.manifest
+                        .base_paths
+                        .get(&base_id)
+                        .ok_or_else(|| Error::Internal {
+                            message: format!("base_id {} not found", base_id),
+                            location: location!(),
+                        })?;
+                Path::parse(base_path.path.as_str())?
+            } else {
+                self.base.clone()
+            };
+            let index_root = base_root.child(INDICES_DIR).child(index.uuid.to_string());
+            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            while let Some(meta) = stream.next().await.transpose()? {
+                if let Some(filename) = meta.location.filename() {
+                    file_paths.push((
+                        format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
+                        base_root.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(file_paths)
     }
 
     /// Run a SQL query against the dataset.
@@ -2490,6 +2709,55 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
+
+    pub async fn merge_index_metadata(
+        &self,
+        index_uuid: &str,
+        index_type: IndexType,
+        batch_readhead: Option<usize>,
+    ) -> Result<()> {
+        let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
+        let index_dir = self.indices_dir().child(index_uuid);
+        match index_type {
+            IndexType::Inverted => {
+                // Call merge_index_files function for inverted index
+                lance_index::scalar::inverted::builder::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                )
+                .await
+            }
+            IndexType::BTree => {
+                // Call merge_index_files function for btree index
+                lance_index::scalar::btree::merge_index_files(
+                    self.object_store(),
+                    &index_dir,
+                    Arc::new(store),
+                    batch_readhead,
+                )
+                .await
+            }
+            // Precise vector index types: IVF_FLAT, IVF_PQ, IVF_SQ
+            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
+                // Merge distributed vector index partials and finalize root index via Lance IVF helper
+                crate::index::vector::ivf::finalize_distributed_merge(
+                    self.object_store(),
+                    &index_dir,
+                    Some(index_type),
+                )
+                .await?;
+                Ok(())
+            }
+            _ => Err(Error::InvalidInput {
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Unsupported index type (patched): {}", index_type),
+                )),
+                location: location!(),
+            }),
+        }
+    }
 }
 
 /// # Dataset metadata APIs
@@ -2513,10 +2781,6 @@ impl Dataset {
     /// Get the dataset config from manifest
     pub fn config(&self) -> &HashMap<String, String> {
         &self.manifest.config
-    }
-
-    pub(crate) fn blob_version(&self) -> BlobVersion {
-        blob_version_from_config(&self.manifest.config)
     }
 
     /// Delete keys from the config.

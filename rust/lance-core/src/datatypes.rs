@@ -91,6 +91,10 @@ impl LogicalType {
         self.0 == "large_list" || self.0 == "large_list.struct"
     }
 
+    fn is_fixed_size_list_struct(&self) -> bool {
+        self.0.starts_with("fixed_size_list:struct:")
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
@@ -421,19 +425,6 @@ impl PartialEq for Dictionary {
             _ => false,
         }
     }
-}
-
-/// Returns true if Lance supports writing this datatype with nulls.
-pub fn lance_supports_nulls(datatype: &DataType) -> bool {
-    matches!(
-        datatype,
-        DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::List(_)
-            | DataType::FixedSizeBinary(_)
-            | DataType::FixedSizeList(_, _)
-    )
 }
 
 /// Physical storage mode for blob v2 descriptors (one byte, stored in the packed struct column).

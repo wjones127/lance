@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::{
-    list::StructuralListDecoder, map::StructuralMapDecoder,
-    primitive::StructuralPrimitiveFieldDecoder,
+    fixed_size_list::StructuralFixedSizeListDecoder, list::StructuralListDecoder,
+    map::StructuralMapDecoder, primitive::StructuralPrimitiveFieldDecoder,
 };
 use crate::{
     decoder::{
@@ -275,6 +275,16 @@ impl StructuralStructDecoder {
                     field.data_type().clone(),
                 )))
             }
+            DataType::FixedSizeList(child_field, _)
+                if matches!(child_field.data_type(), DataType::Struct(_)) =>
+            {
+                // FixedSizeList containing Struct needs structural decoding
+                let child_decoder = Self::field_to_decoder(child_field, should_validate)?;
+                Ok(Box::new(StructuralFixedSizeListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                )))
+            }
             DataType::Map(entries_field, keys_sorted) => {
                 if *keys_sorted {
                     return Err(Error::NotSupported {
@@ -379,7 +389,12 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::new(self.child_fields, children, validity);
+        let array = StructArray::try_new(self.child_fields, children, validity).map_err(|e| {
+            Error::InvalidInput {
+                source: e.to_string().into(),
+                location: location!(),
+            }
+        })?;
         Ok(DecodedArray {
             array: Arc::new(array),
             repdef,

@@ -18,6 +18,8 @@ import org.lance.namespace.LanceNamespace;
 import org.lance.namespace.LanceNamespaceStorageOptionsProvider;
 import org.lance.namespace.model.CreateEmptyTableRequest;
 import org.lance.namespace.model.CreateEmptyTableResponse;
+import org.lance.namespace.model.DeclareTableRequest;
+import org.lance.namespace.model.DeclareTableResponse;
 import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
@@ -78,7 +80,6 @@ public class WriteDatasetBuilder {
   private Optional<Long> maxBytesPerFile = Optional.empty();
   private Optional<Boolean> enableStableRowIds = Optional.empty();
   private Optional<WriteParams.LanceFileVersion> dataStorageVersion = Optional.empty();
-  private Optional<Long> s3CredentialsRefreshOffsetSeconds = Optional.empty();
   private Optional<List<BasePath>> initialBases = Optional.empty();
   private Optional<List<String>> targetBases = Optional.empty();
 
@@ -274,21 +275,6 @@ public class WriteDatasetBuilder {
     return this;
   }
 
-  /**
-   * Sets the S3 credentials refresh offset in seconds.
-   *
-   * <p>This parameter controls how long before credential expiration to refresh them. For example,
-   * if credentials expire at T+60s and this is set to 10, credentials will be refreshed at T+50s.
-   *
-   * @param s3CredentialsRefreshOffsetSeconds Refresh offset in seconds
-   * @return this builder instance
-   */
-  public WriteDatasetBuilder s3CredentialsRefreshOffsetSeconds(
-      long s3CredentialsRefreshOffsetSeconds) {
-    this.s3CredentialsRefreshOffsetSeconds = Optional.of(s3CredentialsRefreshOffsetSeconds);
-    return this;
-  }
-
   public WriteDatasetBuilder initialBases(List<BasePath> bases) {
     this.initialBases = Optional.of(bases);
     return this;
@@ -365,18 +351,33 @@ public class WriteDatasetBuilder {
 
     // Mode-specific namespace operations
     if (mode == WriteParams.WriteMode.CREATE) {
-      // Call namespace.createEmptyTable() to create new table
-      CreateEmptyTableRequest request = new CreateEmptyTableRequest();
-      request.setId(tableId);
+      // Try declareTable first, fall back to deprecated createEmptyTable
+      // for backward compatibility with older namespace implementations.
+      // createEmptyTable support will be removed in 3.0.0.
+      String location;
+      Map<String, String> responseStorageOptions;
 
-      CreateEmptyTableResponse response = namespace.createEmptyTable(request);
+      try {
+        DeclareTableRequest declareRequest = new DeclareTableRequest();
+        declareRequest.setId(tableId);
+        DeclareTableResponse declareResponse = namespace.declareTable(declareRequest);
+        location = declareResponse.getLocation();
+        responseStorageOptions = declareResponse.getStorageOptions();
+      } catch (UnsupportedOperationException e) {
+        // Fall back to deprecated createEmptyTable
+        CreateEmptyTableRequest fallbackRequest = new CreateEmptyTableRequest();
+        fallbackRequest.setId(tableId);
+        CreateEmptyTableResponse fallbackResponse = namespace.createEmptyTable(fallbackRequest);
+        location = fallbackResponse.getLocation();
+        responseStorageOptions = fallbackResponse.getStorageOptions();
+      }
 
-      tableUri = response.getLocation();
+      tableUri = location;
       if (tableUri == null || tableUri.isEmpty()) {
         throw new IllegalArgumentException("Namespace did not return a table location");
       }
 
-      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : response.getStorageOptions();
+      namespaceStorageOptions = ignoreNamespaceStorageOptions ? null : responseStorageOptions;
     } else {
       // For APPEND/OVERWRITE modes, call namespace.describeTable()
       DescribeTableRequest request = new DescribeTableRequest();
@@ -407,8 +408,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
 
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
@@ -434,8 +433,6 @@ public class WriteDatasetBuilder {
     maxBytesPerFile.ifPresent(paramsBuilder::withMaxBytesPerFile);
     enableStableRowIds.ifPresent(paramsBuilder::withEnableStableRowIds);
     dataStorageVersion.ifPresent(paramsBuilder::withDataStorageVersion);
-    s3CredentialsRefreshOffsetSeconds.ifPresent(
-        paramsBuilder::withS3CredentialsRefreshOffsetSeconds);
     initialBases.ifPresent(paramsBuilder::withInitialBases);
     targetBases.ifPresent(paramsBuilder::withTargetBases);
 

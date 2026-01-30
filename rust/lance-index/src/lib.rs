@@ -118,6 +118,8 @@ pub enum IndexType {
 
     BloomFilter = 9, // Bloom filter
 
+    RTree = 10, // RTree
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -142,6 +144,7 @@ impl std::fmt::Display for IndexType {
             Self::MemWal => write!(f, "MemWal"),
             Self::ZoneMap => write!(f, "ZoneMap"),
             Self::BloomFilter => write!(f, "BloomFilter"),
+            Self::RTree => write!(f, "RTree"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -188,15 +191,13 @@ impl TryFrom<&str> for IndexType {
 
     fn try_from(value: &str) -> Result<Self> {
         match value {
-            "BTree" => Ok(Self::BTree),
-            "Bitmap" => Ok(Self::Bitmap),
-            "LabelList" => Ok(Self::LabelList),
-            "Inverted" => Ok(Self::Inverted),
-            "NGram" => Ok(Self::NGram),
-            "FragmentReuse" => Ok(Self::FragmentReuse),
-            "MemWal" => Ok(Self::MemWal),
-            "ZoneMap" => Ok(Self::ZoneMap),
-            "Vector" => Ok(Self::Vector),
+            "BTree" | "BTREE" => Ok(Self::BTree),
+            "Bitmap" | "BITMAP" => Ok(Self::Bitmap),
+            "LabelList" | "LABELLIST" => Ok(Self::LabelList),
+            "Inverted" | "INVERTED" => Ok(Self::Inverted),
+            "NGram" | "NGRAM" => Ok(Self::NGram),
+            "ZoneMap" | "ZONEMAP" => Ok(Self::ZoneMap),
+            "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
             "IVF_PQ" => Ok(Self::IvfPq),
@@ -204,6 +205,8 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "FragmentReuse" => Ok(Self::FragmentReuse),
+            "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(
                 format!("invalid index type: {}", value),
                 location!(),
@@ -224,6 +227,7 @@ impl IndexType {
                 | Self::NGram
                 | Self::ZoneMap
                 | Self::BloomFilter
+                | Self::RTree,
         )
     }
 
@@ -262,6 +266,7 @@ impl IndexType {
             Self::MemWal => 0,
             Self::ZoneMap => 0,
             Self::BloomFilter => 0,
+            Self::RTree => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.

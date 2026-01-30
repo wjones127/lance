@@ -51,7 +51,7 @@ use crate::{
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
                 VariablePackedStructFieldKind,
             },
-            rle::{RleMiniBlockDecompressor, RleMiniBlockEncoder},
+            rle::{RleDecompressor, RleEncoder},
             value::{ValueDecompressor, ValueEncoder},
         },
     },
@@ -69,8 +69,11 @@ use lance_core::{datatypes::Field, error::LanceOptionExt, Error, Result};
 use snafu::location;
 use std::{str::FromStr, sync::Arc};
 
-/// Default threshold for RLE compression selection.
-/// RLE is chosen when the run count is less than this fraction of total values.
+/// Default threshold for RLE compression selection when the user explicitly provides a threshold.
+///
+/// If no threshold is provided, we use a size model instead of a fixed run ratio.
+/// This preserves existing behavior for users relying on the default, while making
+/// the default selection more type-aware.
 const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 // Minimum block size (32kb) to trigger general block compression
@@ -168,13 +171,74 @@ fn try_rle_for_mini_block(
         return None;
     }
 
+    let type_size = bits / 8;
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    let threshold = params
+        .rle_threshold
+        .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
+
+    // If the user explicitly provided a threshold then honor it as an additional guard.
+    // A lower threshold makes RLE harder to trigger and can be used to avoid CPU overhead.
+    let passes_threshold = match params.rle_threshold {
+        Some(_) => (run_count as f64) < (data.num_values as f64) * threshold,
+        None => true,
+    };
+
+    if !passes_threshold {
+        return None;
+    }
+
+    // Estimate the encoded size.
+    //
+    // RLE stores (value, run_length) pairs. Run lengths are u8 and long runs are split into
+    // multiple entries of up to 255 values. We don't know the run length distribution here,
+    // so we conservatively account for splitting with an upper bound.
+    let num_values = data.num_values;
+    let estimated_pairs = (run_count.saturating_add(num_values / 255)).min(num_values);
+
+    let raw_bytes = (num_values as u128) * (type_size as u128);
+    let rle_bytes = (estimated_pairs as u128) * ((type_size + 1) as u128);
+
+    if rle_bytes < raw_bytes {
+        #[cfg(feature = "bitpacking")]
+        {
+            if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data) {
+                if (bitpack_bytes as u128) < rle_bytes {
+                    return None;
+                }
+            }
+        }
+        return Some(Box::new(RleEncoder::new()));
+    }
+    None
+}
+
+fn try_rle_for_block(
+    data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
+    params: &CompressionFieldParams,
+) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    if version < LanceFileVersion::V2_2 {
+        return None;
+    }
+
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
     let threshold = params
         .rle_threshold
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     if (run_count as f64) < (data.num_values as f64) * threshold {
-        return Some(Box::new(RleMiniBlockEncoder::new()));
+        let compressor = Box::new(RleEncoder::new());
+        let encoding = ProtobufUtils21::rle(
+            ProtobufUtils21::flat(bits, None),
+            ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+        );
+        return Some((compressor, encoding));
     }
     None
 }
@@ -182,19 +246,8 @@ fn try_rle_for_mini_block(
 fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
     #[cfg(feature = "bitpacking")]
     {
-        use arrow_array::cast::AsArray;
-
         let bits = _data.bits_per_value;
-        if !matches!(bits, 8 | 16 | 32 | 64) {
-            return None;
-        }
-
-        let bit_widths = _data.expect_stat(Stat::BitWidth);
-        let widths = bit_widths.as_primitive::<UInt64Type>();
-        let too_small = widths.len() == 1
-            && InlineBitpacking::min_size_bytes(widths.value(0)) >= _data.data_size();
-
-        if !too_small {
+        if estimate_inline_bitpacking_bytes(_data).is_some() {
             return Some(Box::new(InlineBitpacking::new(bits)));
         }
         None
@@ -203,6 +256,40 @@ fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn Min
     {
         None
     }
+}
+
+#[cfg(feature = "bitpacking")]
+fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
+    use arrow_array::cast::AsArray;
+
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return None;
+    }
+    if data.num_values == 0 {
+        return None;
+    }
+
+    let bit_widths = data.expect_stat(Stat::BitWidth);
+    let widths = bit_widths.as_primitive::<UInt64Type>();
+
+    let words_per_chunk: u128 = 1;
+    let word_bytes: u128 = (bits / 8) as u128;
+    let mut total_words: u128 = 0;
+    for i in 0..widths.len() {
+        let bit_width = widths.value(i) as u128;
+        let packed_words = (1024u128 * bit_width) / (bits as u128);
+        total_words = total_words.saturating_add(words_per_chunk.saturating_add(packed_words));
+    }
+
+    let estimated_bytes = total_words.saturating_mul(word_bytes);
+    let raw_bytes = data.data_size() as u128;
+
+    if estimated_bytes >= raw_bytes {
+        return None;
+    }
+
+    u64::try_from(estimated_bytes).ok()
 }
 
 fn try_bitpack_for_block(
@@ -247,10 +334,7 @@ fn maybe_wrap_general_for_mini_block(
         None | Some("none") | Some("fsst") => Ok(inner),
         Some(raw) => {
             let scheme = CompressionScheme::from_str(raw).map_err(|_| {
-                lance_core::Error::invalid_input(
-                    format!("Unknown compression scheme: {raw}"),
-                    location!(),
-                )
+                Error::invalid_input(format!("Unknown compression scheme: {raw}"), location!())
             })?;
             let cfg = CompressionConfig::new(scheme, params.compression_level);
             Ok(Box::new(GeneralMiniBlockCompressor::new(inner, cfg)))
@@ -587,6 +671,11 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width) => {
+                if let Some((compressor, encoding)) =
+                    try_rle_for_block(fixed_width, self.version, &field_params)
+                {
+                    return Ok((compressor, encoding));
+                }
                 if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
                     return Ok((compressor, encoding));
                 }
@@ -736,28 +825,8 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
             Compression::Rle(rle) => {
-                let Compression::Flat(values) =
-                    rle.values.as_ref().unwrap().compression.as_ref().unwrap()
-                else {
-                    panic!("RLE compression only supports flat values")
-                };
-                let Compression::Flat(run_lengths) = rle
-                    .run_lengths
-                    .as_ref()
-                    .unwrap()
-                    .compression
-                    .as_ref()
-                    .unwrap()
-                else {
-                    panic!("RLE compression only supports flat run lengths")
-                };
-                assert_eq!(
-                    run_lengths.bits_per_value, 8,
-                    "RLE compression only supports 8-bit run lengths"
-                );
-                Ok(Box::new(RleMiniBlockDecompressor::new(
-                    values.bits_per_value,
-                )))
+                let bits_per_value = validate_rle_compression(rle)?;
+                Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
@@ -785,10 +854,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
                 let scheme = compression.scheme().try_into()?;
 
-                let compression_config = crate::encodings::physical::block::CompressionConfig::new(
-                    scheme,
-                    compression.level,
-                );
+                let compression_config = CompressionConfig::new(scheme, compression.level);
 
                 Ok(Box::new(GeneralMiniBlockDecompressor::new(
                     inner_decompressor,
@@ -963,9 +1029,57 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
                 Ok(Box::new(general_decompressor))
             }
+            Compression::Rle(rle) => {
+                let bits_per_value = validate_rle_compression(rle)?;
+                Ok(Box::new(RleDecompressor::new(bits_per_value)))
+            }
             _ => todo!(),
         }
     }
+}
+/// Validates RLE compression format and extracts bits_per_value
+fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
+    let values = rle.values.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing values encoding", location!())
+    })?;
+    let run_lengths = rle.run_lengths.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing run lengths encoding", location!())
+    })?;
+
+    let values = values.compression.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing values compression", location!())
+    })?;
+    let Compression::Flat(values) = values else {
+        return Err(Error::invalid_input(
+            "RLE compression only supports flat values",
+            location!(),
+        ));
+    };
+
+    let run_lengths = run_lengths.compression.as_ref().ok_or_else(|| {
+        Error::invalid_input(
+            "RLE compression missing run lengths compression",
+            location!(),
+        )
+    })?;
+    let Compression::Flat(run_lengths) = run_lengths else {
+        return Err(Error::invalid_input(
+            "RLE compression only supports flat run lengths",
+            location!(),
+        ));
+    };
+
+    if run_lengths.bits_per_value != 8 {
+        return Err(Error::invalid_input(
+            format!(
+                "RLE compression only supports 8-bit run lengths, got {}",
+                run_lengths.bits_per_value
+            ),
+            location!(),
+        ));
+    }
+
+    Ok(values.bits_per_value)
 }
 
 #[cfg(test)]
@@ -973,6 +1087,7 @@ mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::statistics::ComputeStat;
     use crate::testing::extract_array_encoding_chain;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
@@ -1143,7 +1258,7 @@ mod tests {
 
         // The compressor should be RLE wrapped in general compression
         assert!(debug_str.contains("GeneralMiniBlockCompressor"));
-        assert!(debug_str.contains("RleMiniBlockEncoder"));
+        assert!(debug_str.contains("RleEncoder"));
     }
 
     #[test]
@@ -1169,7 +1284,48 @@ mod tests {
 
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         // Should use RLE due to very low threshold
-        assert!(format!("{:?}", compressor).contains("RleMiniBlockEncoder"));
+        assert!(format!("{:?}", compressor).contains("RleEncoder"));
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_low_cardinality_prefers_bitpacking_over_rle() {
+        let strategy = DefaultCompressionStrategy::new();
+        let field = create_test_field("int_score", DataType::Int64);
+
+        // Low cardinality values (3/4/5) but with moderate run count:
+        // RLE compresses vs raw, yet bitpacking should be smaller.
+        let mut values: Vec<u64> = Vec::with_capacity(256);
+        for run_idx in 0..64 {
+            let value = match run_idx % 3 {
+                0 => 3u64,
+                1 => 4u64,
+                _ => 5u64,
+            };
+            values.extend(std::iter::repeat_n(value, 4));
+        }
+
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 256,
+            block_info: BlockInfo::default(),
+        };
+
+        use crate::statistics::ComputeStat;
+        block.compute_stat();
+
+        let data = DataBlock::FixedWidth(block);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{:?}", compressor);
+        assert!(
+            debug_str.contains("InlineBitpacking"),
+            "expected InlineBitpacking, got: {debug_str}"
+        );
+        assert!(
+            !debug_str.contains("RleEncoder"),
+            "expected RLE to be skipped when bitpacking is smaller, got: {debug_str}"
+        );
     }
 
     fn check_uncompressed_encoding(encoding: &CompressiveEncoding, variable: bool) {
@@ -1411,7 +1567,7 @@ mod tests {
 
         // Should use RLE because run_count (100) < num_values * threshold (800)
         let debug_str = format!("{:?}", compressor);
-        assert!(debug_str.contains("RleMiniBlockEncoder"));
+        assert!(debug_str.contains("RleEncoder"));
     }
 
     #[test]
@@ -1570,5 +1726,78 @@ mod tests {
             }
             _ => panic!("expected fixed width block"),
         }
+    }
+
+    #[test]
+    fn test_rle_block_used_for_version_v2_2() {
+        let field = create_test_field("test_repdef", DataType::UInt16);
+
+        // Create highly repetitive data
+        let num_values = 1000u64;
+        let mut data = Vec::with_capacity(num_values as usize);
+        for i in 0..10 {
+            for _ in 0..100 {
+                data.push(i as u16);
+            }
+        }
+
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+
+        block.compute_stat();
+
+        let data_block = DataBlock::FixedWidth(block);
+
+        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new())
+            .with_version(LanceFileVersion::V2_2);
+
+        let (compressor, _) = strategy
+            .create_block_compressor(&field, &data_block)
+            .unwrap();
+
+        let debug_str = format!("{:?}", compressor);
+        assert!(debug_str.contains("RleEncoder"));
+    }
+
+    #[test]
+    fn test_rle_block_not_used_for_version_v2_1() {
+        let field = create_test_field("test_repdef", DataType::UInt16);
+
+        // Create highly repetitive data
+        let num_values = 1000u64;
+        let mut data = Vec::with_capacity(num_values as usize);
+        for i in 0..10 {
+            for _ in 0..100 {
+                data.push(i as u16);
+            }
+        }
+
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+
+        block.compute_stat();
+
+        let data_block = DataBlock::FixedWidth(block);
+
+        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new())
+            .with_version(LanceFileVersion::V2_1);
+
+        let (compressor, _) = strategy
+            .create_block_compressor(&field, &data_block)
+            .unwrap();
+
+        let debug_str = format!("{:?}", compressor);
+        assert!(
+            !debug_str.contains("RleEncoder"),
+            "RLE should not be used for V2.1"
+        );
     }
 }
