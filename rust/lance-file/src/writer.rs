@@ -23,13 +23,13 @@ use lance_encoding::encoder::{
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
-use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::{debug, warn};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
 use snafu::location;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
@@ -101,7 +101,7 @@ pub struct FileWriterOptions {
 }
 
 pub struct FileWriter {
-    writer: ObjectWriter,
+    writer: Box<dyn Writer>,
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
@@ -127,7 +127,7 @@ static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
 impl FileWriter {
     /// Create a new FileWriter with a desired output schema
     pub fn try_new(
-        object_writer: ObjectWriter,
+        object_writer: Box<dyn Writer>,
         schema: LanceSchema,
         options: FileWriterOptions,
     ) -> Result<Self> {
@@ -140,7 +140,7 @@ impl FileWriter {
     ///
     /// The output schema will be set based on the first batch of data to arrive.
     /// If no data arrives and the writer is finished then the write will fail.
-    pub fn new_lazy(object_writer: ObjectWriter, options: FileWriterOptions) -> Self {
+    pub fn new_lazy(object_writer: Box<dyn Writer>, options: FileWriterOptions) -> Self {
         if let Some(format_version) = options.format_version {
             if format_version.is_unstable()
                 && WARNED_ON_UNSTABLE_API
@@ -187,7 +187,7 @@ impl FileWriter {
         Ok(writer.finish().await? as usize)
     }
 
-    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+    async fn do_write_buffer(writer: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> Result<()> {
         writer.write_all(buf).await?;
         let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
         writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
@@ -653,12 +653,13 @@ impl FileWriter {
         self.writer.write_all(MAGIC).await?;
 
         // 7. close the writer
-        self.writer.shutdown().await?;
+        Writer::shutdown(self.writer.as_mut()).await?;
         Ok(self.rows_written)
     }
 
     pub async fn abort(&mut self) {
-        self.writer.abort().await;
+        // For multipart uploads, ObjectWriter's Drop impl will abort
+        // the upload when the writer is dropped.
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
