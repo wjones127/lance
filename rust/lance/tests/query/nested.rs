@@ -195,7 +195,8 @@ async fn test_query_list_int() {
 
 // Issue: https://github.com/lance-format/lance/issues/1120
 // Struct-level nulls are not preserved during round-trip (write/read)
-// TODO: Implement struct-level null preservation
+// Expected to be fixed in Lance 2.1+
+// TODO: Re-enable when minimum Lance version is 2.1 or later
 #[tokio::test]
 #[ignore]
 async fn test_query_struct() {
@@ -267,7 +268,8 @@ async fn test_query_struct() {
 
 // Issue: https://github.com/lance-format/lance/issues/838
 // List<Struct> columns not properly handled in filtering and selection
-// TODO: Implement proper support for list-of-struct columns
+// Expected to be fixed in Lance 2.1+
+// TODO: Re-enable when minimum Lance version is 2.1 or later
 #[tokio::test]
 #[ignore]
 async fn test_query_list_struct() {
