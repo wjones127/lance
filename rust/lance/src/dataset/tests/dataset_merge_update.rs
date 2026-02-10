@@ -1513,15 +1513,22 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec!["x", "a"])),
         ],
     )
     .unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    let mut dataset = Dataset::write(reader, "memory://test_5321", None)
-        .await
-        .unwrap();
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_5321",
+        Some(WriteParams {
+            max_rows_per_file: 1, // Force multiple fragments for testing
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
 
     // Step 2: Create BTree index on 'id'
     dataset
