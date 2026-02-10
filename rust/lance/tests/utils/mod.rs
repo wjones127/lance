@@ -12,6 +12,7 @@ use lance::{
     dataset::{InsertBuilder, WriteParams},
     Dataset,
 };
+use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -42,6 +43,7 @@ pub struct DatasetTestCases {
     original: RecordBatch,
     index_options: Vec<(String, Vec<Option<IndexType>>)>,
     inverted_index_params: HashMap<String, InvertedIndexParams>,
+    file_version: Option<lance_file::version::LanceFileVersion>,
 }
 
 impl DatasetTestCases {
@@ -50,6 +52,7 @@ impl DatasetTestCases {
             original,
             index_options: Vec::new(),
             inverted_index_params: HashMap::new(),
+            file_version: None,
         }
     }
 
@@ -73,6 +76,11 @@ impl DatasetTestCases {
         self.index_options
             .push((column.clone(), index_types.into_iter().collect()));
         self.inverted_index_params.insert(column, inverted_params);
+        self
+    }
+
+    pub fn with_file_version(mut self, version: lance_file::version::LanceFileVersion) -> Self {
+        self.file_version = Some(version);
         self
     }
 
@@ -131,6 +139,7 @@ impl DatasetTestCases {
                         deletion,
                         &indices,
                         &self.inverted_index_params,
+                        self.file_version,
                     )
                     .await;
                     let context = format!(
@@ -158,6 +167,7 @@ async fn build_dataset(
     deletion: DeletionState,
     indices: &[(&str, IndexType)],
     inverted_index_params: &HashMap<String, InvertedIndexParams>,
+    file_version: Option<lance_file::version::LanceFileVersion>,
 ) -> Dataset {
     let data_to_write = fill_deleted_rows(&original, deletion);
 
@@ -170,6 +180,7 @@ async fn build_dataset(
     let mut ds = InsertBuilder::new("memory://")
         .with_params(&WriteParams {
             max_rows_per_file,
+            data_storage_version: file_version,
             ..Default::default()
         })
         .execute(vec![data_to_write])
