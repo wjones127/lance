@@ -267,7 +267,6 @@ async fn test_query_struct() {
         .await
 }
 
-// Issue: https://github.com/lance-format/lance/issues/1120
 // Version-specific test: struct-level nulls with Lance 2.1+
 #[tokio::test]
 async fn test_query_struct_v2_1() {
@@ -338,10 +337,11 @@ async fn test_query_struct_v2_1() {
         .await
 }
 
-// Issue: https://github.com/lance-format/lance/issues/838
-// List<Struct> columns not properly handled in filtering and selection
-// Expected to be fixed in Lance 2.1+
-// TODO: Re-enable when minimum Lance version is 2.1 or later
+// Issue: Encoding panic in repdef when writing List<Struct>
+// Root cause: panic in lance-encoding/src/repdef.rs:630 during write
+// This is SEPARATE from issue #838 (filtering/selection of list-of-struct)
+// The panic occurs with ListBuilder + StructBuilder validity patterns
+// Python API works fine - issue is specific to Rust builder + encoder interaction
 #[tokio::test]
 #[ignore]
 async fn test_query_list_struct() {
@@ -471,6 +471,7 @@ async fn test_query_list_struct() {
 
     // No index — LabelList doesn't support struct elements
     DatasetTestCases::from_data(batch)
+        .with_file_version(LanceFileVersion::V2_2)
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
@@ -480,9 +481,10 @@ async fn test_query_list_struct() {
         .await
 }
 
-// Issue: https://github.com/lance-format/lance/issues/838
+// Issue: Encoding panic in repdef when writing List<Struct>
 // Version-specific test: list-of-struct with Lance 2.1+
-// Note: Even with V2_1, this test still fails - issue #838 is not yet fixed
+// Note: Panic occurs even with V2.1 - indicates encoder issue, not version-specific
+// Python repro: test_list_struct_minimal.py shows Python API works fine
 #[tokio::test]
 #[ignore]
 async fn test_query_list_struct_v2_1() {
