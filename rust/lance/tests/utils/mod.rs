@@ -79,7 +79,7 @@ impl DatasetTestCases {
         self
     }
 
-    pub fn with_file_version(mut self, version: lance_file::version::LanceFileVersion) -> Self {
+    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
         self.file_version = Some(version);
         self
     }

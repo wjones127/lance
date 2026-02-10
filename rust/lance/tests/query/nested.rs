@@ -337,11 +337,12 @@ async fn test_query_struct_v2_1() {
         .await
 }
 
-// Issue: Encoding panic in repdef when writing List<Struct>
-// Root cause: panic in lance-encoding/src/repdef.rs:630 during write
+// Issue: https://github.com/lance-format/lance/issues/1120 (related)
+// List<Struct> with null struct elements: validity bits are not preserved on round-trip
+// Struct-level nulls are lost and converted to valid structs
+// Related to issue #1120 but affecting list elements
 // This is SEPARATE from issue #838 (filtering/selection of list-of-struct)
-// The panic occurs with ListBuilder + StructBuilder validity patterns
-// Python API works fine - issue is specific to Rust builder + encoder interaction
+// Rust test panics on write, Python API silently drops the validity information
 #[tokio::test]
 #[ignore]
 async fn test_query_list_struct() {
@@ -481,10 +482,10 @@ async fn test_query_list_struct() {
         .await
 }
 
-// Issue: Encoding panic in repdef when writing List<Struct>
+// Issue: https://github.com/lance-format/lance/issues/1120 (related)
 // Version-specific test: list-of-struct with Lance 2.1+
-// Note: Panic occurs even with V2.1 - indicates encoder issue, not version-specific
-// Python repro: test_list_struct_minimal.py shows Python API works fine
+// Null struct element validity not preserved (same as issue #1120 but for lists)
+// Panics on write in Rust, silently drops validity in Python
 #[tokio::test]
 #[ignore]
 async fn test_query_list_struct_v2_1() {
