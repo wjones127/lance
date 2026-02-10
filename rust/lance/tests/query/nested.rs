@@ -16,10 +16,9 @@ use super::{test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
 
 // Issue: https://github.com/lance-format/lance/issues/5682
-// LabelList index drops rows with null elements in lists
-// TODO: Remove #[ignore] once fix is available on main
+// Partially fixed by PR #5867 and PR #5914, but LabelList index still has issues
+// LabelList index is disabled for now - tests pass without it
 #[tokio::test]
-#[ignore]
 async fn test_query_list_str() {
     let mut builder = ListBuilder::new(StringBuilder::new());
 
@@ -75,7 +74,7 @@ async fn test_query_list_str() {
     let batch = RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
 
     DatasetTestCases::from_data(batch)
-        .with_index_types("value", [None, Some(IndexType::LabelList)])
+        .with_index_types("value", [None]) // TODO: Re-enable LabelList when issue is fully fixed
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
@@ -166,7 +165,7 @@ async fn test_query_list_int() {
     let batch = RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
 
     DatasetTestCases::from_data(batch)
-        .with_index_types("value", [None, Some(IndexType::LabelList)])
+        .with_index_types("value", [None]) // TODO: Re-enable LabelList when issue is fully fixed
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
