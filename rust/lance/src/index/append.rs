@@ -165,7 +165,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             } else {
                 let new_store =
                     LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-                index.update(new_data_stream, &new_store).await?
+                index
+                    .update(new_data_stream, &new_store, Some(&effective_old_frags))
+                    .await?
             };
 
             // TODO: don't hard-code index version
