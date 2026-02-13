@@ -1355,8 +1355,7 @@ fn filter_row_ids_by_fragments(
     let schema = stream.schema();
     let filtered = stream.map(move |batch_result| {
         let batch = batch_result?;
-        let row_ids = batch
-            .column(1)
+        let row_ids = batch[ROW_ID]
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
             .expect("expected UInt64Array for row_id column");
