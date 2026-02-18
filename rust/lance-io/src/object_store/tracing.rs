@@ -15,25 +15,29 @@ use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
     PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
-use tracing::{debug_span, instrument, Instrument, Span};
+use tracing::{instrument, Instrument, Span};
 
 #[derive(Debug)]
 pub struct TracedMultipartUpload {
     write_span: Span,
     target: Box<dyn MultipartUpload>,
+    write_size: usize,
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for TracedMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let write_span = self.write_span.clone();
+        self.write_size += data.content_length();
         let fut = self.target.put_part(data);
         Box::pin(fut.instrument(write_span))
     }
 
     #[instrument(level = "debug", skip_all)]
     async fn complete(&mut self) -> OSResult<PutResult> {
-        self.target.complete().await
+        let res = self.target.complete().await?;
+        self.write_span.record("size", self.write_size);
+        Ok(res)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -56,12 +60,12 @@ impl std::fmt::Display for TracedObjectStore {
 #[async_trait::async_trait]
 #[deny(clippy::missing_trait_methods)]
 impl object_store::ObjectStore for TracedObjectStore {
-    #[instrument(level = "debug", skip(self, bytes))]
+    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
         self.target.put(location, bytes).await
     }
 
-    #[instrument(level = "debug", skip(self, bytes))]
+    #[instrument(level = "debug", skip(self, bytes, location), fields(path = location.as_ref(), size = bytes.content_length()))]
     async fn put_opts(
         &self,
         location: &Path,
@@ -71,6 +75,7 @@ impl object_store::ObjectStore for TracedObjectStore {
         self.target.put_opts(location, bytes, opts).await
     }
 
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn put_multipart(
         &self,
         location: &Path,
@@ -78,10 +83,12 @@ impl object_store::ObjectStore for TracedObjectStore {
         let upload = self.target.put_multipart(location).await?;
         Ok(Box::new(TracedMultipartUpload {
             target: upload,
-            write_span: debug_span!("put_multipart"),
+            write_span: tracing::Span::current(),
+            write_size: 0,
         }))
     }
 
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn put_multipart_opts(
         &self,
         location: &Path,
@@ -90,36 +97,47 @@ impl object_store::ObjectStore for TracedObjectStore {
         let upload = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(TracedMultipartUpload {
             target: upload,
-            write_span: debug_span!("put_multipart_opts"),
+            write_span: tracing::Span::current(),
+            write_size: 0,
         }))
     }
 
-    #[instrument(level = "debug", skip(self, location))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn get(&self, location: &Path) -> OSResult<GetResult> {
-        self.target.get(location).await
+        let res = self.target.get(location).await?;
+
+        let span = tracing::Span::current();
+        span.record("size", res.meta.size);
+
+        Ok(res)
     }
 
-    #[instrument(level = "debug", skip(self, options))]
+    #[instrument(level = "debug", skip(self, options, location), fields(path = location.as_ref(), size = tracing::field::Empty))]
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        self.target.get_opts(location, options).await
+        let res = self.target.get_opts(location, options).await?;
+
+        let span = tracing::Span::current();
+        span.record("size", res.range.end - res.range.start);
+
+        Ok(res)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = range.end - range.start))]
     async fn get_range(&self, location: &Path, range: Range<u64>) -> OSResult<Bytes> {
         self.target.get_range(location, range).await
     }
 
-    #[instrument(level = "debug", skip(self, ranges))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref(), size = ranges.iter().map(|r| r.end - r.start).sum::<u64>()))]
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
         self.target.get_ranges(location, ranges).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
     async fn head(&self, location: &Path) -> OSResult<ObjectMeta> {
         self.target.head(location).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, location), fields(path = location.as_ref()))]
     async fn delete(&self, location: &Path) -> OSResult<()> {
         self.target.delete(location).await
     }
@@ -135,12 +153,12 @@ impl object_store::ObjectStore for TracedObjectStore {
             .boxed()
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         self.target.list(prefix).stream_in_current_span().boxed()
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, prefix, offset), fields(prefix = prefix.map(|p| p.as_ref()), offset = offset.as_ref()))]
     fn list_with_offset(
         &self,
         prefix: Option<&Path>,
@@ -152,27 +170,27 @@ impl object_store::ObjectStore for TracedObjectStore {
             .boxed()
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, prefix), fields(prefix = prefix.map(|p| p.as_ref())))]
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         self.target.list_with_delimiter(prefix).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.rename_if_not_exists(from, to).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, from, to), fields(from = from.as_ref(), to = to.as_ref()))]
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
     }
