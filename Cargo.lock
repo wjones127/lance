@@ -5188,6 +5188,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "tracing-mock",
  "url",
 ]
 
@@ -9199,6 +9200,16 @@ checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
  "log",
  "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-mock"
+version = "0.1.0-beta.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98a31739d4ff16a8634c5463c75d5bf9e500596958a245d1ee5b6b98ac37658d"
+dependencies = [
+ "tracing",
  "tracing-core",
 ]
 

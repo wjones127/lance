@@ -196,6 +196,251 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::PutPayload;
+    use tracing_mock::{expect, subscriber};
+
+    fn payload(data: &[u8]) -> PutPayload {
+        PutPayload::from_bytes(Bytes::copy_from_slice(data))
+    }
+
+    fn make_store() -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(InMemory::new()).traced()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_put_records_path_and_size() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let span = expect::span().named("put");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                span.clone().with_fields(
+                    expect::field("path")
+                        .with_value(&"a/b.bin")
+                        .and(expect::field("size").with_value(&data.len()))
+                        .only(),
+                ),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        make_store().put(&path, payload(data)).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_get_records_path_and_size() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+        let size = data.len() as u64; // meta.size is u64
+
+        // Seed without an active mock subscriber.
+        let store = make_store();
+        store.put(&path, payload(data)).await.unwrap();
+
+        let span = expect::span().named("get");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                // size = Empty at span creation, so only path is visited.
+                span.clone()
+                    .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
+            )
+            .enter(span.clone())
+            .record(span.clone(), expect::field("size").with_value(&size))
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.get(&path).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_get_range_records_path_and_size() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let store = make_store();
+        store.put(&path, payload(data)).await.unwrap();
+
+        let range = 2u64..7u64;
+        let size = range.end - range.start;
+
+        let span = expect::span().named("get_range");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                // `range` is also captured automatically as a debug field since it
+                // is not in the skip list, so we don't use `.only()` here.
+                span.clone().with_fields(
+                    expect::field("path")
+                        .with_value(&"a/b.bin")
+                        .and(expect::field("size").with_value(&size)),
+                ),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.get_range(&path, range).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_get_ranges_records_path_and_total_size() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let store = make_store();
+        store.put(&path, payload(data)).await.unwrap();
+
+        let ranges = [2u64..5u64, 6u64..9u64];
+        let size: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+
+        let span = expect::span().named("get_ranges");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                // `ranges` is also captured automatically as a debug field since
+                // it is not in the skip list, so we don't use `.only()` here.
+                span.clone().with_fields(
+                    expect::field("path")
+                        .with_value(&"a/b.bin")
+                        .and(expect::field("size").with_value(&size)),
+                ),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.get_ranges(&path, &ranges).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_head_records_path() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let store = make_store();
+        store.put(&path, payload(data)).await.unwrap();
+
+        let span = expect::span().named("head");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                span.clone()
+                    .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.head(&path).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_delete_records_path() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let store = make_store();
+        store.put(&path, payload(data)).await.unwrap();
+
+        let span = expect::span().named("delete");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                span.clone()
+                    .with_fields(expect::field("path").with_value(&"a/b.bin").only()),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.delete(&path).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_copy_records_from_and_to() {
+        let from = Path::from("a/src.bin");
+        let to = Path::from("a/dst.bin");
+        let data = b"hello world";
+
+        let store = make_store();
+        store.put(&from, payload(data)).await.unwrap();
+
+        let span = expect::span().named("copy");
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                span.clone().with_fields(
+                    expect::field("from")
+                        .with_value(&"a/src.bin")
+                        .and(expect::field("to").with_value(&"a/dst.bin"))
+                        .only(),
+                ),
+            )
+            .enter(span.clone())
+            .exit(span.clone())
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        store.copy(&from, &to).await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_put_multipart_records_path() {
+        let path = Path::from("a/b.bin");
+        let data = b"hello world";
+
+        let put_mp_span = expect::span().named("put_multipart");
+        // Expect only the span creation; any subsequent enter/exit/record
+        // events are not in the queue so they are silently ignored.
+        let (sub, handle) = subscriber::mock()
+            .new_span(
+                // size = Empty at span creation, so only path is visited.
+                put_mp_span.with_fields(expect::field("path").with_value(&"a/b.bin").only()),
+            )
+            .run_with_handle();
+
+        let _guard = tracing::subscriber::set_default(sub);
+        let store = make_store();
+        let mut upload = store.put_multipart(&path).await.unwrap();
+        upload.put_part(payload(data)).await.unwrap();
+        upload.complete().await.unwrap();
+        drop(_guard);
+
+        handle.assert_finished();
+    }
+}
+
 pub trait ObjectStoreTracingExt {
     fn traced(self) -> Arc<dyn object_store::ObjectStore>;
 }
