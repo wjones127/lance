@@ -57,7 +57,7 @@ use lance_io::utils::{
     read_last_block, read_message, read_message_from_buf, read_metadata_offset, read_version,
     CachedFileSize,
 };
-use lance_table::format::{list_index_files_with_sizes, IndexFile, IndexMetadata};
+use lance_table::format::{list_index_files_with_sizes, IndexMetadata};
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
@@ -345,18 +345,9 @@ pub(crate) async fn remap_index(
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
             };
 
-            // Capture file sizes for the scalar index
-            let files: Vec<IndexFile> = new_store
-                .list_files_with_sizes()
-                .await?
-                .into_iter()
-                .map(|f| IndexFile {
-                    path: f.path,
-                    size_bytes: f.size_bytes,
-                })
-                .collect();
-
-            (created, Some(files))
+            // File sizes were captured by the remap/train operation above.
+            let files = created.files.clone();
+            (created, files)
         }
         it if it.is_vector() => {
             remap_vector_index(
