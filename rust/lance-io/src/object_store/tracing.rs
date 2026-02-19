@@ -196,6 +196,22 @@ impl object_store::ObjectStore for TracedObjectStore {
     }
 }
 
+pub trait ObjectStoreTracingExt {
+    fn traced(self) -> Arc<dyn object_store::ObjectStore>;
+}
+
+impl ObjectStoreTracingExt for Arc<dyn object_store::ObjectStore> {
+    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(TracedObjectStore { target: self })
+    }
+}
+
+impl<T: object_store::ObjectStore> ObjectStoreTracingExt for Arc<T> {
+    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(TracedObjectStore { target: self })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,21 +454,5 @@ mod tests {
         drop(_guard);
 
         handle.assert_finished();
-    }
-}
-
-pub trait ObjectStoreTracingExt {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore>;
-}
-
-impl ObjectStoreTracingExt for Arc<dyn object_store::ObjectStore> {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(TracedObjectStore { target: self })
-    }
-}
-
-impl<T: object_store::ObjectStore> ObjectStoreTracingExt for Arc<T> {
-    fn traced(self) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(TracedObjectStore { target: self })
     }
 }
