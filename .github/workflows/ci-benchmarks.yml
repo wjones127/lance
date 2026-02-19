@@ -44,13 +44,12 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install maturin duckdb requests pytest pytest-benchmark
-          maturin develop --locked --release
+          pip install maturin duckdb requests pytest pytest-benchmark datasets
+          maturin develop --locked --release --features datagen
       - name: Build memtest
         run: |
           source venv/bin/activate
-          cd memtest
-          make build-release
+          make -C ../memtest build-release
       - name: Generate datasets
         run: |
           source venv/bin/activate

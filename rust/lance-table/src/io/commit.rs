@@ -37,7 +37,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use lance_io::object_writer::{ObjectWriter, WriteResult};
+use lance_io::object_writer::{get_etag, ObjectWriter, WriteResult};
 use log::warn;
 use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
@@ -51,7 +51,7 @@ pub mod external_manifest;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
-use lance_io::traits::WriteExt;
+use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{is_detached_version, IndexMetadata, Manifest, Transaction};
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT};
@@ -67,7 +67,7 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-const VERSIONS_DIR: &str = "_versions";
+pub const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 const DETACHED_VERSION_PREFIX: &str = "d";
 
@@ -204,7 +204,7 @@ pub fn write_manifest_file_to_path<'a>(
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let res = object_writer.shutdown().await?;
+        let res = Writer::shutdown(&mut object_writer).await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
         Ok(res)
     })
@@ -318,23 +318,27 @@ async fn current_manifest_path(
                 e_tag: meta.e_tag,
             })
         }
-        // If the first valid manifest we see if V1, assume for now that we are
-        // using V1 naming scheme for all manifests. Since we are listing the
-        // directory anyways, we will assert there aren't any V2 manifests.
-        (Some((scheme, meta)), _) => {
-            let mut current_version = scheme
+        // If the list is not lexically ordered, we need to iterate all manifests
+        // to find the latest version. This works for both V1 and V2 schemes.
+        (Some((first_scheme, meta)), _) => {
+            let mut current_version = first_scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
             let mut current_meta = meta;
+            let scheme = first_scheme;
 
-            while let Some((scheme, meta)) = valid_manifests.next().await.transpose()? {
-                if matches!(scheme, ManifestNamingScheme::V2) {
+            while let Some((entry_scheme, meta)) = valid_manifests.next().await.transpose()? {
+                if entry_scheme != scheme {
                     return Err(Error::Internal {
-                        message: "Found V2 manifest in a V1 manifest directory".to_string(),
+                        message: format!(
+                            "Found multiple manifest naming schemes in the same directory: {:?} and {:?}. \
+                             Use `migrate_manifest_paths_v2` to migrate the directory.",
+                            scheme, entry_scheme
+                        ),
                         location: location!(),
                     });
                 }
-                let version = scheme
+                let version = entry_scheme
                     .parse_version(meta.location.filename().unwrap())
                     .unwrap();
                 if version > current_version {
@@ -420,36 +424,6 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
     } else {
         Ok(None)
     }
-}
-
-// Based on object store's implementation.
-fn get_etag(metadata: &std::fs::Metadata) -> String {
-    let inode = get_inode(metadata);
-    let size = metadata.len();
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|mtime| mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-        .unwrap_or_default()
-        .as_micros();
-
-    // Use an ETag scheme based on that used by many popular HTTP servers
-    // <https://httpd.apache.org/docs/2.2/mod/core.html#fileetag>
-    // <https://stackoverflow.com/questions/47512043/how-etags-are-generated-and-configured>
-    format!("{inode:x}-{mtime:x}-{size:x}")
-}
-
-#[cfg(unix)]
-/// We include the inode when available to yield an ETag more resistant to collisions
-/// and as used by popular web servers such as [Apache](https://httpd.apache.org/docs/2.2/mod/core.html#fileetag)
-fn get_inode(metadata: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::ino(metadata)
-}
-
-#[cfg(not(unix))]
-/// On platforms where an inode isn't available, fallback to just relying on size and mtime
-fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
-    0
 }
 
 fn list_manifests<'a>(
@@ -724,7 +698,7 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "memory" | "oss" => Ok(Arc::new(ConditionalPutCommitHandler)),
+        "s3" | "gs" | "az" | "memory" | "oss" | "cos" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -761,20 +735,22 @@ pub async fn commit_handler_from_url(
                 }
             };
             let options = options.clone().unwrap_or_default();
-            let storage_options = StorageOptions(options.storage_options.unwrap_or_default());
-            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options);
-            let expires_at_millis = storage_options.expires_at_millis();
-            let storage_options = storage_options.as_s3_options();
+            let storage_options_raw =
+                StorageOptions(options.storage_options().cloned().unwrap_or_default());
+            let dynamo_endpoint = get_dynamodb_endpoint(&storage_options_raw);
+            let storage_options = storage_options_raw.as_s3_options();
 
             let region = storage_options.get(&AmazonS3ConfigKey::Region).cloned();
+
+            // Get accessor from the options
+            let accessor = options.get_accessor();
 
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
-                options.storage_options_provider.clone(),
-                expires_at_millis,
+                accessor,
             )
             .await?;
 
@@ -1239,5 +1215,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_current_manifest_path(
+        #[values(true, false)] lexical_list_store: bool,
+        #[values(ManifestNamingScheme::V1, ManifestNamingScheme::V2)]
+        naming_scheme: ManifestNamingScheme,
+    ) {
+        // Use memory store for both cases to avoid local FS special codepath.
+        // Modify list_is_lexically_ordered to simulate different object stores.
+        let mut object_store = ObjectStore::memory();
+        object_store.list_is_lexically_ordered = lexical_list_store;
+        let object_store = Box::new(object_store);
+        let base = Path::from("base");
+
+        // Write 12 manifest files in non-sequential order
+        for version in [5, 2, 11, 0, 8, 3, 10, 1, 7, 4, 9, 6] {
+            let path = naming_scheme.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+
+        assert_eq!(location.version, 11);
+        assert_eq!(location.naming_scheme, naming_scheme);
+        assert_eq!(location.path, naming_scheme.manifest_path(&base, 11));
     }
 }

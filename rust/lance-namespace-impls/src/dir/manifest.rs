@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::StreamExt;
+use futures::{stream::StreamExt, FutureExt};
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{builder::DatasetBuilder, WriteParams};
 use lance::session::Session;
@@ -24,12 +24,13 @@ use lance_index::IndexType;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeregisterTableRequest,
-    DeregisterTableResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
-    DescribeTableRequest, DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse,
-    DropTableRequest, DropTableResponse, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest,
-    RegisterTableResponse, TableExistsRequest,
+    CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
+    DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
+    DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
+    DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
+    DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
+    ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
+    TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
@@ -981,7 +982,11 @@ impl ManifestNamespace {
             let write_params = WriteParams {
                 session,
                 store_params: storage_options.as_ref().map(|opts| ObjectStoreParams {
-                    storage_options: Some(opts.clone()),
+                    storage_options_accessor: Some(Arc::new(
+                        lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                            opts.clone(),
+                        ),
+                    )),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1076,7 +1081,7 @@ impl LanceNamespace for ManifestNamespace {
         }
 
         let object_id = Self::str_object_id(table_id);
-        let table_info = self.query_manifest_for_table(&object_id).await?;
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
 
         // Extract table name and namespace from table_id
         let table_name = table_id.last().cloned().unwrap_or_default();
@@ -1086,10 +1091,32 @@ impl LanceNamespace for ManifestNamespace {
             vec![]
         };
 
+        let load_detailed_metadata = request.load_detailed_metadata.unwrap_or(false);
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+
         match table_info {
             Some(info) => {
                 // Construct full URI from relative location
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+
+                let storage_options = if vend_credentials {
+                    self.storage_options.clone()
+                } else {
+                    None
+                };
+
+                // If not loading detailed metadata, return minimal response with just location
+                if !load_detailed_metadata {
+                    return Ok(DescribeTableResponse {
+                        table: Some(table_name),
+                        namespace: Some(namespace_id),
+                        location: Some(table_uri.clone()),
+                        table_uri: Some(table_uri),
+                        storage_options,
+                        ..Default::default()
+                    });
+                }
 
                 // Try to open the dataset to get version and schema
                 match Dataset::open(&table_uri).await {
@@ -1111,8 +1138,8 @@ impl LanceNamespace for ManifestNamespace {
                             location: Some(table_uri.clone()),
                             table_uri: Some(table_uri),
                             schema: Some(Box::new(json_schema)),
-                            storage_options: self.storage_options.clone(),
-                            stats: None,
+                            storage_options,
+                            ..Default::default()
                         })
                     }
                     Err(_) => {
@@ -1120,12 +1147,10 @@ impl LanceNamespace for ManifestNamespace {
                         Ok(DescribeTableResponse {
                             table: Some(table_name),
                             namespace: Some(namespace_id),
-                            version: None,
                             location: Some(table_uri.clone()),
                             table_uri: Some(table_uri),
-                            schema: None,
-                            storage_options: self.storage_options.clone(),
-                            stats: None,
+                            storage_options,
+                            ..Default::default()
                         })
                     }
                 }
@@ -1249,10 +1274,10 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(CreateTableResponse {
-            transaction_id: None,
             version: Some(1),
             location: Some(table_uri),
             storage_options: self.storage_options.clone(),
+            ..Default::default()
         })
     }
 
@@ -1273,12 +1298,12 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = Self::build_object_id(&namespace, &table_name);
 
         // Query manifest for table location
-        let table_info = self.query_manifest_for_table(&object_id).await?;
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
 
         match table_info {
             Some(info) => {
                 // Delete from manifest first
-                self.delete_from_manifest(&object_id).await?;
+                self.delete_from_manifest(&object_id).boxed().await?;
 
                 // Delete physical data directory using the dir_name from manifest
                 let table_path = self.base_path.child(info.location.as_str());
@@ -1287,6 +1312,7 @@ impl LanceNamespace for ManifestNamespace {
                 // Remove the table directory
                 self.object_store
                     .remove_dir_all(table_path)
+                    .boxed()
                     .await
                     .map_err(|e| Error::Namespace {
                         source: format!("Failed to delete table directory: {}", e).into(),
@@ -1296,8 +1322,7 @@ impl LanceNamespace for ManifestNamespace {
                 Ok(DropTableResponse {
                     id: request.id.clone(),
                     location: Some(table_uri),
-                    properties: None,
-                    transaction_id: None,
+                    ..Default::default()
                 })
             }
             None => Err(Error::Namespace {
@@ -1369,8 +1394,10 @@ impl LanceNamespace for ManifestNamespace {
 
         // Root namespace always exists
         if namespace_id.is_empty() {
+            #[allow(clippy::needless_update)]
             return Ok(DescribeNamespaceResponse {
                 properties: Some(HashMap::new()),
+                ..Default::default()
             });
         }
 
@@ -1379,8 +1406,10 @@ impl LanceNamespace for ManifestNamespace {
         let namespace_info = self.query_manifest_for_namespace(&object_id).await?;
 
         match namespace_info {
+            #[allow(clippy::needless_update)]
             Some(info) => Ok(DescribeNamespaceResponse {
                 properties: info.metadata,
+                ..Default::default()
             }),
             None => Err(Error::Namespace {
                 source: format!("Namespace '{}' not found", object_id).into(),
@@ -1439,8 +1468,8 @@ impl LanceNamespace for ManifestNamespace {
         .await?;
 
         Ok(CreateNamespaceResponse {
-            transaction_id: None,
             properties: request.properties,
+            ..Default::default()
         })
     }
 
@@ -1461,7 +1490,7 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = namespace_id.join(DELIMITER);
 
         // Check if namespace exists
-        if !self.manifest_contains_object(&object_id).await? {
+        if !self.manifest_contains_object(&object_id).boxed().await? {
             return Err(Error::Namespace {
                 source: format!("Namespace '{}' not found", object_id).into(),
                 location: location!(),
@@ -1471,7 +1500,7 @@ impl LanceNamespace for ManifestNamespace {
         // Check for child namespaces
         let prefix = format!("{}{}", object_id, DELIMITER);
         let filter = format!("starts_with(object_id, '{}')", prefix);
-        let mut scanner = self.manifest_scanner().await?;
+        let mut scanner = self.manifest_scanner().boxed().await?;
         scanner.filter(&filter).map_err(|e| Error::IO {
             source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
             location: location!(),
@@ -1481,7 +1510,7 @@ impl LanceNamespace for ManifestNamespace {
             location: location!(),
         })?;
         scanner.with_row_id();
-        let count = scanner.count_rows().await.map_err(|e| Error::IO {
+        let count = scanner.count_rows().boxed().await.map_err(|e| Error::IO {
             source: box_error(std::io::Error::other(format!(
                 "Failed to count rows: {}",
                 e
@@ -1500,12 +1529,9 @@ impl LanceNamespace for ManifestNamespace {
             });
         }
 
-        self.delete_from_manifest(&object_id).await?;
+        self.delete_from_manifest(&object_id).boxed().await?;
 
-        Ok(DropNamespaceResponse {
-            properties: None,
-            transaction_id: None,
-        })
+        Ok(DropNamespaceResponse::default())
     }
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
@@ -1621,11 +1647,121 @@ impl LanceNamespace for ManifestNamespace {
             table_uri
         );
 
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let storage_options = if vend_credentials {
+            self.storage_options.clone()
+        } else {
+            None
+        };
+
         Ok(CreateEmptyTableResponse {
-            transaction_id: None,
             location: Some(table_uri),
-            properties: None,
-            storage_options: self.storage_options.clone(),
+            storage_options,
+            ..Default::default()
+        })
+    }
+
+    async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| Error::InvalidInput {
+            source: "Table ID is required".into(),
+            location: location!(),
+        })?;
+
+        if table_id.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "Table ID cannot be empty".into(),
+                location: location!(),
+            });
+        }
+
+        let (namespace, table_name) = Self::split_object_id(table_id);
+        let object_id = Self::build_object_id(&namespace, &table_name);
+
+        // Check if table already exists in manifest
+        let existing = self.query_manifest_for_table(&object_id).await?;
+        if existing.is_some() {
+            return Err(Error::Namespace {
+                source: format!("Table '{}' already exists", table_name).into(),
+                location: location!(),
+            });
+        }
+
+        // Create table location path with hash-based naming
+        // When dir_listing_enabled is true and it's a root table, use directory-style naming: {table_name}.lance
+        // Otherwise, use hash-based naming: {hash}_{object_id}
+        let dir_name = if namespace.is_empty() && self.dir_listing_enabled {
+            // Root table with directory listing enabled: use {table_name}.lance
+            format!("{}.lance", table_name)
+        } else {
+            // Child namespace table or dir listing disabled: use hash-based naming
+            Self::generate_dir_name(&object_id)
+        };
+        let table_path = self.base_path.child(dir_name.as_str());
+        let table_uri = Self::construct_full_uri(&self.root, &dir_name)?;
+
+        // Validate location if provided
+        if let Some(req_location) = &request.location {
+            let req_location = req_location.trim_end_matches('/');
+            if req_location != table_uri {
+                return Err(Error::Namespace {
+                    source: format!(
+                        "Cannot declare table {} at location {}, must be at location {}",
+                        table_name, req_location, table_uri
+                    )
+                    .into(),
+                    location: location!(),
+                });
+            }
+        }
+
+        // Create the .lance-reserved file to mark the table as existing
+        let reserved_file_path = table_path.child(".lance-reserved");
+
+        self.object_store
+            .create(&reserved_file_path)
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to create .lance-reserved file for table {}: {}",
+                    table_name, e
+                )
+                .into(),
+                location: location!(),
+            })?
+            .shutdown()
+            .await
+            .map_err(|e| Error::Namespace {
+                source: format!(
+                    "Failed to finalize .lance-reserved file for table {}: {}",
+                    table_name, e
+                )
+                .into(),
+                location: location!(),
+            })?;
+
+        // Add entry to manifest marking this as a declared table (store dir_name, not full path)
+        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
+            .await?;
+
+        log::info!(
+            "Declared table '{}' in manifest at {}",
+            table_name,
+            table_uri
+        );
+
+        // For backwards compatibility, only skip vending credentials when explicitly set to false
+        let vend_credentials = request.vend_credentials.unwrap_or(true);
+        let storage_options = if vend_credentials {
+            self.storage_options.clone()
+        } else {
+            None
+        };
+
+        Ok(DeclareTableResponse {
+            location: Some(table_uri),
+            storage_options,
+            ..Default::default()
         })
     }
 
@@ -1698,9 +1834,8 @@ impl LanceNamespace for ManifestNamespace {
             .await?;
 
         Ok(RegisterTableResponse {
-            transaction_id: None,
             location: Some(location),
-            properties: None,
+            ..Default::default()
         })
     }
 
@@ -1729,7 +1864,7 @@ impl LanceNamespace for ManifestNamespace {
         let table_uri = match table_info {
             Some(info) => {
                 // Delete from manifest only (leave physical data intact)
-                self.delete_from_manifest(&object_id).await?;
+                self.delete_from_manifest(&object_id).boxed().await?;
                 Self::construct_full_uri(&self.root, &info.location)?
             }
             None => {
@@ -1741,10 +1876,9 @@ impl LanceNamespace for ManifestNamespace {
         };
 
         Ok(DeregisterTableResponse {
-            transaction_id: None,
             id: request.id.clone(),
             location: Some(table_uri),
-            properties: None,
+            ..Default::default()
         })
     }
 }
@@ -2172,6 +2306,7 @@ mod tests {
         // Verify namespace exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_ok(), "Namespace should exist");
@@ -2181,6 +2316,7 @@ mod tests {
             id: Some(vec![]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2225,6 +2361,7 @@ mod tests {
         // Verify nested namespace exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["parent".to_string(), "child".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_ok(), "Nested namespace should exist");
@@ -2234,6 +2371,7 @@ mod tests {
             id: Some(vec!["parent".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_namespaces(list_req).await;
         assert!(result.is_ok());
@@ -2301,6 +2439,7 @@ mod tests {
         // Verify namespace no longer exists
         let exists_req = NamespaceExistsRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.namespace_exists(exists_req).await;
         assert!(result.is_err(), "Namespace should not exist after drop");
@@ -2379,6 +2518,7 @@ mod tests {
             id: Some(vec!["ns1".to_string()]),
             page_token: None,
             limit: None,
+            ..Default::default()
         };
         let result = dir_namespace.list_tables(list_req).await;
         assert!(result.is_ok());
@@ -2415,6 +2555,7 @@ mod tests {
         // Describe the namespace
         let describe_req = DescribeNamespaceRequest {
             id: Some(vec!["ns1".to_string()]),
+            ..Default::default()
         };
         let result = dir_namespace.describe_namespace(describe_req).await;
         assert!(

@@ -232,12 +232,14 @@ use snafu::location;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
+use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
 use tracing::instrument;
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
 use crate::encoder::EncodedBatch;
+use crate::encodings::logical::fixed_size_list::StructuralFixedSizeListScheduler;
 use crate::encodings::logical::list::StructuralListScheduler;
 use crate::encodings::logical::map::StructuralMapScheduler;
 use crate::encodings::logical::primitive::StructuralPrimitiveFieldScheduler;
@@ -765,14 +767,22 @@ impl CoreFieldDecoderStrategy {
                 )
             }
             DataType::List(_) | DataType::LargeList(_) => {
-                let child = field
-                    .children
-                    .first()
-                    .expect("List field must have a child");
+                let child = field.children.first().expect_ok()?;
                 let child_scheduler =
                     self.create_structural_field_scheduler(child, column_infos)?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
+            }
+            DataType::FixedSizeList(inner, dimension)
+                if matches!(inner.data_type(), DataType::Struct(_)) =>
+            {
+                let child = field.children.first().expect_ok()?;
+                let child_scheduler =
+                    self.create_structural_field_scheduler(child, column_infos)?;
+                Ok(Box::new(StructuralFixedSizeListScheduler::new(
+                    child_scheduler,
+                    *dimension,
+                )) as Box<dyn StructuralFieldScheduler>)
             }
             DataType::Map(_, keys_sorted) => {
                 // TODO: We only support keys_sorted=false for now,
@@ -784,10 +794,7 @@ impl CoreFieldDecoderStrategy {
                         location: location!(),
                     });
                 }
-                let entries_child = field
-                    .children
-                    .first()
-                    .expect("Map field must have an entries child");
+                let entries_child = field.children.first().expect_ok()?;
                 let child_scheduler =
                     self.create_structural_field_scheduler(entries_child, column_infos)?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
@@ -1295,7 +1302,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] <= w[1]));
+        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
         if indices.is_empty() {
             return;
         }
@@ -1375,6 +1382,7 @@ impl BatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1711,6 +1719,7 @@ impl StructuralBatchDecodeStream {
         }
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
@@ -1786,15 +1795,7 @@ impl StructuralBatchDecodeStream {
                 let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = async move {
                     let next_task = next_task?;
-                    // Real decode work happens inside into_batch, which can block the current
-                    // thread for a long time. By spawning it as a new task, we allow Tokio's
-                    // worker threads to keep making progress.
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::Wrapped {
-                            error: err.into(),
-                            location: location!(),
-                        })?
+                    async move { next_task.into_batch(emitted_batch_size_warning) }.await
                 };
                 (task, num_rows)
             });

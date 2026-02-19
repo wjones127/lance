@@ -193,7 +193,7 @@ impl<'a> InsertBuilder<'a> {
         let target_base_info =
             validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
 
-        let (written_fragments, _) = write_fragments_internal(
+        let (written_fragments, written_schema) = write_fragments_internal(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -204,7 +204,7 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(schema, written_fragments, &context)?;
+        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
@@ -216,28 +216,29 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create => {
-                let config_upsert_values =
-                    if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
-                        let mut upsert_values = HashMap::new();
-                        upsert_values.insert(
-                            String::from("lance.auto_cleanup.interval"),
-                            auto_cleanup_params.interval.to_string(),
-                        );
+                let mut upsert_values = HashMap::new();
+                if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
+                    upsert_values.insert(
+                        String::from("lance.auto_cleanup.interval"),
+                        auto_cleanup_params.interval.to_string(),
+                    );
 
-                        let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
-                            Error::InvalidInput {
-                                source: e.into(),
-                                location: location!(),
-                            }
-                        })?;
-                        upsert_values.insert(
-                            String::from("lance.auto_cleanup.older_than"),
-                            format_duration(duration).to_string(),
-                        );
-                        Some(upsert_values)
-                    } else {
-                        None
-                    };
+                    let duration = auto_cleanup_params.older_than.to_std().map_err(|e| {
+                        Error::InvalidInput {
+                            source: e.into(),
+                            location: location!(),
+                        }
+                    })?;
+                    upsert_values.insert(
+                        String::from("lance.auto_cleanup.older_than"),
+                        format_duration(duration).to_string(),
+                    );
+                }
+                let config_upsert_values = if upsert_values.is_empty() {
+                    None
+                } else {
+                    Some(upsert_values)
+                };
                 Operation::Overwrite {
                     // Use the full schema, not the written schema
                     schema,
@@ -434,8 +435,11 @@ struct WriteContext<'a> {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, StructArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use std::collections::HashMap;
+
+    use arrow_array::{BinaryArray, Int32Array, RecordBatchReader, StructArray};
+    use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use lance_arrow::BLOB_META_KEY;
 
     use crate::session::Session;
 
@@ -488,7 +492,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn prevent_blob_version_upgrade_on_overwrite() {
+    async fn allow_overwrite_to_v2_2_without_blob_upgrade() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
@@ -513,6 +517,139 @@ mod test {
             .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
             .await;
 
-        assert!(matches!(result, Err(Error::InvalidInput { .. })));
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_v2_2_dataset_rejects_legacy_blob_schema() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )
+        .with_metadata(HashMap::from([(
+            BLOB_META_KEY.to_string(),
+            "true".to_string(),
+        )]))]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]))],
+        )
+        .unwrap();
+
+        let dataset = InsertBuilder::new("memory://forced-blob-v2")
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = dataset.unwrap_err();
+        match err {
+            Error::InvalidInput { source, .. } => {
+                let message = source.to_string();
+                assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("lance.blob.v2"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    mod external_error {
+        use super::*;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct MyTestError {
+            code: i32,
+            details: String,
+        }
+
+        impl fmt::Display for MyTestError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "MyTestError({}): {}", self.code, self.details)
+            }
+        }
+
+        impl std::error::Error for MyTestError {}
+
+        fn create_failing_iterator(
+            schema: Arc<Schema>,
+            fail_at_batch: usize,
+            error_code: i32,
+        ) -> impl Iterator<Item = std::result::Result<RecordBatch, ArrowError>> {
+            let mut batch_count = 0;
+            std::iter::from_fn(move || {
+                if batch_count >= 5 {
+                    return None;
+                }
+                batch_count += 1;
+                if batch_count == fail_at_batch {
+                    Some(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                        code: error_code,
+                        details: format!("Failed at batch {}", batch_count),
+                    }))))
+                } else {
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![batch_count as i32; 10]))],
+                    )
+                    .unwrap();
+                    Some(Ok(batch))
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_preserves_external_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 42;
+            let iter = create_failing_iterator(schema.clone(), 3, error_code);
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_external_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source
+                        .downcast_ref::<MyTestError>()
+                        .expect("Should be able to downcast to MyTestError");
+                    assert_eq!(original.code, error_code);
+                    assert!(original.details.contains("batch 3"));
+                }
+                Err(other) => panic!("Expected Error::External variant, got: {:?}", other),
+                Ok(_) => panic!("Expected error, got success"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_insert_builder_first_batch_error() {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+            let error_code = 999;
+            let iter = std::iter::once(Err(ArrowError::ExternalError(Box::new(MyTestError {
+                code: error_code,
+                details: "immediate failure".to_string(),
+            }))));
+            let reader = RecordBatchIterator::new(iter, schema);
+
+            let result = InsertBuilder::new("memory://test_first_batch_error")
+                .execute_stream(Box::new(reader) as Box<dyn RecordBatchReader + Send>)
+                .await;
+
+            match result {
+                Err(Error::External { source }) => {
+                    let original = source.downcast_ref::<MyTestError>().unwrap();
+                    assert_eq!(original.code, error_code);
+                }
+                Err(other) => panic!("Expected External, got: {:?}", other),
+                Ok(_) => panic!("Expected error"),
+            }
+        }
     }
 }

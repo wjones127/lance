@@ -348,6 +348,7 @@ pub async fn check_round_trip_encoding_generated(
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -639,6 +640,9 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
+                if mini_block.dictionary.is_some() {
+                    actual_chain.push("dictionary".to_string());
+                }
                 // Check value compression
                 if let Some(ref value_comp) = mini_block.value_compression {
                     let chain = extract_array_encoding_chain(value_comp);
@@ -652,8 +656,8 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     actual_chain.extend(chain);
                 }
             }
-            Layout::AllNullLayout(_) => {
-                // No value encoding for all null
+            Layout::ConstantLayout(_) => {
+                // Constant layout does not describe a value encoding chain.
             }
             Layout::BlobLayout(blob) => {
                 if let Some(inner_layout) = &blob.inner_layout {
@@ -681,6 +685,19 @@ fn verify_page_encoding(
     match &page.description {
         PageEncoding::Structural(layout) => {
             collect_page_encoding(layout, &mut actual_chain)?;
+
+            // All-null structural pages may legitimately contain no encodings to verify.
+            // This can happen even when compression is configured because there is no value data
+            // (and rep/def compression is not currently described in the page layout).
+            if actual_chain.is_empty() && page.data.is_empty() {
+                if let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+                    layout.layout.as_ref()
+                {
+                    if cl.inline_value.is_none() {
+                        return Ok(());
+                    }
+                }
+            }
         }
         PageEncoding::Legacy(_) => {
             // We don't need to care about legacy.
@@ -736,6 +753,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
+                version: file_version,
             };
             let encoder = encoding_strategy
                 .create_field_encoder(
@@ -961,8 +979,7 @@ async fn check_round_trip_encoding_inner(
     let decode_field = if is_structural_encoding {
         let mut lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
         if lance_field.is_blob() && matches!(lance_field.data_type(), DataType::Struct(_)) {
-            lance_field =
-                lance_field.into_unloaded_with_version(lance_core::datatypes::BlobVersion::V2);
+            lance_field.unloaded_mut();
             let mut arrow_field = ArrowField::from(&lance_field);
             let mut metadata = arrow_field.metadata().clone();
             metadata.insert("lance-encoding:packed".to_string(), "true".to_string());

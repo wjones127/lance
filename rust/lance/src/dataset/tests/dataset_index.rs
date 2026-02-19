@@ -90,18 +90,18 @@ async fn test_create_index(
 
     // Make sure valid arguments should create index successfully
     let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
-    dataset
+    let index_meta = dataset
         .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
     dataset.validate().await.unwrap();
 
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
     // The version should match the table version it was created from.
-    let indices = dataset.load_indices().await.unwrap();
-    let actual = indices.first().unwrap().dataset_version;
     let expected = dataset.manifest.version - 1;
-    assert_eq!(actual, expected);
-    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
     assert_eq!(fragment_bitmap.len(), 1);
     assert!(fragment_bitmap.contains(0));
 
@@ -313,18 +313,18 @@ async fn test_create_int8_index(
 
     // Make sure valid arguments should create index successfully
     let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 50);
-    dataset
+    let index_meta = dataset
         .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
     dataset.validate().await.unwrap();
 
+    // Verify the returned metadata
+    assert_eq!(index_meta.name, "embeddings_idx");
     // The version should match the table version it was created from.
-    let indices = dataset.load_indices().await.unwrap();
-    let actual = indices.first().unwrap().dataset_version;
     let expected = dataset.manifest.version - 1;
-    assert_eq!(actual, expected);
-    let fragment_bitmap = indices.first().unwrap().fragment_bitmap.as_ref().unwrap();
+    assert_eq!(index_meta.dataset_version, expected);
+    let fragment_bitmap = index_meta.fragment_bitmap.as_ref().unwrap();
     assert_eq!(fragment_bitmap.len(), 1);
     assert!(fragment_bitmap.contains(0));
 
@@ -925,6 +925,50 @@ async fn test_fts_unindexed_data() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_fts_unindexed_data_with_stop_words() {
+    // When indexed data has avg_doc_length < 1.0 (e.g. single-word stop words
+    // that get filtered), the BM25 scorer must still produce non-zero scores
+    // for unindexed rows. Regression test for #5871.
+    let params = InvertedIndexParams::default();
+    let text_col = StringArray::from(vec!["a", "is", "the", "bug"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://stop_words.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    // Append unindexed rows with a term not in the index
+    let unindexed: Vec<String> = (0..10).map(|i| format!("hello_{i}")).collect();
+    let text_col = StringArray::from(unindexed);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
 }
 
 #[tokio::test]

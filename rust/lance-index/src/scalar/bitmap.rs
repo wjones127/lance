@@ -9,7 +9,6 @@ use std::{
     sync::Arc,
 };
 
-use crate::pbold;
 use arrow::array::BinaryBuilder;
 use arrow_array::{new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -18,6 +17,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     cache::{CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
@@ -36,6 +36,7 @@ use super::{
     btree::OrderableScalarValue, BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
 };
 use super::{AnyQuery, IndexStore, ScalarIndex};
+use crate::pbold;
 use crate::{
     frag_reuse::FragReuseIndex,
     scalar::{
@@ -437,11 +438,23 @@ impl ScalarIndex for BitmapIndex {
                     Bound::Unbounded => Bound::Unbounded,
                 };
 
-                let keys: Vec<_> = self
-                    .index_map
-                    .range((range_start, range_end))
-                    .map(|(k, _v)| k.clone())
-                    .collect();
+                // Empty range if lower > upper, or if any bound is excluded and lower >= upper.
+                let empty_range = match (&range_start, &range_end) {
+                    (Bound::Included(lower), Bound::Included(upper)) => lower > upper,
+                    (Bound::Included(lower), Bound::Excluded(upper))
+                    | (Bound::Excluded(lower), Bound::Included(upper))
+                    | (Bound::Excluded(lower), Bound::Excluded(upper)) => lower >= upper,
+                    _ => false,
+                };
+
+                let keys: Vec<_> = if empty_range {
+                    Vec::new()
+                } else {
+                    self.index_map
+                        .range((range_start, range_end))
+                        .map(|(k, _v)| k.clone())
+                        .collect()
+                };
 
                 metrics.record_comparisons(keys.len());
 
@@ -847,6 +860,7 @@ pub mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use std::collections::HashMap;
@@ -951,6 +965,18 @@ pub mod tests {
                 .collect();
             actual.sort();
             assert_eq!(actual, expected_range_rows);
+        }
+
+        // Test 3b: Inverted range query should return empty result
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Utf8(Some("green".to_string()))),
+            std::ops::Bound::Included(ScalarValue::Utf8(Some("blue".to_string()))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        if let SearchResult::Exact(row_ids) = result {
+            assert!(row_ids.true_rows().is_empty());
+        } else {
+            panic!("Expected exact search result");
         }
 
         // Test 4: IsIn query

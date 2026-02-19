@@ -42,6 +42,13 @@ use crate::{
 /// (3) The field must not be within a list type.
 pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-key";
 
+/// Use this config key in Arrow field metadata to specify the position of a primary key column.
+/// The value is a 1-based integer indicating the order within the composite primary key.
+/// When specified, primary key fields are ordered by this position value.
+/// When not specified, primary key fields are ordered by their schema field id.
+pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
+    "lance-schema:unenforced-primary-key:position";
+
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
         .metadata()
@@ -92,25 +99,6 @@ pub enum BlobVersion {
     /// Blob v2 struct format.
     V2,
 }
-
-impl BlobVersion {
-    /// Convert a persisted string value (e.g. table config) into a blob version
-    pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
-            "1" => Some(Self::V1),
-            "2" => Some(Self::V2),
-            _ => None,
-        }
-    }
-
-    /// Persistable string representation for table config.
-    pub fn config_value(self) -> &'static str {
-        match self {
-            Self::V1 => "1",
-            Self::V2 => "2",
-        }
-    }
-}
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
 pub enum Encoding {
@@ -144,11 +132,15 @@ pub struct Field {
     pub encoding: Option<Encoding>,
     pub nullable: bool,
 
-    pub children: Vec<Field>,
+    pub children: Vec<Self>,
 
     /// Dictionary value array if this field is dictionary.
     pub dictionary: Option<Dictionary>,
-    pub unenforced_primary_key: bool,
+
+    /// Position of this field in the primary key (1-based).
+    /// None means the field is not part of the primary key.
+    /// Some(n) means this field is the nth column in the primary key.
+    pub unenforced_primary_key_position: Option<u32>,
 }
 
 impl Field {
@@ -164,6 +156,16 @@ impl Field {
             lt if lt.is_list() => DataType::List(Arc::new(ArrowField::from(&self.children[0]))),
             lt if lt.is_large_list() => {
                 DataType::LargeList(Arc::new(ArrowField::from(&self.children[0])))
+            }
+            lt if lt.is_fixed_size_list_struct() => {
+                // Parse size from "fixed_size_list:struct:N"
+                let size: i32 =
+                    lt.0.split(':')
+                        .next_back()
+                        .expect("fixed_size_list:struct logical type missing size suffix")
+                        .parse()
+                        .expect("fixed_size_list:struct logical type has invalid size");
+                DataType::FixedSizeList(Arc::new(ArrowField::from(&self.children[0])), size)
             }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
@@ -281,11 +283,7 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(
-                projection
-                    .blob_handling
-                    .unload_if_needed(new_field, projection.blob_version),
-            )
+            Some(projection.blob_handling.unload_if_needed(new_field))
         }
     }
 
@@ -541,28 +539,6 @@ impl Field {
         }
     }
 
-    /// If the field is a blob, return a new field with the same name and id
-    /// but with the data type set to a struct of the blob description fields.
-    ///
-    /// If the field is not a blob, return the field itself.
-    pub fn into_unloaded_with_version(mut self, version: BlobVersion) -> Self {
-        if self.is_blob() {
-            match version {
-                BlobVersion::V2 => {
-                    self.logical_type = BLOB_V2_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_V2_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_V2_DESC_LANCE_FIELD.metadata.clone();
-                }
-                BlobVersion::V1 => {
-                    self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
-                    self.children = BLOB_DESC_LANCE_FIELD.children.clone();
-                    self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
-                }
-            }
-        }
-        self
-    }
-
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -574,7 +550,7 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
-            unenforced_primary_key: self.unenforced_primary_key,
+            unenforced_primary_key_position: self.unenforced_primary_key_position,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -682,6 +658,12 @@ impl Field {
                 Ok(self.clone())
             }
             (DataType::Struct(_), DataType::Struct(_)) => {
+                // Blob v2 columns are special: they can have different struct layouts
+                // (logical input vs. descriptor struct). We treat blob v2 structs like primitive
+                // fields (e.g. a binary column) during schema set operations (union/subtract).
+                if self.is_blob() {
+                    return Ok(self.clone());
+                }
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
@@ -753,6 +735,33 @@ impl Field {
         }
     }
 
+    /// Case-insensitive version of resolve.
+    /// First tries exact match for each child, then falls back to case-insensitive.
+    pub(crate) fn resolve_case_insensitive<'a>(
+        &'a self,
+        split: &mut VecDeque<&str>,
+        fields: &mut Vec<&'a Self>,
+    ) -> bool {
+        fields.push(self);
+        if split.is_empty() {
+            return true;
+        }
+        let first = split.pop_front().unwrap();
+        // Try exact match first
+        if let Some(child) = self.children.iter().find(|c| c.name == first) {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        // Fall back to case-insensitive match
+        if let Some(child) = self
+            .children
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(first))
+        {
+            return child.resolve_case_insensitive(split, fields);
+        }
+        false
+    }
+
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Arrow {
@@ -812,7 +821,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                unenforced_primary_key: self.unenforced_primary_key,
+                unenforced_primary_key_position: self.unenforced_primary_key_position,
             };
             return Ok(f);
         }
@@ -875,7 +884,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                unenforced_primary_key: self.unenforced_primary_key,
+                unenforced_primary_key_position: self.unenforced_primary_key_position,
             })
         }
     }
@@ -1005,6 +1014,11 @@ impl Field {
     pub fn is_leaf(&self) -> bool {
         self.children.is_empty()
     }
+
+    /// Return true if the field is part of the (unenforced) primary key.
+    pub fn is_unenforced_primary_key(&self) -> bool {
+        self.unenforced_primary_key_position.is_some()
+    }
 }
 
 impl fmt::Display for Field {
@@ -1043,6 +1057,9 @@ impl TryFrom<&ArrowField> for Field {
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::FixedSizeList(item, _) if matches!(item.data_type(), DataType::Struct(_)) => {
+                vec![Self::try_from(item.as_ref())?]
+            }
             DataType::Map(entries, keys_sorted) => {
                 // TODO: We only support keys_sorted=false for now,
                 //  because converting a rust arrow map field to the python arrow field will
@@ -1081,10 +1098,16 @@ impl TryFrom<&ArrowField> for Field {
             }
             _ => vec![],
         };
-        let unenforced_primary_key = metadata
-            .get(LANCE_UNENFORCED_PRIMARY_KEY)
-            .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
+        let unenforced_primary_key_position = metadata
+            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                // Backward compatibility: use 0 for legacy boolean flag
+                metadata
+                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .map(|_| 0)
+            });
         let is_blob_v2 = has_blob_v2_extension(field);
 
         if is_blob_v2 {
@@ -1121,7 +1144,7 @@ impl TryFrom<&ArrowField> for Field {
             nullable: field.is_nullable(),
             children,
             dictionary: None,
-            unenforced_primary_key,
+            unenforced_primary_key_position,
         })
     }
 }
@@ -1738,14 +1761,34 @@ mod tests {
     }
 
     #[test]
-    fn blob_into_unloaded_selects_v2_layout() {
+    fn blob_unloaded_mut_selects_layout_from_metadata() {
         let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
-        let field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+        let mut field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
             .unwrap();
-        let unloaded = field.into_unloaded_with_version(BlobVersion::V2);
-        assert_eq!(unloaded.children.len(), 5);
-        assert_eq!(unloaded.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 2);
+        assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let mut field: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 5);
+        assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
     }
 }

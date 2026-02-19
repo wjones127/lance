@@ -724,7 +724,7 @@ impl FileFragment {
             determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
 
         if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                     dataset.manifest.data_storage_format.lance_file_version()?,
@@ -876,14 +876,11 @@ impl FileFragment {
         let row_id_sequence = row_id_sequence?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
-            return Err(Error::io(
-                format!(
-                    "Did not find any data files for schema: {}\nfragment_id={}",
-                    projection,
-                    self.id()
-                ),
-                location!(),
-            ));
+            return Err(Error::not_found(format!(
+                "No data files found for schema: {}, fragment_id={}",
+                projection,
+                self.id()
+            )));
         }
 
         let num_physical_rows = self.physical_rows().await?;
@@ -1158,10 +1155,10 @@ impl FileFragment {
     /// fragment.
     pub async fn physical_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            return Err(Error::io(
-                format!("Fragment {} does not contain any data", self.id()),
-                location!(),
-            ));
+            return Err(Error::not_found(format!(
+                "Fragment {} does not contain any data",
+                self.id()
+            )));
         };
 
         // Early versions that did not write the writer version also could write
@@ -1379,7 +1376,8 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false).await
+        self.take_rows(&row_ids, projection, false, false, false, false)
+            .await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1427,13 +1425,17 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
+        with_row_created_at_version: bool,
+        with_row_last_updated_at_version: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
                 projection,
                 FragReadConfig::default()
                     .with_row_id(with_row_id)
-                    .with_row_address(with_row_address),
+                    .with_row_address(with_row_address)
+                    .with_row_created_at_version(with_row_created_at_version)
+                    .with_row_last_updated_at_version(with_row_last_updated_at_version),
             )
             .await?;
 
@@ -1593,7 +1595,9 @@ impl FileFragment {
         let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
-            let batch = joiner.collect(batch[join_column].clone()).await?;
+            let batch = joiner
+                .collect(&self.dataset, batch[join_column].clone())
+                .await?;
             updater.update(batch).await?;
         }
 
@@ -1996,7 +2000,7 @@ impl std::fmt::Display for FragmentReader {
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
-        return Err(Error::io(
+        return Err(Error::invalid_input(
             "Cannot merge empty batches".to_string(),
             location!(),
         ));
@@ -2026,14 +2030,14 @@ impl FragmentReader {
             for reader in readers.iter().skip(1) {
                 if let Some(other_legacy) = reader.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
-                        return Err(Error::io(
+                        return Err(Error::invalid_input(
                                 "Cannot create FragmentReader from data files with different number of batches"
                                     .to_string(),
                             location!(),
                         ));
                     }
                 } else {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         "Cannot mix legacy and non-legacy readers".to_string(),
                         location!(),
                     ));
@@ -2612,18 +2616,43 @@ impl FragmentReader {
 
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
     /// batches.  May return an error if the taken rows do not fit into a single batch.
+    ///
+    /// Duplicate indices are allowed and will produce duplicate rows in the output.
     pub async fn take_as_batch(
         &self,
         indices: &[u32],
         take_priority: Option<u32>,
     ) -> Result<RecordBatch> {
+        // The v2 encoding layer requires strictly increasing indices. Deduplicate
+        // here so callers (e.g. FTS with duplicate row matches) don't need to.
+        let has_duplicates = indices.windows(2).any(|w| w[0] == w[1]);
+        let (unique_indices, expand_map) = if has_duplicates {
+            let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
+            let mut mapping: Vec<u32> = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                if unique.last() != Some(&idx) {
+                    unique.push(idx);
+                }
+                mapping.push((unique.len() - 1) as u32);
+            }
+            (Cow::Owned(unique), Some(UInt32Array::from(mapping)))
+        } else {
+            (Cow::Borrowed(indices), None)
+        };
+
         let batches = self
-            .take(indices, u32::MAX, take_priority)
+            .take(&unique_indices, u32::MAX, take_priority)
             .await?
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
+        let mut batch = concat_batches(&Arc::new(self.output_schema.clone()), batches.iter())?;
+
+        if let Some(expand_map) = expand_map {
+            batch = arrow_select::take::take_record_batch(&batch, &expand_map)?;
+        }
+
+        Ok(batch)
     }
 }
 
@@ -2855,9 +2884,10 @@ mod tests {
             updated_fragments: vec![updated_fragment1],
             new_fragments: vec![],
             fields_modified: fields_modified1,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
         };
         let mut dataset1 = Dataset::commit(
             test_uri,
@@ -2927,9 +2957,10 @@ mod tests {
             updated_fragments: vec![updated_fragment2],
             new_fragments: vec![],
             fields_modified: fields_modified2,
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
         };
         let dataset2 = Dataset::commit(
             test_uri,
@@ -3315,7 +3346,14 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3334,7 +3372,14 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3344,7 +3389,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false, false)
+            .take_rows(&[], dataset.schema(), false, false, false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -3354,7 +3399,14 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, true)
+            .take_rows(
+                &[1, 2, 4, 5, 8],
+                dataset.schema(),
+                false,
+                true,
+                false,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3831,7 +3883,7 @@ mod tests {
                 FragReadConfig::default(),
             )
             .await;
-        assert!(matches!(res, Err(Error::IO { .. })));
+        assert!(matches!(res, Err(Error::NotFound { .. })));
 
         Ok(())
     }

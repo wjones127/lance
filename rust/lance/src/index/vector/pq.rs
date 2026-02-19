@@ -640,7 +640,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowIdMask;
+    use lance_core::utils::mask::RowAddrMask;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
@@ -713,9 +713,16 @@ mod tests {
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
-        let ivf = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf = build_ivf_model(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+            lance_index::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(
             &dataset,
@@ -817,8 +824,8 @@ mod tests {
             self.row_ids.is_empty()
         }
 
-        fn mask(&self) -> Arc<RowIdMask> {
-            RowIdMask::all_rows().into()
+        fn mask(&self) -> Arc<RowAddrMask> {
+            RowAddrMask::all_rows().into()
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {

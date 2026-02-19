@@ -43,7 +43,7 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery};
+use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
     stable_version, LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -161,9 +161,17 @@ pub fn init_logging(mut log_builder: Builder) {
 
     let max_level = logger.filter();
 
-    let log_level = max_level.to_level().unwrap_or(Level::Error);
+    let trace_level = env::var("LANCE_TRACING").unwrap_or_default().to_lowercase();
+    let trace_level = match trace_level.as_str() {
+        "debug" => Level::Debug,
+        "info" => Level::Info,
+        "warn" => Level::Warn,
+        "error" => Level::Error,
+        "trace" => Level::Trace,
+        _ => Level::Info,
+    };
 
-    tracing::initialize_tracing(log_level);
+    tracing::initialize_tracing(trace_level);
     log::set_boxed_logger(Box::new(logger)).unwrap();
     log::set_max_level(max_level);
 }
@@ -268,11 +276,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
+    m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
-    #[cfg(feature = "rest")]
     m.add_class::<namespace::PyRestNamespace>()?;
-    #[cfg(feature = "rest-adapter")]
     m.add_class::<namespace::PyRestAdapter>()?;
+    m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
