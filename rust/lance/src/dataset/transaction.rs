@@ -60,7 +60,8 @@ use lance_table::feature_flags::{apply_feature_flags, FLAG_STABLE_ROW_IDS};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, RowIdMeta,
+        pb, BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+        RowIdMeta,
     },
     io::{
         commit::CommitHandler,
@@ -1171,6 +1172,9 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
     pub new_index_details: prost_types::Any,
     pub new_index_version: u32,
+    /// Files in the new index with their sizes. Not persisted to the transaction
+    /// proto, so this will be None when deserializing from a transaction file.
+    pub files: Option<Vec<IndexFile>>,
 }
 
 impl DeepSizeOf for RewrittenIndex {
@@ -2537,6 +2541,10 @@ impl Transaction {
                 groups,
             )?);
             index.uuid = rewritten_index.new_id;
+            // Update file sizes to match the new index files. When not available
+            // (e.g., after crash recovery from a transaction file), clear the
+            // old file sizes to avoid using stale sizes from the pre-remap index.
+            index.files = rewritten_index.files.clone();
         }
         Ok(())
     }
@@ -3057,6 +3065,8 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                 })?
                 .clone(),
             new_index_version: message.new_index_version,
+            // files are not persisted in the transaction proto
+            files: None,
         })
     }
 }
@@ -4344,6 +4354,7 @@ mod tests {
                 value: vec![],
             },
             new_index_version: 1,
+            files: None,
         }];
 
         // Should succeed (skip missing index) instead of error

@@ -441,6 +441,10 @@ async fn test_index_file_size_migration() {
     )
     .unwrap();
     let dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
         .execute(vec![batch])
         .await
         .unwrap();

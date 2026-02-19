@@ -1240,7 +1240,7 @@ pub fn document_input(
 mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::{IndexReader, IndexWriter};
+    use crate::scalar::{IndexFile, IndexReader, IndexWriter};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -1352,6 +1352,10 @@ mod tests {
                 "CountingStore does not support deleting",
                 location!(),
             ))
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            Ok(vec![])
         }
     }
 

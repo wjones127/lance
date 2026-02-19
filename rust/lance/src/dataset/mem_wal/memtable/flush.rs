@@ -496,6 +496,7 @@ impl MemTableFlusher {
                 index_version: INVERTED_INDEX_VERSION as i32,
                 created_at: None,
                 base_id: None,
+                files: None,
             };
 
             // Commit the index to the dataset
@@ -739,6 +740,7 @@ impl MemTableFlusher {
             base_id: None,
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
+            files: None,
         };
 
         Ok(index_meta)
