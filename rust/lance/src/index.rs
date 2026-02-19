@@ -35,7 +35,7 @@ use lance_index::scalar::expression::{
 use lance_index::scalar::inverted::InvertedIndexPlugin;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use lance_index::scalar::{CreatedIndex, IndexStore, ScalarIndex};
+use lance_index::scalar::{CreatedIndex, ScalarIndex};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -5790,7 +5790,7 @@ mod tests {
         ]));
 
         let num_rows = 100;
-        let ids = Int32Array::from_iter_values(0..num_rows as i32);
+        let ids = Int32Array::from_iter_values(0..num_rows);
         let texts = StringArray::from_iter_values((0..num_rows).map(|i| {
             if i % 3 == 0 {
                 format!("hello world document {}", i)
