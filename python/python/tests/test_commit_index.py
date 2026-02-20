@@ -161,8 +161,10 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
         read_version=dataset_without_index.version,
     )
 
-    # Verify that the index was created
-    assert len(dataset_without_index.describe_indices()) == 1
+    # Verify that the index was created. Use list_indices() here instead of
+    # describe_indices() because the manually committed index has no index_details,
+    # which describe_indices() requires.
+    assert len(dataset_without_index.list_indices()) == 1
 
     # Read back the transaction to verify the files were stored
     transactions = dataset_without_index.get_transactions(1)

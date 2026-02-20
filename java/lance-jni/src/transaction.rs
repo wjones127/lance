@@ -204,6 +204,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             index_version,
             created_at,
             base_id,
+            files: None,
         })
     }
 }
