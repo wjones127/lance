@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{CreatedIndex, IndexStore};
+use lance_index::scalar::CreatedIndex;
 use lance_index::VECTOR_INDEX_VERSION;
 use lance_table::format::{list_index_files_with_sizes, Fragment, IndexMetadata};
 use roaring::RoaringBitmap;

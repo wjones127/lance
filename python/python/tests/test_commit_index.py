@@ -112,12 +112,10 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     from lance.dataset import Index, IndexFile
 
     # Get info about the existing index created by the fixture
-    existing_indices = dataset_with_index.list_indices()
-    assert len(existing_indices) == 1
-    index_id = existing_indices[0]["uuid"]
-
-    # Get the original index description which should have file sizes
     original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    # Verify the original index has file sizes
     original_size = original_desc.total_size_bytes
     assert original_size is not None and original_size > 0
 
