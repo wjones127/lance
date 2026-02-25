@@ -3984,6 +3984,36 @@ class LanceDataset(pa.dataset.Dataset):
 
         return ivf.centroids
 
+    def tracked_files(self) -> pa.RecordBatchReader:
+        """Stream all files referenced by any manifest version of this dataset.
+
+        Returns a :class:`pyarrow.RecordBatchReader` with schema:
+
+        - **version** (int64): manifest version number
+        - **base_uri** (dictionary<int32, utf8>): storage root URI
+        - **path** (utf8): file path relative to ``base_uri``
+        - **type** (dictionary<int8, utf8>): one of ``manifest``, ``data file``,
+          ``deletion file``, ``transaction file``, ``index file``
+
+        Output order is non-deterministic.
+        """
+        return self._ds.tracked_files()
+
+    def all_files(self) -> pa.RecordBatchReader:
+        """Stream all files physically present at this dataset's base URI.
+
+        Returns a :class:`pyarrow.RecordBatchReader` with schema:
+
+        - **base_uri** (dictionary<int32, utf8>): storage root URI
+        - **path** (utf8): file path relative to ``base_uri``
+        - **size_bytes** (int64): file size in bytes
+        - **last_modified** (timestamp[us, UTC]): last modification time
+
+        Only the primary object store is scanned; alternate ``base_paths``
+        entries are not included.
+        """
+        return self._ds.all_files()
+
 
 class SqlQuery:
     """

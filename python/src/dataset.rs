@@ -2428,6 +2428,24 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
+    fn tracked_files(&self) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt()
+            .block_on(None, self.ds.tracked_files())?
+            .infer_error()?;
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
+    }
+
+    fn all_files(&self) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = rt().block_on(None, self.ds.all_files())?;
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
+    }
+
     #[pyo3(signature = (keys))]
     fn delete_config_keys(&mut self, keys: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
