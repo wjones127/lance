@@ -3,6 +3,7 @@
 
 //! Dataset file inspection APIs.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 
@@ -14,9 +15,14 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use either::Either;
+use futures::stream::TryChunksError;
 use futures::{stream, StreamExt, TryStreamExt};
+use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
 
+use crate::dataset::files::arrow::{FileTypeArrayBuilder, TrackedFileBatch, TRACKED_FILES_SCHEMA};
+use crate::dataset::files::file_types::FileType;
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::Dataset;
 use lance_core::Result;
@@ -24,41 +30,10 @@ use lance_table::io::commit::ManifestLocation;
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 
+mod arrow;
+mod file_types;
+
 const BATCH_SIZE: usize = 4096;
-
-static TRACKED_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new("version", DataType::Int64, false),
-        Field::new(
-            "base_uri",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            false,
-        ),
-        Field::new("path", DataType::Utf8, false),
-        Field::new(
-            "type",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            false,
-        ),
-    ]))
-});
-
-static ALL_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
-        Field::new(
-            "base_uri",
-            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-            false,
-        ),
-        Field::new("path", DataType::Utf8, false),
-        Field::new("size_bytes", DataType::Int64, false),
-        Field::new(
-            "last_modified",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-    ]))
-});
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     match path.prefix_match(prefix) {
@@ -68,136 +43,121 @@ fn remove_prefix(path: &Path, prefix: &Path) -> Path {
 }
 
 /// A single row destined for the `tracked_files` output.
-struct FileRow {
+struct FileRow<'a> {
     version: u64,
-    base_uri: String,
-    path: String,
-    file_type: &'static str,
+    base_uri: Cow<'a, str>,
+    path: Cow<'a, str>,
+    file_type: FileType,
 }
 
-/// Arrow batch builder for the `tracked_files` schema.
-///
-/// Construct with [`with_capacity`](Self::with_capacity) to pre-size the
-/// underlying buffers, then call [`extend`](Self::extend) to fill rows in bulk.
-struct TrackedFileBatch {
-    schema: SchemaRef,
-    version: Int64Builder,
-    base_uri: StringDictionaryBuilder<Int32Type>,
-    path: StringBuilder,
-    file_type: StringDictionaryBuilder<Int32Type>,
-}
+fn manifest_file_rows<'a>(
+    manifest: &'a lance_table::format::Manifest,
+    base_uri: &'a str,
+    manifest_path: &'a str,
+) -> Box<dyn ExactSizeIterator<Item = FileRow<'a>> + 'a> {
+    let mut files = 1;
+    let manifest_row = FileRow {
+        version: manifest.version,
+        base_uri: Cow::Borrowed(base_uri),
+        path: Cow::Borrowed(manifest_path),
+        file_type: FileType::Manifest,
+    };
+    let iter = std::iter::once(manifest_row);
 
-impl TrackedFileBatch {
-    fn with_capacity(schema: SchemaRef, capacity: usize) -> Self {
-        // Guess 4 unique base_uris and 20 bytes per uri/type value.
-        Self {
-            schema,
-            version: Int64Builder::with_capacity(capacity),
-            base_uri: StringDictionaryBuilder::with_capacity(capacity, 4, capacity * 20),
-            path: StringBuilder::with_capacity(capacity, capacity * 50),
-            file_type: StringDictionaryBuilder::with_capacity(capacity, 5, capacity * 20),
-        }
-    }
-
-    fn extend<'a>(&mut self, rows: impl IntoIterator<Item = &'a FileRow>) {
-        for row in rows {
-            self.version.append_value(row.version as i64);
-            self.base_uri.append_value(&row.base_uri);
-            self.path.append_value(&row.path);
-            self.file_type.append_value(row.file_type);
-        }
-    }
-
-    fn finish(mut self) -> Result<RecordBatch> {
-        RecordBatch::try_new(
-            self.schema,
-            vec![
-                Arc::new(self.version.finish()),
-                Arc::new(self.base_uri.finish()),
-                Arc::new(self.path.finish()),
-                Arc::new(self.file_type.finish()),
-            ],
-        )
-        .map_err(Into::into)
-    }
-}
-
-/// Build one `RecordBatch` per `BATCH_SIZE` chunk of `rows`.
-fn rows_to_batches<'a>(
-    rows: &'a [FileRow],
-    schema: &'a SchemaRef,
-) -> impl Iterator<Item = Result<RecordBatch>> + 'a {
-    rows.chunks(BATCH_SIZE).map(|chunk| {
-        let mut b = TrackedFileBatch::with_capacity(schema.clone(), chunk.len());
-        b.extend(chunk);
-        b.finish()
-    })
-}
-
-/// Collect every non-index [`FileRow`] referenced by a single manifest.
-fn manifest_file_rows(
-    version: u64,
-    manifest_path_rel: &str,
-    manifest: &lance_table::format::Manifest,
-    uri: &str,
-) -> Vec<FileRow> {
-    let n_data: usize = manifest.fragments.iter().map(|f| f.files.len()).sum();
-    let n_del = manifest
-        .fragments
-        .iter()
-        .filter(|f| f.deletion_file.is_some())
-        .count();
-    let n_tx = manifest.transaction_file.is_some() as usize;
-    let mut rows = Vec::with_capacity(1 + n_data + n_del + n_tx);
-
-    rows.push(FileRow {
-        version,
-        base_uri: uri.to_string(),
-        path: manifest_path_rel.to_string(),
-        file_type: "manifest",
-    });
+    let iter = if let Some(txn_file) = &manifest.transaction_file {
+        files += 1;
+        let txn_row = FileRow {
+            version: manifest.version,
+            base_uri: Cow::Borrowed(base_uri),
+            path: Cow::Borrowed(txn_file),
+            file_type: FileType::TransactionFile,
+        };
+        Either::Left(iter.chain(std::iter::once(txn_row)))
+    } else {
+        Either::Right(iter)
+    };
 
     for fragment in manifest.fragments.iter() {
-        for data_file in fragment.files.iter() {
-            let file_base_uri = data_file
-                .base_id
-                .and_then(|id| manifest.base_paths.get(&id))
-                .map(|bp| bp.path.as_str())
-                .unwrap_or(uri)
-                .to_string();
-            rows.push(FileRow {
-                version,
-                base_uri: file_base_uri,
-                path: format!("{}/{}", DATA_DIR, data_file.path),
-                file_type: "data file",
-            });
-        }
-        if let Some(del_file) = &fragment.deletion_file {
-            let del_base_uri = del_file
-                .base_id
-                .and_then(|id| manifest.base_paths.get(&id))
-                .map(|bp| bp.path.as_str())
-                .unwrap_or(uri)
-                .to_string();
-            rows.push(FileRow {
-                version,
-                base_uri: del_base_uri,
-                path: relative_deletion_file_path(fragment.id, del_file),
-                file_type: "deletion file",
-            });
+        files += fragment.files.len();
+
+        if fragment.deletion_file.is_some() {
+            files += 1;
         }
     }
 
-    if let Some(tx_file) = &manifest.transaction_file {
-        rows.push(FileRow {
-            version,
-            base_uri: uri.to_string(),
-            path: format!("{}/{}", TRANSACTIONS_DIR, tx_file),
-            file_type: "transaction file",
+    let data_files = manifest.fragments.iter().flat_map(move |fragment| {
+        let base_uri = fragment
+            .files
+            .iter()
+            .find_map(|f| {
+                f.base_id
+                    .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
+            })
+            .unwrap_or(base_uri);
+        let data_rows = fragment.files.iter().map(move |data_file| FileRow {
+            version: manifest.version,
+            base_uri: Cow::Borrowed(base_uri),
+            path: Cow::Borrowed(data_file.path.as_str()),
+            file_type: FileType::DataFile,
         });
-    }
+        data_rows
+    });
 
-    rows
+    let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
+        fragment.deletion_file.as_ref().map(|del_file| {
+            let base_uri = fragment
+                .files
+                .iter()
+                .find_map(|f| {
+                    f.base_id
+                        .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
+                })
+                .unwrap_or(base_uri);
+
+            FileRow {
+                version: manifest.version,
+                base_uri: Cow::Borrowed(base_uri),
+                path: Cow::Borrowed(todo!("handle relative deletion file paths")),
+                file_type: FileType::DeletionFile,
+            }
+        })
+    });
+
+    Box::new(
+        iter.chain(data_files)
+            .chain(deletion_files)
+            .exact_size(files),
+    )
+}
+
+fn manifest_file_batches<'a>(
+    manifest: &'a lance_table::format::Manifest,
+    base_uri: &'a str,
+    manifest_path: &'a str,
+) -> Box<dyn ExactSizeIterator<Item = Result<RecordBatch>> + 'a> {
+    const BATCH_SIZE: usize = 4096;
+    let mut builder = TrackedFileBatch::with_capacity(BATCH_SIZE);
+
+    let mut iter = manifest_file_rows(manifest, base_uri, manifest_path);
+    let size = iter.len().div_ceil(BATCH_SIZE);
+
+    Box::new(
+        std::iter::from_fn(move || {
+            while let Some(row) = iter.next() {
+                builder.append(&row);
+                if builder.len() == BATCH_SIZE {
+                    let next_size = iter.len().div_ceil(BATCH_SIZE);
+                    let old_builder =
+                        std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(next_size));
+                    let batch_result = old_builder.finish();
+                    builder = TrackedFileBatch::with_capacity(iter.size_hint().0.min(BATCH_SIZE));
+                    return Some(batch_result);
+                }
+            }
+            None
+        })
+        .exact_size(size),
+    )
 }
 
 /// State for the Phase 2 stream in [`Dataset::tracked_files`].
@@ -235,187 +195,49 @@ impl Dataset {
     ///
     /// Output order is non-deterministic.
     pub async fn tracked_files(&self) -> Result<SendableRecordBatchStream> {
-        let schema = TRACKED_FILES_SCHEMA.clone();
         let io_parallelism = self.object_store.io_parallelism();
         let base = self.base.clone();
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
 
-        // Pre-collect manifest locations (path + optional size only — cheap).
-        // This lets the spawned task be 'static without borrowing &self.
-        let manifest_locations: Vec<ManifestLocation> = self
-            .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_collect()
-            .await?;
+        let commit_handler = self.commit_handler.clone();
 
-        // Phase 1: spawn a task that processes manifests concurrently, sends
-        // non-index batches via an mpsc channel, and delivers the UUID→versions
-        // map via a oneshot when done.  Phase 2 is driven by the caller-side
-        // `try_unfold` once it has received the UUID map from the oneshot.
-        let (tx_batches, rx_batches) =
-            tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(16);
-        let (tx_uuids, rx_uuids) = tokio::sync::oneshot::channel::<HashMap<String, Vec<u64>>>();
+        let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
 
-        let base_p1 = base.clone();
-        let uri_p1 = uri.clone();
-        let os_p1 = object_store.clone();
-        let schema_p1 = schema.clone();
+        let task = tokio::spawn(async move {
+            let manifest_locations =
+                self.commit_handler
+                    .list_manifest_locations(&self.base, &self.object_store, false);
 
-        tokio::spawn(async move {
-            let tx_per_manifest = tx_batches.clone();
-
-            let uuid_map_result: lance_core::Result<HashMap<String, Vec<u64>>> = stream::iter(
-                manifest_locations
-                    .into_iter()
-                    .map(Ok::<_, lance_core::Error>),
-            )
-            .map(move |loc_res| {
-                let base = base_p1.clone();
-                let uri = uri_p1.clone();
-                let os = os_p1.clone();
-                let schema = schema_p1.clone();
-                let tx = tx_per_manifest.clone();
-                async move {
-                    let loc = loc_res?;
-                    let manifest = read_manifest(&os, &loc.path, loc.size).await?;
-                    let indexes = read_manifest_indexes(&os, &loc, &manifest).await?;
-                    let version = manifest.version;
-
-                    let manifest_rel = remove_prefix(&loc.path, &base);
-                    let rows = manifest_file_rows(version, manifest_rel.as_ref(), &manifest, &uri);
-
-                    for batch_result in rows_to_batches(&rows, &schema) {
-                        let df = batch_result.map_err(datafusion::error::DataFusionError::from);
-                        if tx.send(df).await.is_err() {
-                            return Ok::<_, lance_core::Error>(vec![]);
-                        }
+            while let Some(loc) = manifest_locations.next().await {
+                let loc = loc?;
+                let manifest = read_manifest(&object_store, &loc.path, loc.size).await?;
+                let batches = manifest_file_batches(&manifest, &uri, loc.path.as_ref());
+                for batch_result in batches {
+                    let df_batch_result =
+                        batch_result.map_err(datafusion::error::DataFusionError::from);
+                    if tx.send(df_batch_result).await.is_err() {
+                        // Receiver dropped; stop processing.
+                        return Ok(());
                     }
-
-                    let pairs: Vec<(u64, String)> = indexes
-                        .iter()
-                        .map(|i| (version, i.uuid.to_string()))
-                        .collect();
-                    Ok(pairs)
-                }
-            })
-            .buffer_unordered(io_parallelism)
-            .try_fold(
-                HashMap::<String, Vec<u64>>::new(),
-                |mut map, pairs| async move {
-                    for (v, u) in pairs {
-                        map.entry(u).or_default().push(v);
-                    }
-                    Ok(map)
-                },
-            )
-            .await;
-
-            // tx_batches dropped here (all per-manifest clones + the clone above).
-            // This closes the mpsc channel, signalling end-of-phase-1.
-            match uuid_map_result {
-                Ok(map) => {
-                    tx_uuids.send(map).ok();
-                }
-                Err(e) => {
-                    // Send the error through the batch channel so the phase 1
-                    // stream propagates it to the caller.  The oneshot is just
-                    // dropped, so phase 2 will get a RecvError — but it will
-                    // never be polled because the chain stops at the first error.
-                    tx_batches
-                        .send(Err(datafusion::error::DataFusionError::from(e)))
-                        .await
-                        .ok();
                 }
             }
+
+            // TODO: handle index files too.
+            // We should handle indexes as we see them. We might see indexes multiple times,
+            // so we should keep a cache of index UUIDs we've seen and their files so we can
+            // provide them for every manifest version after we see them.
+            // NOTE: don't try too hard to optimize this; in the future, we'll have the list
+            // of index files in the manifest.
+            Ok(())
         });
 
-        // Phase 1 stream: yield batches produced by the spawned task.
-        let phase1_stream = stream::try_unfold(rx_batches, |mut rx| async move {
-            match rx.recv().await {
-                Some(Ok(batch)) => Ok(Some((batch, rx))),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            }
-        });
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-        // Phase 2 stream: once the UUID map arrives, list each index directory
-        // and emit (version, index-file) rows.  The `try_unfold` state machine
-        // processes one UUID directory per invocation.
-        let phase2_stream = stream::try_unfold(
-            IndexFilesState {
-                rx_uuids: Some(rx_uuids),
-                uuid_iter: None,
-                pending: VecDeque::new(),
-                object_store: (*object_store).clone(),
-                base,
-                uri,
-                schema: schema.clone(),
-            },
-            |mut state| async move {
-                // Step 1: receive the UUID map on the first call.
-                if let Some(rx) = state.rx_uuids.take() {
-                    // If Phase 1 failed, rx will return Err(RecvError).  In
-                    // that case the phase 1 stream already propagated the error
-                    // and this stream will never be polled — but we still handle
-                    // the case gracefully.
-                    match rx.await {
-                        Ok(map) => state.uuid_iter = Some(map.into_iter()),
-                        Err(_) => return Ok::<_, lance_core::Error>(None),
-                    }
-                }
-
-                // Step 2: emit any batches already queued from a previous call.
-                if let Some(batch) = state.pending.pop_front() {
-                    return Ok(Some((batch, state)));
-                }
-
-                // Step 3: process the next UUID directory.  Loop until we either
-                // produce a batch or exhaust all UUIDs.
-                let iter = state.uuid_iter.as_mut().expect("initialized in step 1");
-                loop {
-                    let Some((uuid, versions)) = iter.next() else {
-                        return Ok(None);
-                    };
-
-                    let index_dir = state.base.child(INDICES_DIR).child(uuid.as_str());
-                    // Collect files eagerly so we don't hold a live stream that
-                    // borrows object_store across the try_unfold state boundary.
-                    let files: Vec<object_store::ObjectMeta> = state
-                        .object_store
-                        .read_dir_all(&index_dir, None)
-                        .try_collect()
-                        .await?;
-
-                    for meta in &files {
-                        let rel = remove_prefix(&meta.location, &state.base);
-                        let rows: Vec<FileRow> = versions
-                            .iter()
-                            .map(|&v| FileRow {
-                                version: v,
-                                base_uri: state.uri.clone(),
-                                path: rel.as_ref().to_string(),
-                                file_type: "index file",
-                            })
-                            .collect();
-                        for batch_result in rows_to_batches(&rows, &state.schema) {
-                            state.pending.push_back(batch_result?);
-                        }
-                    }
-
-                    if let Some(batch) = state.pending.pop_front() {
-                        return Ok(Some((batch, state)));
-                    }
-                    // No files for this UUID; try the next one.
-                }
-            },
-        )
-        // Convert lance_core::Error to DataFusionError for the stream adapter.
-        .map_err(datafusion::error::DataFusionError::from);
-
-        let combined = phase1_stream.chain(phase2_stream);
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, combined)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            TRACKED_FILES_SCHEMA.clone(),
+            stream,
+        )))
     }
 
     /// Returns one row per file that physically exists at the dataset's base URI.
@@ -432,84 +254,39 @@ impl Dataset {
     /// | `path`          | `Utf8` (non-null)                          | Relative to `base_uri` |
     /// | `size_bytes`    | `Int64` (non-null)                         | File size in bytes |
     /// | `last_modified` | `Timestamp(Microsecond, "UTC")` (non-null) | Last modification time |
-    pub async fn all_files(&self) -> Result<SendableRecordBatchStream> {
-        let schema = ALL_FILES_SCHEMA.clone();
+    pub async fn all_files(&self) -> SendableRecordBatchStream {
         let base = self.base.clone();
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
 
-        // Spawn a task that drives read_dir_all (which borrows object_store)
-        // and sends batches via an mpsc channel.  This avoids returning a stream
-        // that captures &self.
-        let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(16);
+        let stream = object_store
+            .list(Some(base.clone()))
+            .try_chunks(4000)
+            .map_err(|err| err.1)
+            .and_then(
+                move |chunk| match build_all_files_batch(&chunk, &base, &uri) {
+                    Ok(batch) => futures::future::ok(batch),
+                    Err(e) => futures::future::err(e),
+                },
+            )
+            .map_err(datafusion::error::DataFusionError::from);
 
-        let schema_spawn = schema.clone();
-        tokio::spawn(async move {
-            // object_store is an owned Arc<ObjectStore>. read_dir_all borrows it
-            // within this async block; Rust's async state machine handles the
-            // resulting self-referential type safely via Pin.
-            let mut file_stream = object_store.read_dir_all(&base, None);
-            let mut chunk: Vec<object_store::ObjectMeta> = Vec::with_capacity(BATCH_SIZE);
-
-            loop {
-                match file_stream.next().await {
-                    Some(Ok(meta)) => {
-                        chunk.push(meta);
-                        if chunk.len() >= BATCH_SIZE {
-                            let batch = build_all_files_batch(&chunk, &schema_spawn, &base, &uri);
-                            if tx
-                                .send(batch.map_err(datafusion::error::DataFusionError::from))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            chunk.clear();
-                        }
-                    }
-                    Some(Err(e)) => {
-                        tx.send(Err(datafusion::error::DataFusionError::from(e)))
-                            .await
-                            .ok();
-                        return;
-                    }
-                    None => break,
-                }
-            }
-
-            if !chunk.is_empty() {
-                let batch = build_all_files_batch(&chunk, &schema_spawn, &base, &uri);
-                tx.send(batch.map_err(datafusion::error::DataFusionError::from))
-                    .await
-                    .ok();
-            }
-        });
-
-        let batch_stream = stream::try_unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(Ok(batch)) => Ok(Some((batch, rx))),
-                Some(Err(e)) => Err(e),
-                None => Ok(None),
-            }
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            batch_stream,
-        )))
+        Box::pin(RecordBatchStreamAdapter::new(
+            arrow::ALL_FILES_SCHEMA.clone(),
+            stream,
+        ))
     }
 }
 
 fn build_all_files_batch(
     chunk: &[object_store::ObjectMeta],
-    schema: &SchemaRef,
     base: &Path,
     uri: &str,
 ) -> Result<RecordBatch> {
     let n = chunk.len();
-    let mut base_uri_builder =
-        StringDictionaryBuilder::<Int32Type>::with_capacity(n, 1, uri.len() * n);
-    let mut path_builder = StringBuilder::with_capacity(n, n * 50);
+    let mut base_uri_builder = StringDictionaryBuilder::<Int32Type>::with_capacity(n, 1, uri.len());
+    let path_capacity = chunk.iter().map(|m| m.location.as_ref().len()).sum();
+    let mut path_builder = StringBuilder::with_capacity(n, path_capacity);
     let mut size_builder = Int64Builder::with_capacity(n);
     let mut ts_builder = TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC");
 
@@ -522,7 +299,7 @@ fn build_all_files_batch(
     }
 
     RecordBatch::try_new(
-        schema.clone(),
+        arrow::ALL_FILES_SCHEMA.clone(),
         vec![
             Arc::new(base_uri_builder.finish()),
             Arc::new(path_builder.finish()),
