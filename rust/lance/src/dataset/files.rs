@@ -243,39 +243,51 @@ impl Dataset {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
 
-        let _task: tokio::task::JoinHandle<lance_core::Result<()>> = tokio::spawn(async move {
-            let mut manifest_locations =
-                commit_handler.list_manifest_locations(&base, &object_store, false);
+        let _task = tokio::spawn(async move {
+            let result: lance_core::Result<()> = async {
+                let mut manifest_locations =
+                    commit_handler.list_manifest_locations(&base, &object_store, false);
 
-            // uuid -> files under that index directory.
-            // Cached to avoid re-listing the same UUID directory across manifest versions.
-            let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
+                // uuid -> files under that index directory.
+                // Cached to avoid re-listing the same UUID directory across manifest versions.
+                let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
 
-            while let Some(loc) = manifest_locations.next().await {
-                let loc = loc?;
-                let manifest = read_manifest(&object_store, &loc.path, loc.size).await?;
-                let manifest_path = remove_prefix(&loc.path, &base);
-                let batches = manifest_file_batches(&manifest, &uri, manifest_path.as_ref());
-                for batch_result in batches {
-                    let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
-                    if tx.send(df_result).await.is_err() {
-                        return Ok(());
+                while let Some(loc) = manifest_locations.next().await {
+                    let loc = loc?;
+                    let manifest = read_manifest(&object_store, &loc.path, loc.size).await?;
+                    let manifest_path = remove_prefix(&loc.path, &base);
+                    let batches = manifest_file_batches(&manifest, &uri, manifest_path.as_ref());
+                    for batch_result in batches {
+                        let df_result =
+                            batch_result.map_err(datafusion::error::DataFusionError::from);
+                        if tx.send(df_result).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    let indexes = read_manifest_indexes(&object_store, &loc, &manifest).await?;
+                    let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
+                    let index_paths =
+                        get_index_files(uuids, &base, &object_store, &mut uuid_cache).await?;
+                    if !index_paths.is_empty() {
+                        let batch = index_file_batch(manifest.version, &uri, &index_paths).await?;
+                        if tx.send(Ok(batch)).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
 
-                let indexes = read_manifest_indexes(&object_store, &loc, &manifest).await?;
-                let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
-                let index_paths =
-                    get_index_files(uuids, &base, &object_store, &mut uuid_cache).await?;
-                if !index_paths.is_empty() {
-                    let batch = index_file_batch(manifest.version, &uri, &index_paths).await?;
-                    if tx.send(Ok(batch)).await.is_err() {
-                        return Ok(());
-                    }
-                }
+                Ok(())
             }
+            .await;
 
-            Ok(())
+            if let Err(e) = result {
+                // Best-effort: send the error to the stream consumer. If the
+                // receiver is already gone we silently discard it.
+                let _ = tx
+                    .send(Err(datafusion::error::DataFusionError::from(e)))
+                    .await;
+            }
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
