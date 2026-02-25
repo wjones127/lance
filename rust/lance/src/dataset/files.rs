@@ -122,7 +122,6 @@ fn manifest_file_batches<'a>(
     base_uri: &'a str,
     manifest_path: &'a str,
 ) -> Box<dyn ExactSizeIterator<Item = Result<RecordBatch>> + Send + 'a> {
-    const BATCH_SIZE: usize = 4096;
     let mut builder = TrackedFileBatch::with_capacity(BATCH_SIZE);
 
     let mut iter = manifest_file_rows(manifest, base_uri, manifest_path);
@@ -159,25 +158,52 @@ fn manifest_file_batches<'a>(
 async fn get_index_files(
     uuids: impl IntoIterator<Item = Uuid>,
     base: &Path,
-    object_store: &dyn object_store::ObjectStore,
+    object_store: &lance_io::object_store::ObjectStore,
     cache: &mut HashMap<Uuid, Vec<object_store::ObjectMeta>>,
 ) -> Result<Vec<Path>> {
-    futures::stream::iter(uuids)
-        .map(|uuid| async {
-            if !cache.contains_key(&uuid) {
-                let index_prefix = base.child(INDICES_DIR).child(uuid.to_string());
-                let files: Vec<object_store::ObjectMeta> =
-                    object_store.list(Some(&index_prefix)).try_collect().await?;
-                cache.insert(uuid, files);
-            }
-            Ok(cache[&uuid]
+    let uuids: Vec<Uuid> = uuids.into_iter().collect();
+
+    // Phase 1: list uncached UUID directories concurrently.
+    let uncached: Vec<Uuid> = uuids
+        .iter()
+        .filter(|uuid| !cache.contains_key(*uuid))
+        .copied()
+        .collect();
+    if !uncached.is_empty() {
+        let parallelism = object_store.io_parallelism();
+        // Clone for use in async move closures (ObjectStore is Arc-backed).
+        let base_owned = base.clone();
+        let os = object_store.clone();
+        let new_entries: Vec<(Uuid, Vec<object_store::ObjectMeta>)> =
+            futures::stream::iter(uncached)
+                .map(|uuid| {
+                    let base = base_owned.clone();
+                    let os = os.clone();
+                    async move {
+                        let prefix = base.child(INDICES_DIR).child(uuid.to_string());
+                        let files: Vec<object_store::ObjectMeta> =
+                            os.list(Some(prefix)).try_collect().await?;
+                        lance_core::Result::Ok((uuid, files))
+                    }
+                })
+                .buffer_unordered(parallelism)
+                .try_collect()
+                .await?;
+
+        // Phase 2: insert results into cache (serial, no contention).
+        cache.extend(new_entries);
+    }
+
+    // Phase 3: collect paths for the requested UUIDs in order.
+    let mut paths = Vec::new();
+    for uuid in &uuids {
+        paths.extend(
+            cache[uuid]
                 .iter()
-                .map(|meta| remove_prefix(&meta.location, base))
-                .collect::<Vec<_>>())
-        })
-        .buffer_unordered(4)
-        .try_collect::<Vec<_>>()
-        .await
+                .map(|meta| remove_prefix(&meta.location, base)),
+        );
+    }
+    Ok(paths)
 }
 
 async fn index_file_batch(version: u64, base_uri: &str, paths: &[Path]) -> Result<RecordBatch> {
@@ -238,11 +264,14 @@ impl Dataset {
                 }
 
                 let indexes = read_manifest_indexes(&object_store, &loc, &manifest).await?;
-                let uuids = indexes.iter().map(|idx| idx.uuid);
-                let index_paths = get_index_files(uuids, base, object_store, cache).await?;
-                let batch = index_file_batch(manifest.version, &uri, &index_paths.concat()).await?;
-                if tx.send(Ok(batch)).await.is_err() {
-                    return Ok(());
+                let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
+                let index_paths =
+                    get_index_files(uuids, &base, &object_store, &mut uuid_cache).await?;
+                if !index_paths.is_empty() {
+                    let batch = index_file_batch(manifest.version, &uri, &index_paths).await?;
+                    if tx.send(Ok(batch)).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
 
