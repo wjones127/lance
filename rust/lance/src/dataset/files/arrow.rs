@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayBuilder, Int8Builder};
 use arrow::datatypes::Int8Type;
-use arrow_array::builder::{
-    Int64Builder, StringBuilder, StringDictionaryBuilder, TimestampMicrosecondBuilder,
-};
+use arrow_array::builder::{Int64Builder, StringBuilder, StringDictionaryBuilder};
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, DictionaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -18,7 +14,7 @@ use lance_core::Result;
 use super::file_types::FileType;
 use super::FileRow;
 
-pub const FILE_TYPE_DICT_ARRAY: LazyLock<ArrayRef> = LazyLock::new(|| {
+pub static FILE_TYPE_DICT_ARRAY: LazyLock<ArrayRef> = LazyLock::new(|| {
     let mut builder = StringBuilder::with_capacity(5, 20);
     builder.append_value(FileType::Manifest.to_string());
     builder.append_value(FileType::DataFile.to_string());

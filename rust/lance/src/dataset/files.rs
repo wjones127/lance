@@ -4,29 +4,27 @@
 //! Dataset file inspection APIs.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_array::builder::{
     Int64Builder, StringBuilder, StringDictionaryBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::types::Int32Type;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
-use futures::stream::TryChunksError;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
+use uuid::Uuid;
 
-use crate::dataset::files::arrow::{FileTypeArrayBuilder, TrackedFileBatch, TRACKED_FILES_SCHEMA};
+use crate::dataset::files::arrow::{TrackedFileBatch, TRACKED_FILES_SCHEMA};
 use crate::dataset::files::file_types::FileType;
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::Dataset;
 use lance_core::Result;
-use lance_table::io::commit::ManifestLocation;
 use lance_table::io::deletion::relative_deletion_file_path;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 
@@ -54,7 +52,7 @@ fn manifest_file_rows<'a>(
     manifest: &'a lance_table::format::Manifest,
     base_uri: &'a str,
     manifest_path: &'a str,
-) -> Box<dyn ExactSizeIterator<Item = FileRow<'a>> + 'a> {
+) -> Box<dyn ExactSizeIterator<Item = FileRow<'a>> + Send + 'a> {
     let mut files = 1;
     let manifest_row = FileRow {
         version: manifest.version,
@@ -69,7 +67,7 @@ fn manifest_file_rows<'a>(
         let txn_row = FileRow {
             version: manifest.version,
             base_uri: Cow::Borrowed(base_uri),
-            path: Cow::Borrowed(txn_file),
+            path: Cow::Owned(format!("{}/{}", TRANSACTIONS_DIR, txn_file)),
             file_type: FileType::TransactionFile,
         };
         Either::Left(iter.chain(std::iter::once(txn_row)))
@@ -97,29 +95,18 @@ fn manifest_file_rows<'a>(
         let data_rows = fragment.files.iter().map(move |data_file| FileRow {
             version: manifest.version,
             base_uri: Cow::Borrowed(base_uri),
-            path: Cow::Borrowed(data_file.path.as_str()),
+            path: Cow::Owned(format!("{}/{}", DATA_DIR, data_file.path)),
             file_type: FileType::DataFile,
         });
         data_rows
     });
 
     let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
-        fragment.deletion_file.as_ref().map(|del_file| {
-            let base_uri = fragment
-                .files
-                .iter()
-                .find_map(|f| {
-                    f.base_id
-                        .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
-                })
-                .unwrap_or(base_uri);
-
-            FileRow {
-                version: manifest.version,
-                base_uri: Cow::Borrowed(base_uri),
-                path: Cow::Borrowed(todo!("handle relative deletion file paths")),
-                file_type: FileType::DeletionFile,
-            }
+        fragment.deletion_file.as_ref().map(|del_file| FileRow {
+            version: manifest.version,
+            base_uri: Cow::Borrowed(base_uri),
+            path: Cow::Owned(relative_deletion_file_path(fragment.id, del_file)),
+            file_type: FileType::DeletionFile,
         })
     });
 
@@ -134,48 +121,76 @@ fn manifest_file_batches<'a>(
     manifest: &'a lance_table::format::Manifest,
     base_uri: &'a str,
     manifest_path: &'a str,
-) -> Box<dyn ExactSizeIterator<Item = Result<RecordBatch>> + 'a> {
+) -> Box<dyn ExactSizeIterator<Item = Result<RecordBatch>> + Send + 'a> {
     const BATCH_SIZE: usize = 4096;
     let mut builder = TrackedFileBatch::with_capacity(BATCH_SIZE);
 
     let mut iter = manifest_file_rows(manifest, base_uri, manifest_path);
     let size = iter.len().div_ceil(BATCH_SIZE);
 
+    let mut flushed = false;
     Box::new(
         std::iter::from_fn(move || {
+            if flushed {
+                return None;
+            }
             while let Some(row) = iter.next() {
                 builder.append(&row);
                 if builder.len() == BATCH_SIZE {
                     let next_size = iter.len().div_ceil(BATCH_SIZE);
                     let old_builder =
                         std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(next_size));
-                    let batch_result = old_builder.finish();
-                    builder = TrackedFileBatch::with_capacity(iter.size_hint().0.min(BATCH_SIZE));
-                    return Some(batch_result);
+                    return Some(old_builder.finish());
                 }
             }
-            None
+            // Flush the remaining partial batch.
+            flushed = true;
+            if builder.len() != 0 {
+                let partial = std::mem::replace(&mut builder, TrackedFileBatch::with_capacity(0));
+                Some(partial.finish())
+            } else {
+                None
+            }
         })
         .exact_size(size),
     )
 }
 
-/// State for the Phase 2 stream in [`Dataset::tracked_files`].
-///
-/// Phase 2 lists each index UUID directory and emits one row per
-/// (version, index-file) pair.
-struct IndexFilesState {
-    /// Receives the UUID-to-versions map from the Phase 1 spawned task.
-    /// `None` once the map has been received.
-    rx_uuids: Option<tokio::sync::oneshot::Receiver<HashMap<String, Vec<u64>>>>,
-    /// Iterates over the UUID map entries after `rx_uuids` has been consumed.
-    uuid_iter: Option<std::collections::hash_map::IntoIter<String, Vec<u64>>>,
-    /// Batches that have been built but not yet yielded.
-    pending: VecDeque<RecordBatch>,
-    object_store: lance_io::object_store::ObjectStore,
-    base: Path,
-    uri: String,
-    schema: SchemaRef,
+async fn get_index_files(
+    uuids: impl IntoIterator<Item = Uuid>,
+    base: &Path,
+    object_store: &dyn object_store::ObjectStore,
+    cache: &mut HashMap<Uuid, Vec<object_store::ObjectMeta>>,
+) -> Result<Vec<Path>> {
+    futures::stream::iter(uuids)
+        .map(|uuid| async {
+            if !cache.contains_key(&uuid) {
+                let index_prefix = base.child(INDICES_DIR).child(uuid.to_string());
+                let files: Vec<object_store::ObjectMeta> =
+                    object_store.list(Some(&index_prefix)).try_collect().await?;
+                cache.insert(uuid, files);
+            }
+            Ok(cache[&uuid]
+                .iter()
+                .map(|meta| remove_prefix(&meta.location, base))
+                .collect::<Vec<_>>())
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await
+}
+
+async fn index_file_batch(version: u64, base_uri: &str, paths: &[Path]) -> Result<RecordBatch> {
+    let mut builder = TrackedFileBatch::with_capacity(paths.len());
+    for path in paths {
+        builder.append(&FileRow {
+            version,
+            base_uri: Cow::Borrowed(base_uri),
+            path: Cow::Owned(path.to_string()),
+            file_type: FileType::IndexFile,
+        });
+    }
+    builder.finish()
 }
 
 impl Dataset {
@@ -195,40 +210,42 @@ impl Dataset {
     ///
     /// Output order is non-deterministic.
     pub async fn tracked_files(&self) -> Result<SendableRecordBatchStream> {
-        let io_parallelism = self.object_store.io_parallelism();
         let base = self.base.clone();
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
-
         let commit_handler = self.commit_handler.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
 
-        let task = tokio::spawn(async move {
-            let manifest_locations =
-                self.commit_handler
-                    .list_manifest_locations(&self.base, &self.object_store, false);
+        let _task: tokio::task::JoinHandle<lance_core::Result<()>> = tokio::spawn(async move {
+            let mut manifest_locations =
+                commit_handler.list_manifest_locations(&base, &object_store, false);
+
+            // uuid -> files under that index directory.
+            // Cached to avoid re-listing the same UUID directory across manifest versions.
+            let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
 
             while let Some(loc) = manifest_locations.next().await {
                 let loc = loc?;
                 let manifest = read_manifest(&object_store, &loc.path, loc.size).await?;
-                let batches = manifest_file_batches(&manifest, &uri, loc.path.as_ref());
+                let manifest_path = remove_prefix(&loc.path, &base);
+                let batches = manifest_file_batches(&manifest, &uri, manifest_path.as_ref());
                 for batch_result in batches {
-                    let df_batch_result =
-                        batch_result.map_err(datafusion::error::DataFusionError::from);
-                    if tx.send(df_batch_result).await.is_err() {
-                        // Receiver dropped; stop processing.
+                    let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
+                    if tx.send(df_result).await.is_err() {
                         return Ok(());
                     }
                 }
+
+                let indexes = read_manifest_indexes(&object_store, &loc, &manifest).await?;
+                let uuids = indexes.iter().map(|idx| idx.uuid);
+                let index_paths = get_index_files(uuids, base, object_store, cache).await?;
+                let batch = index_file_batch(manifest.version, &uri, &index_paths.concat()).await?;
+                if tx.send(Ok(batch)).await.is_err() {
+                    return Ok(());
+                }
             }
 
-            // TODO: handle index files too.
-            // We should handle indexes as we see them. We might see indexes multiple times,
-            // so we should keep a cache of index UUIDs we've seen and their files so we can
-            // provide them for every manifest version after we see them.
-            // NOTE: don't try too hard to optimize this; in the future, we'll have the list
-            // of index files in the manifest.
             Ok(())
         });
 
@@ -316,7 +333,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::Dataset;
     use arrow_array::{Array, Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
@@ -331,26 +348,38 @@ mod tests {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    fn dict_value_at(col: &dyn arrow_array::Array, i: usize) -> String {
+        if let Some(dict) = col
+            .as_any()
+            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int8Type>>()
+        {
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            values.value(dict.keys().value(i) as usize).to_string()
+        } else if let Some(dict) = col
+            .as_any()
+            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>()
+        {
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            values.value(dict.keys().value(i) as usize).to_string()
+        } else {
+            panic!("expected a dictionary array with Int8 or Int32 keys");
+        }
+    }
+
     fn collect_column_values(batches: &[RecordBatch], col: &str) -> Vec<String> {
         batches
             .iter()
             .flat_map(|b| {
                 let col = b.column_by_name(col).unwrap();
-                (0..col.len()).map(|i| {
-                    let dict = col
-                        .as_any()
-                        .downcast_ref::<arrow_array::DictionaryArray<
-                            arrow_array::types::Int32Type,
-                        >>()
-                        .unwrap();
-                    let values = dict
-                        .values()
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap();
-                    let key = dict.keys().value(i) as usize;
-                    values.value(key).to_string()
-                })
+                (0..col.len()).map(|i| dict_value_at(col.as_ref(), i))
             })
             .collect()
     }
@@ -476,7 +505,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stream = ds.all_files().await.unwrap();
+        let stream = ds.all_files().await;
         let schema = stream.schema();
         let batches = collect_rows(stream).await;
 
@@ -528,7 +557,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stream = ds.all_files().await.unwrap();
+        let stream = ds.all_files().await;
         let schema = stream.schema();
 
         assert_eq!(schema.fields().len(), 4);

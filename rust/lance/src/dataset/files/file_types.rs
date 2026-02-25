@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, LazyLock};
-
-use arrow::{
-    array::{Int8Builder, StringBuilder},
-    datatypes::Int8Type,
-};
-use arrow_array::ArrayRef;
-
 #[derive(Debug, Clone, Copy)]
 pub enum FileType {
     Manifest,
@@ -21,11 +13,11 @@ pub enum FileType {
 impl std::fmt::Display for FileType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            FileType::Manifest => "manifest",
-            FileType::DataFile => "data",
-            FileType::DeletionFile => "deletion",
-            FileType::TransactionFile => "transaction",
-            FileType::IndexFile => "index",
+            Self::Manifest => "manifest",
+            Self::DataFile => "data file",
+            Self::DeletionFile => "deletion file",
+            Self::TransactionFile => "transaction file",
+            Self::IndexFile => "index file",
         };
         write!(f, "{s}")
     }
