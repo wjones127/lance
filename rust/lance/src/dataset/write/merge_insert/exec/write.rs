@@ -695,13 +695,10 @@ impl FullSchemaMergeInsertExec {
         update_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
         insert_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
     ) {
-        // Send to first open one.
-        match update_tx.send(Err(error)) {
-            Ok(_) => return,
-            Err(tokio::sync::mpsc::error::SendError(error)) => {
-                let _ = insert_tx.send(error);
-                return;
-            }
+        // Send to first open one. It doesn't matter which one receives it as
+        // long as the user gets the error in the end.
+        if let Err(tokio::sync::mpsc::error::SendError(error)) = update_tx.send(Err(error)) {
+            let _ = insert_tx.send(error);
         }
     }
 }
