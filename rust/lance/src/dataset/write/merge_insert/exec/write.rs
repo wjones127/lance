@@ -695,13 +695,14 @@ impl FullSchemaMergeInsertExec {
         update_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
         insert_tx: &tokio::sync::mpsc::UnboundedSender<DFResult<RecordBatch>>,
     ) {
-        let error_msg = format!("Stream processing failed: {}", error);
-
-        let update_error = datafusion::error::DataFusionError::Internal(error_msg.clone());
-        let insert_error = datafusion::error::DataFusionError::Internal(error_msg);
-
-        let _ = update_tx.send(Err(update_error));
-        let _ = insert_tx.send(Err(insert_error));
+        // Send to first open one.
+        match update_tx.send(Err(error)) {
+            Ok(_) => return,
+            Err(tokio::sync::mpsc::error::SendError(error)) => {
+                let _ = insert_tx.send(error);
+                return;
+            }
+        }
     }
 }
 
