@@ -194,8 +194,8 @@ pub fn create_duplicate_row_error(
 ) -> DataFusionError {
     DataFusionError::Execution(
         format!(
-            "Ambiguous merge insert: multiple source rows match the same target row on ({}). \
-                                This could lead to data corruption. Please ensure each target row is matched by at most one source row.",
+            "Ambiguous merge inserts are prohibited: multiple source rows match the same target row on ({}). \
+            Please ensure each target row is matched by at most one source row.",
             format_key_values_on_columns(batch, row_idx, on_columns)
         )
     )
