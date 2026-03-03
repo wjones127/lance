@@ -306,7 +306,6 @@ pub fn default_encoding_strategy_with_params(
     match version.resolve() {
         LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
             "Compression parameters are only supported in Lance file version 2.1 and later",
-            location!(),
         )),
         _ => {
             let compression_strategy =
@@ -818,15 +817,52 @@ mod tests {
         // Test with V2.0 - should fail
         let err = default_encoding_strategy_with_params(LanceFileVersion::V2_0, params.clone())
             .expect_err("Should fail for V2.0");
-        assert!(err
-            .to_string()
-            .contains("only supported in Lance file version 2.1"));
+        assert!(
+            err.to_string()
+                .contains("only supported in Lance file version 2.1")
+        );
 
         // Test with Legacy - should fail
         let err = default_encoding_strategy_with_params(LanceFileVersion::Legacy, params)
             .expect_err("Should fail for Legacy");
-        assert!(err
-            .to_string()
-            .contains("only supported in Lance file version 2.1"));
+        assert!(
+            err.to_string()
+                .contains("only supported in Lance file version 2.1")
+        );
+    }
+
+    #[test]
+    fn test_fixed_size_list_struct_requires_v2_2() {
+        let list_item = ArrowField::new(
+            "item",
+            ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "x",
+                ArrowDataType::Int32,
+                true,
+            )])),
+            true,
+        );
+        let arrow_field = ArrowField::new(
+            "list_struct",
+            ArrowDataType::FixedSizeList(Arc::new(list_item), 2),
+            true,
+        );
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        let strategy = StructuralEncodingStrategy::with_version(LanceFileVersion::V2_1);
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions::default();
+
+        let result = strategy.create_field_encoder(&strategy, &field, &mut column_index, &options);
+        assert!(
+            result.is_err(),
+            "FixedSizeList<Struct> should be rejected for file version 2.1"
+        );
+        let err = result.err().unwrap();
+
+        assert!(
+            err.to_string()
+                .contains("FixedSizeList<Struct> is only supported in Lance file format 2.2+")
+        );
     }
 }
