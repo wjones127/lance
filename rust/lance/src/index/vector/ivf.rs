@@ -27,6 +27,7 @@ use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
+use futures::TryFutureExt;
 use futures::{
     Stream, TryStreamExt,
     stream::{self, StreamExt},
@@ -889,8 +890,13 @@ impl Index for IVFIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: We should prewarm the IVF index by loading the partitions into memory
-        Ok(())
+        futures::stream::iter(0..self.ivf.num_partitions())
+            .map(Ok)
+            .try_for_each_concurrent(Some(self.reader.io_parallelism()), |part_id| {
+                self.load_partition(part_id, true, &NoOpMetricsCollector)
+                    .map_ok(|_| ())
+            })
+            .await
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
