@@ -346,10 +346,14 @@ fn try_general_compression(
     field_params: &CompressionFieldParams,
     data: &DataBlock,
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressionConfig)>> {
+    // Explicitly disable general compression.
+    if field_params.compression.as_deref() == Some("none") {
+        return Ok(None);
+    }
+
     // User-requested compression (unused today but perhaps still used
     // in the future someday)
     if let Some(compression_scheme) = &field_params.compression
-        && compression_scheme != "none"
         && version >= LanceFileVersion::V2_2
     {
         let scheme: CompressionScheme = compression_scheme.parse()?;
@@ -1779,6 +1783,64 @@ mod tests {
             }
             _ => panic!("expected fixed width block"),
         }
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn test_general_compression_not_selected_for_v2_1_even_if_requested() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some(if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 1024);
+
+        let (_compressor, encoding) = strategy
+            .create_block_compressor(&field, &data)
+            .expect("block compressor selection should succeed");
+
+        assert!(
+            !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
+            "general compression should not be selected for V2.1"
+        );
+    }
+
+    #[test]
+    fn test_none_compression_disables_auto_general_block_compression() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some("none".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 20_000);
+
+        assert!(
+            data.data_size() > MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION,
+            "test requires block size above automatic general compression threshold"
+        );
+
+        let (_compressor, encoding) = strategy
+            .create_block_compressor(&field, &data)
+            .expect("block compressor selection should succeed");
+
+        assert!(
+            !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
+            "compression=none should disable automatic block general compression"
+        );
     }
 
     #[test]
