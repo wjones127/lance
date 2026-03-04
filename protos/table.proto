@@ -460,7 +460,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// Empty details messages for older indexes that don't take advantage of the details field.
+// Details for vector indexes.
 message VectorIndexDetails {
   enum VectorMetricType {
     L2 = 0;

@@ -18,12 +18,50 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_table::format::IndexMetadata;
-use serde_json::json;
+use serde::Serialize;
 
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
+
+// Private structs for JSON serialization of VectorIndexDetails.
+// Changes to field names or structure are backwards-incompatible for users
+// parsing the JSON output of describe_indices(). See snapshot tests below.
+
+#[derive(Serialize)]
+struct VectorDetailsJson {
+    metric_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_partition_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hnsw: Option<HnswDetailsJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression: Option<CompressionDetailsJson>,
+}
+
+#[derive(Serialize)]
+struct HnswDetailsJson {
+    max_connections: u32,
+    construction_ef: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum CompressionDetailsJson {
+    Flat,
+    Pq {
+        num_bits: u32,
+        num_sub_vectors: u32,
+    },
+    Sq {
+        num_bits: u32,
+    },
+    Rq {
+        num_bits: u32,
+        rotation_type: &'static str,
+    },
+}
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
 pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
@@ -144,50 +182,44 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         Err(_) => "UNKNOWN",
     };
 
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "metric_type".to_string(),
-        serde_json::Value::String(metric_type.to_string()),
-    );
+    let hnsw = d.hnsw_index_config.map(|h| HnswDetailsJson {
+        max_connections: h.max_connections,
+        construction_ef: h.construction_ef,
+    });
 
-    if d.target_partition_size > 0 {
-        obj.insert(
-            "target_partition_size".to_string(),
-            json!(d.target_partition_size),
-        );
-    }
+    let compression = d.compression.map(|c| match c {
+        Compression::Flat(_) => CompressionDetailsJson::Flat,
+        Compression::Pq(pq) => CompressionDetailsJson::Pq {
+            num_bits: pq.num_bits,
+            num_sub_vectors: pq.num_sub_vectors,
+        },
+        Compression::Sq(sq) => CompressionDetailsJson::Sq {
+            num_bits: sq.num_bits,
+        },
+        Compression::Rq(rq) => {
+            let rotation_type = match rabit_quantization::RotationType::try_from(rq.rotation_type) {
+                Ok(rabit_quantization::RotationType::Matrix) => "matrix",
+                _ => "fast",
+            };
+            CompressionDetailsJson::Rq {
+                num_bits: rq.num_bits,
+                rotation_type,
+            }
+        }
+    });
 
-    if let Some(hnsw) = d.hnsw_index_config {
-        obj.insert(
-            "hnsw".to_string(),
-            json!({
-                "max_connections": hnsw.max_connections,
-                "construction_ef": hnsw.construction_ef,
-            }),
-        );
-    }
+    let json = VectorDetailsJson {
+        metric_type,
+        target_partition_size: if d.target_partition_size > 0 {
+            Some(d.target_partition_size)
+        } else {
+            None
+        },
+        hnsw,
+        compression,
+    };
 
-    if let Some(compression) = d.compression {
-        let comp_json = match compression {
-            Compression::Flat(_) => json!({"type": "flat"}),
-            Compression::Pq(pq) => json!({
-                "type": "pq",
-                "num_bits": pq.num_bits,
-                "num_sub_vectors": pq.num_sub_vectors,
-            }),
-            Compression::Sq(sq) => json!({
-                "type": "sq",
-                "num_bits": sq.num_bits,
-            }),
-            Compression::Rq(rq) => json!({
-                "type": "rq",
-                "num_bits": rq.num_bits,
-            }),
-        };
-        obj.insert("compression".to_string(), comp_json);
-    }
-
-    Ok(serde_json::Value::Object(obj).to_string())
+    serde_json::to_string(&json).map_err(|e| Error::index(format!("Failed to serialize: {}", e)))
 }
 
 /// Infer VectorIndexDetails from index files on disk.
@@ -344,4 +376,183 @@ async fn convert_v3_metadata_to_details(
         compression,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_table::format::pb::vector_index_details::*;
+    use lance_table::format::pb::{HnswIndexDetails, VectorIndexDetails};
+
+    fn make_details(
+        metric: VectorMetricType,
+        hnsw: Option<HnswIndexDetails>,
+        compression: Option<Compression>,
+    ) -> prost_types::Any {
+        let details = VectorIndexDetails {
+            metric_type: metric.into(),
+            target_partition_size: 0,
+            hnsw_index_config: hnsw,
+            compression,
+        };
+        prost_types::Any::from_msg(&details).unwrap()
+    }
+
+    #[test]
+    fn test_derive_index_type_without_hnsw() {
+        // Note: (None, "IVF_FLAT") is not testable here because a proto with
+        // all defaults serializes to empty bytes, which is treated as a legacy index.
+        let cases: [(Option<Compression>, &str); 4] = [
+            (Some(Compression::Flat(Flat {})), "IVF_FLAT"),
+            (
+                Some(Compression::Pq(ProductQuantization {
+                    num_bits: 8,
+                    num_sub_vectors: 16,
+                })),
+                "IVF_PQ",
+            ),
+            (
+                Some(Compression::Sq(ScalarQuantization { num_bits: 8 })),
+                "IVF_SQ",
+            ),
+            (
+                Some(Compression::Rq(RabitQuantization {
+                    num_bits: 1,
+                    rotation_type: 0,
+                })),
+                "IVF_RQ",
+            ),
+        ];
+        for (compression, expected) in cases {
+            let details = make_details(VectorMetricType::L2, None, compression);
+            assert_eq!(derive_vector_index_type(&details), expected);
+        }
+    }
+
+    #[test]
+    fn test_derive_index_type_with_hnsw() {
+        let hnsw = Some(HnswIndexDetails {
+            max_connections: 20,
+            construction_ef: 150,
+        });
+        assert_eq!(
+            derive_vector_index_type(&make_details(VectorMetricType::L2, hnsw, None)),
+            "IVF_HNSW_FLAT"
+        );
+        assert_eq!(
+            derive_vector_index_type(&make_details(
+                VectorMetricType::L2,
+                hnsw,
+                Some(Compression::Pq(ProductQuantization {
+                    num_bits: 8,
+                    num_sub_vectors: 16,
+                }))
+            )),
+            "IVF_HNSW_PQ"
+        );
+        assert_eq!(
+            derive_vector_index_type(&make_details(
+                VectorMetricType::L2,
+                hnsw,
+                Some(Compression::Sq(ScalarQuantization { num_bits: 8 }))
+            )),
+            "IVF_HNSW_SQ"
+        );
+    }
+
+    #[test]
+    fn test_derive_index_type_empty_details() {
+        let details = vector_index_details_default();
+        assert_eq!(derive_vector_index_type(&details), "Vector");
+    }
+
+    // Snapshot tests for JSON serialization. These guard backwards compatibility
+    // of the JSON format returned by describe_indices().
+
+    #[test]
+    fn test_json_ivf_pq() {
+        let details = make_details(
+            VectorMetricType::L2,
+            None,
+            Some(Compression::Pq(ProductQuantization {
+                num_bits: 8,
+                num_sub_vectors: 16,
+            })),
+        );
+        assert_eq!(
+            vector_details_as_json(&details).unwrap(),
+            r#"{"metric_type":"L2","compression":{"type":"pq","num_bits":8,"num_sub_vectors":16}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_ivf_hnsw_sq() {
+        let details = make_details(
+            VectorMetricType::Cosine,
+            Some(HnswIndexDetails {
+                max_connections: 30,
+                construction_ef: 200,
+            }),
+            Some(Compression::Sq(ScalarQuantization { num_bits: 4 })),
+        );
+        assert_eq!(
+            vector_details_as_json(&details).unwrap(),
+            r#"{"metric_type":"COSINE","hnsw":{"max_connections":30,"construction_ef":200},"compression":{"type":"sq","num_bits":4}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_ivf_rq_with_rotation() {
+        let details = make_details(
+            VectorMetricType::Dot,
+            None,
+            Some(Compression::Rq(RabitQuantization {
+                num_bits: 1,
+                rotation_type: rabit_quantization::RotationType::Matrix as i32,
+            })),
+        );
+        assert_eq!(
+            vector_details_as_json(&details).unwrap(),
+            r#"{"metric_type":"DOT","compression":{"type":"rq","num_bits":1,"rotation_type":"matrix"}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_ivf_rq_fast_rotation() {
+        let details = make_details(
+            VectorMetricType::L2,
+            None,
+            Some(Compression::Rq(RabitQuantization {
+                num_bits: 1,
+                rotation_type: rabit_quantization::RotationType::Fast as i32,
+            })),
+        );
+        assert_eq!(
+            vector_details_as_json(&details).unwrap(),
+            r#"{"metric_type":"L2","compression":{"type":"rq","num_bits":1,"rotation_type":"fast"}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_ivf_flat_with_target_partition_size() {
+        let details = {
+            let d = VectorIndexDetails {
+                metric_type: VectorMetricType::L2.into(),
+                target_partition_size: 5000,
+                hnsw_index_config: None,
+                compression: Some(Compression::Flat(Flat {})),
+            };
+            prost_types::Any::from_msg(&d).unwrap()
+        };
+        assert_eq!(
+            vector_details_as_json(&details).unwrap(),
+            r#"{"metric_type":"L2","target_partition_size":5000,"compression":{"type":"flat"}}"#
+        );
+    }
+
+    #[test]
+    fn test_json_empty_details() {
+        let details = vector_index_details_default();
+        assert_eq!(vector_details_as_json(&details).unwrap(), "{}");
+    }
 }
