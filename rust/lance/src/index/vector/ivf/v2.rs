@@ -117,6 +117,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     index_cache: WeakLanceCache,
 
+    io_parallelism: usize,
+
     _marker: PhantomData<(S, Q)>,
 }
 
@@ -141,6 +143,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
     ) -> Result<Self> {
+        let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
@@ -211,6 +214,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
             _marker: PhantomData,
         })
     }
@@ -332,7 +336,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     async fn prewarm(&self) -> Result<()> {
         futures::stream::iter(0..self.ivf.num_partitions())
             .map(Ok)
-            .try_for_each_concurrent(Some(8), |part_id| {
+            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
                 self.load_partition(part_id, true, &NoOpMetricsCollector)
                     .map_ok(|_| ())
             })
