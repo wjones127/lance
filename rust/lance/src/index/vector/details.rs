@@ -49,7 +49,6 @@ struct HnswDetailsJson {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum CompressionDetailsJson {
-    Flat,
     Pq {
         num_bits: u32,
         num_sub_vectors: u32,
@@ -135,7 +134,7 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     };
     let has_hnsw = d.hnsw_index_config.is_some();
     match d.compression {
-        None | Some(Compression::Flat(_)) => {
+        None => {
             if has_hnsw {
                 "IVF_HNSW_FLAT"
             } else {
@@ -188,7 +187,6 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
     });
 
     let compression = d.compression.map(|c| match c {
-        Compression::Flat(_) => CompressionDetailsJson::Flat,
         Compression::Pq(pq) => CompressionDetailsJson::Pq {
             num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
@@ -402,8 +400,7 @@ mod tests {
     fn test_derive_index_type_without_hnsw() {
         // Note: (None, "IVF_FLAT") is not testable here because a proto with
         // all defaults serializes to empty bytes, which is treated as a legacy index.
-        let cases: [(Option<Compression>, &str); 4] = [
-            (Some(Compression::Flat(Flat {})), "IVF_FLAT"),
+        let cases: [(Option<Compression>, &str); 3] = [
             (
                 Some(Compression::Pq(ProductQuantization {
                     num_bits: 8,
@@ -534,19 +531,19 @@ mod tests {
     }
 
     #[test]
-    fn test_json_ivf_flat_with_target_partition_size() {
+    fn test_json_with_target_partition_size() {
         let details = {
             let d = VectorIndexDetails {
                 metric_type: VectorMetricType::L2.into(),
                 target_partition_size: 5000,
                 hnsw_index_config: None,
-                compression: Some(Compression::Flat(Flat {})),
+                compression: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
         assert_eq!(
             vector_details_as_json(&details).unwrap(),
-            r#"{"metric_type":"L2","target_partition_size":5000,"compression":{"type":"flat"}}"#
+            r#"{"metric_type":"L2","target_partition_size":5000}"#
         );
     }
 

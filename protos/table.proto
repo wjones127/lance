@@ -475,7 +475,6 @@ message VectorIndexDetails {
 
   optional HnswIndexDetails hnsw_index_config = 3;
 
-  message Flat {}
   message ProductQuantization {
     uint32 num_bits = 1;
     uint32 num_sub_vectors = 2;
@@ -492,8 +491,8 @@ message VectorIndexDetails {
     RotationType rotation_type = 2;
   }
 
+  // An unset compression oneof means flat / no quantization.
   oneof compression {
-    Flat flat = 4;
     ProductQuantization pq = 5;
     ScalarQuantization sq = 6;
     RabitQuantization rq = 7;
