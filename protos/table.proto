@@ -476,19 +476,20 @@ message VectorIndexDetails {
   optional HnswIndexDetails hnsw_index_config = 3;
 
   message Flat {}
-  enum Bits {
-    BIT_8 = 0;
-    BIT_4 = 1;
-  }
   message ProductQuantization {
-    Bits num_bits = 1;
+    uint32 num_bits = 1;
     uint32 num_sub_vectors = 2;
   }
   message ScalarQuantization {
-    Bits num_bits = 1;
+    uint32 num_bits = 1;
   }
   message RabitQuantization {
-    Bits num_bits = 1;
+    enum RotationType {
+      FAST = 0;
+      MATRIX = 1;
+    }
+    uint32 num_bits = 1;
+    RotationType rotation_type = 2;
   }
 
   oneof compression {

@@ -2260,7 +2260,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details;
+    use crate::index::vector_index_details_default;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
 
     const DIM: usize = 32;
@@ -2658,7 +2658,7 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
@@ -2696,7 +2696,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
@@ -2761,7 +2761,7 @@ mod tests {
                     .map(|f| f.id() as u32)
                     .collect(),
             ),
-            index_details: Some(Arc::new(vector_index_details())),
+            index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,

@@ -407,10 +407,10 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     Ok(proto)
 }
 
-fn vector_index_details() -> prost_types::Any {
-    let details = lance_table::format::pb::VectorIndexDetails::default();
-    prost_types::Any::from_msg(&details).unwrap()
-}
+use vector::details::{
+    derive_vector_index_type, infer_vector_index_details, vector_details_as_json,
+};
+pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 
 struct IndexDescriptionImpl {
     name: String,
@@ -464,10 +464,14 @@ impl IndexDescriptionImpl {
         let details = IndexDetails(index_details.clone());
         let mut rows_indexed = 0;
 
-        let index_type = details
-            .get_plugin()
-            .map(|p| p.name().to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
+        let index_type = if details.is_vector() {
+            derive_vector_index_type(index_details)
+        } else {
+            details
+                .get_plugin()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|_| "Unknown".to_string())
+        };
 
         for shard in &segments {
             let fragment_bitmap = shard
@@ -519,10 +523,14 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn details(&self) -> Result<String> {
-        let plugin = self.details.get_plugin()?;
-        plugin
-            .details_as_json(&self.details.0)
-            .map(|v| v.to_string())
+        if self.details.is_vector() {
+            vector_details_as_json(&self.details.0)
+        } else {
+            let plugin = self.details.get_plugin()?;
+            plugin
+                .details_as_json(&self.details.0)
+                .map(|v| v.to_string())
+        }
     }
 }
 
@@ -657,16 +665,47 @@ impl DatasetIndexExt for Dataset {
         };
         indices.sort_by_key(|idx| &idx.name);
 
-        indices
+        // Collect groups upfront so we don't hold chunk_by across await points
+        let groups: Vec<Vec<IndexMetadata>> = indices
             .into_iter()
-            .chunk_by(|idx| &idx.name)
+            .chunk_by(|idx| idx.name.clone())
             .into_iter()
-            .map(|(_, segments)| {
-                let segments = segments.cloned().collect::<Vec<_>>();
-                let desc = IndexDescriptionImpl::try_new(segments, self)?;
-                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
-            })
-            .collect::<Result<Vec<_>>>()
+            .map(|(_, segments)| segments.cloned().collect::<Vec<_>>())
+            .collect();
+
+        let mut results: Vec<Arc<dyn IndexDescription>> = Vec::new();
+        for mut segments in groups {
+            // For vector indices with empty details, try to infer from index files
+            if let Some(first) = segments.first() {
+                let is_empty_vector = first
+                    .index_details
+                    .as_ref()
+                    .map(|d| d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty())
+                    .unwrap_or(false);
+
+                if is_empty_vector {
+                    match infer_vector_index_details(self, first).await {
+                        Ok(inferred) => {
+                            let inferred = Arc::new(inferred);
+                            for seg in &mut segments {
+                                seg.index_details = Some(inferred.clone());
+                            }
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Could not infer vector index details for {}: {}",
+                                first.name,
+                                err
+                            );
+                        }
+                    }
+                }
+            }
+
+            let desc = IndexDescriptionImpl::try_new(segments, self)?;
+            results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
+        }
+        Ok(results)
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {

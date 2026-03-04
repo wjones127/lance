@@ -10,6 +10,7 @@ use std::sync::Arc;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, ArrayRef, UInt8Array, cast::AsArray};
 use lance_core::{Error, Result};
+use lance_table::format::pb::vector_index_details::RabitQuantization;
 use num_traits::Float;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +118,19 @@ impl RQBuildParams {
         Self {
             num_bits,
             rotation_type,
+        }
+    }
+}
+
+impl From<&RQBuildParams> for RabitQuantization {
+    fn from(value: &RQBuildParams) -> Self {
+        use lance_table::format::pb::vector_index_details::rabit_quantization::RotationType;
+        Self {
+            num_bits: value.num_bits as u32,
+            rotation_type: match value.rotation_type {
+                RQRotationType::Fast => RotationType::Fast as i32,
+                RQRotationType::Matrix => RotationType::Matrix as i32,
+            },
         }
     }
 }

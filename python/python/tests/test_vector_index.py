@@ -1565,8 +1565,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
 
     assert info.name == "vector_idx"
     assert info.type_url == "/lance.table.VectorIndexDetails"
-    # This is currently Unknown because vector indices are not yet handled by plugins
-    assert info.index_type == "Unknown"
+    assert info.index_type == "IVF_PQ"
     assert info.num_rows_indexed == 1000
     assert info.fields == [0]
     assert info.field_names == ["vector"]
@@ -1575,6 +1574,14 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     assert info.segments[0].dataset_version_at_last_update == 1
     assert info.segments[0].index_version == 1
     assert info.segments[0].created_at is not None
+
+    import json
+
+    details = json.loads(info.details)
+    assert details["metric_type"] == "L2"
+    assert details["compression"]["type"] == "pq"
+    assert details["compression"]["num_bits"] == 8
+    assert details["compression"]["num_sub_vectors"] == 16
 
 
 def test_optimize_indices(indexed_dataset):

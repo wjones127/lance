@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
+pub(crate) mod details;
 pub mod ivf;
 pub mod pq;
 pub mod utils;
@@ -59,7 +60,7 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
+use super::{DatasetIndexInternalExt, IndexParams, pb};
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
 
@@ -1552,7 +1553,7 @@ pub async fn initialize_vector_index(
         fields: vec![field.id],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
-        index_details: Some(Arc::new(vector_index_details())),
+        index_details: source_index.index_details.clone(),
         index_version: VECTOR_INDEX_VERSION as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

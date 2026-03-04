@@ -20,7 +20,7 @@ use super::vector::ivf::optimize_vector_indices;
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::scalar::load_training_data;
-use crate::index::vector_index_details;
+use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -213,11 +213,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
                 });
 
+            // Carry forward existing index details from the most recent index segment
+            let index_details = old_indices
+                .last()
+                .and_then(|idx| idx.index_details.as_ref())
+                .map(|d| d.as_ref().clone())
+                .unwrap_or_else(vector_index_details_default);
+
             Ok((
                 new_uuid,
                 indices_merged,
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details,
                     index_version: VECTOR_INDEX_VERSION,
                 },
             ))

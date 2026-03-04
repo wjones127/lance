@@ -14,7 +14,7 @@ use crate::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
         },
-        vector_index_details,
+        vector_index_details, vector_index_details_default,
     },
 };
 use futures::future::BoxFuture;
@@ -353,7 +353,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     .await?;
                 }
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details(vec_params),
                     index_version: VECTOR_INDEX_VERSION,
                 }
             }
@@ -387,7 +387,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     todo!("create empty vector index when train=false");
                 }
                 CreatedIndex {
-                    index_details: vector_index_details(),
+                    index_details: vector_index_details_default(),
                     index_version: VECTOR_INDEX_VERSION,
                 }
             }
