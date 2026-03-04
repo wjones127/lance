@@ -461,7 +461,54 @@ message ExternalFile {
 }
 
 // Empty details messages for older indexes that don't take advantage of the details field.
-message VectorIndexDetails {}
+message VectorIndexDetails {
+  enum VectorMetricType {
+    L2 = 0;
+    COSINE = 1;
+    DOT = 2;
+    HAMMING = 3;
+  }
+
+  VectorMetricType metric_type = 1;
+
+  uint64 target_partition_size = 2;
+
+  optional HnswIndexDetails hnsw_index_config = 3;
+
+  message Flat {}
+  enum Bits {
+    BIT_8 = 0;
+    BIT_4 = 1;
+  }
+  message ProductQuantization {
+    Bits num_bits = 1;
+    uint32 num_sub_vectors = 2;
+  }
+  message ScalarQuantization {
+    Bits num_bits = 1;
+  }
+  message RabitQuantization {
+    Bits num_bits = 1;
+  }
+
+  oneof compression {
+    Flat flat = 4;
+    ProductQuantization pq = 5;
+    ScalarQuantization sq = 6;
+    RabitQuantization rq = 7;
+  }
+}
+
+// Hierarchical Navigable Small World (HNSW) index details, used as an optional configuration for IVF indexes.
+message HnswIndexDetails {
+  // The maximum number of outgoing edges per node in the HNSW graph. Higher values
+  // means more connections, better recall, but more memory and slower builds.
+  // Referred to as "M" in the HNSW literature.
+  uint32 max_connections = 1;
+  // "construction exploration factor": The size of the dynamic list used during
+  // index construction.
+  uint32 construction_ef = 2;
+}
 
 message FragmentReuseIndexDetails {
 
