@@ -44,7 +44,7 @@ pub struct PQBuildParams {
     pub sample_rate: usize,
 }
 
-impl From<&PQBuildParams> for lance_table::format::pb::vector_index_details::ProductQuantization {
+impl From<&PQBuildParams> for crate::pb::vector_index_details::ProductQuantization {
     fn from(params: &PQBuildParams) -> Self {
         Self {
             num_bits: params.num_bits as u32,

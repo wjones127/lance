@@ -362,7 +362,7 @@ pub(crate) async fn remap_index(
             .await?;
             CreatedIndex {
                 index_details: prost_types::Any::from_msg(
-                    &lance_table::format::pb::VectorIndexDetails::default(),
+                    &lance_index::pb::VectorIndexDetails::default(),
                 )
                 .unwrap(),
                 index_version,

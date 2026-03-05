@@ -460,58 +460,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// Details for vector indexes.
-message VectorIndexDetails {
-  enum VectorMetricType {
-    L2 = 0;
-    COSINE = 1;
-    DOT = 2;
-    HAMMING = 3;
-  }
-
-  VectorMetricType metric_type = 1;
-
-  // The target number of vectors per partition.
-  // 0 means unset.
-  uint64 target_partition_size = 2;
-
-  // Optional HNSW index configuration. If present, index does not use HNSW.
-  optional HnswIndexDetails hnsw_index_config = 3;
-
-  message ProductQuantization {
-    uint32 num_bits = 1;
-    uint32 num_sub_vectors = 2;
-  }
-  message ScalarQuantization {
-    uint32 num_bits = 1;
-  }
-  message RabitQuantization {
-    enum RotationType {
-      FAST = 0;
-      MATRIX = 1;
-    }
-    uint32 num_bits = 1;
-    RotationType rotation_type = 2;
-  }
-
-  // An unset compression oneof means flat / no quantization.
-  oneof compression {
-    ProductQuantization pq = 4;
-    ScalarQuantization sq = 5;
-    RabitQuantization rq = 6;
-  }
-}
-
-// Hierarchical Navigable Small World (HNSW) index details, used as an optional configuration for IVF indexes.
-message HnswIndexDetails {
-  // The maximum number of outgoing edges per node in the HNSW graph. Higher values
-  // means more connections, better recall, but more memory and slower builds.
-  // Referred to as "M" in the HNSW literature.
-  uint32 max_connections = 1;
-  // "construction exploration factor": The size of the dynamic list used during
-  // index construction.
-  uint32 construction_ef = 2;
-}
+// VectorIndexDetails and HnswIndexDetails moved to index.proto
 
 message FragmentReuseIndexDetails {
 

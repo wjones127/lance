@@ -13,16 +13,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
+use lance_index::pb::VectorIndexDetails;
+use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
+use lance_index::pb::vector_index_details::{Compression, rabit_quantization};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_table::format::IndexMetadata;
-use lance_table::format::pb::VectorIndexDetails;
-use lance_table::format::pb::vector_index_details::{
-    Compression, VectorMetricType, rabit_quantization,
-};
 use serde::Serialize;
 
 use super::{StageParams, VectorIndexParams};
@@ -112,7 +111,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
 }
 
 pub fn vector_index_details_default() -> prost_types::Any {
-    let details = lance_table::format::pb::VectorIndexDetails::default();
+    let details = lance_index::pb::VectorIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
 }
 
@@ -289,21 +288,16 @@ pub async fn infer_vector_index_details(
 }
 
 fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any> {
-    use lance_table::format::pb::VectorIndexDetails;
-    use lance_table::format::pb::vector_index_details::*;
+    use lance_index::pb::VectorIndexDetails;
+    use lance_index::pb::vector_index_details::*;
     use pb::vector_index_stage::Stage;
 
     let Some(Implementation::VectorIndex(vector_index)) = &proto.implementation else {
         return Ok(vector_index_details_default());
     };
 
-    let metric_type = match pb::VectorMetricType::try_from(vector_index.metric_type) {
-        Ok(pb::VectorMetricType::L2) => VectorMetricType::L2,
-        Ok(pb::VectorMetricType::Cosine) => VectorMetricType::Cosine,
-        Ok(pb::VectorMetricType::Dot) => VectorMetricType::Dot,
-        Ok(pb::VectorMetricType::Hamming) => VectorMetricType::Hamming,
-        Err(_) => VectorMetricType::L2,
-    };
+    let metric_type = pb::VectorMetricType::try_from(vector_index.metric_type)
+        .unwrap_or(pb::VectorMetricType::L2);
 
     let mut compression = None;
     for stage in &vector_index.stages {
@@ -328,13 +322,13 @@ async fn convert_v3_metadata_to_details(
     dataset: &Dataset,
     index_file: &object_store::path::Path,
 ) -> Result<prost_types::Any> {
+    use lance_index::pb::vector_index_details::*;
+    use lance_index::pb::{HnswIndexDetails, VectorIndexDetails};
     use lance_index::vector::bq::storage::RABIT_METADATA_KEY;
     use lance_index::vector::hnsw::HnswMetadata;
     use lance_index::vector::ivf::storage::IVF_PARTITION_KEY;
     use lance_index::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata};
     use lance_index::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
-    use lance_table::format::pb::vector_index_details::*;
-    use lance_table::format::pb::{HnswIndexDetails, VectorIndexDetails};
 
     let scheduler = ScanScheduler::new(
         dataset.object_store.clone(),
@@ -420,8 +414,8 @@ async fn convert_v3_metadata_to_details(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_table::format::pb::vector_index_details::*;
-    use lance_table::format::pb::{HnswIndexDetails, VectorIndexDetails};
+    use lance_index::pb::vector_index_details::*;
+    use lance_index::pb::{HnswIndexDetails, VectorIndexDetails};
 
     fn make_details(
         metric: VectorMetricType,

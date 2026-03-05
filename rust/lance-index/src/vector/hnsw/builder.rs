@@ -59,7 +59,7 @@ pub struct HnswBuildParams {
     pub prefetch_distance: Option<usize>,
 }
 
-impl From<&HnswBuildParams> for lance_table::format::pb::HnswIndexDetails {
+impl From<&HnswBuildParams> for crate::pb::HnswIndexDetails {
     fn from(params: &HnswBuildParams) -> Self {
         Self {
             max_connections: params.m as u32,
