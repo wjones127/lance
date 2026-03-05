@@ -471,9 +471,11 @@ message VectorIndexDetails {
 
   VectorMetricType metric_type = 1;
 
-  // 0 means unset (unknown or not applicable).
+  // The target number of vectors per partition.
+  // 0 means unset.
   uint64 target_partition_size = 2;
 
+  // Optional HNSW index configuration. If present, index does not use HNSW.
   optional HnswIndexDetails hnsw_index_config = 3;
 
   message ProductQuantization {

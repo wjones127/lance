@@ -9,6 +9,7 @@
 //! - Serializing details as JSON for `describe_indices()`
 //! - Inferring details from index files on disk (fallback for legacy indices)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
@@ -18,6 +19,10 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_table::format::IndexMetadata;
+use lance_table::format::pb::VectorIndexDetails;
+use lance_table::format::pb::vector_index_details::{
+    Compression, VectorMetricType, rabit_quantization,
+};
 use serde::Serialize;
 
 use super::{StageParams, VectorIndexParams};
@@ -64,9 +69,6 @@ enum CompressionDetailsJson {
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
 pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
-    use lance_table::format::pb::VectorIndexDetails;
-    use lance_table::format::pb::vector_index_details::*;
-
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -147,8 +149,6 @@ pub fn needs_vector_details_inference(
 /// Runs inference once per unique index name, concurrently across names.
 /// Applies the inferred details back to all matching indices in the slice.
 pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [IndexMetadata]) {
-    use std::collections::HashMap;
-
     let schema = dataset.schema();
     let needs_inference: HashMap<&str, &IndexMetadata> = indices
         .iter()
@@ -184,9 +184,6 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
 
 /// Derive a human-readable index type string from VectorIndexDetails.
 pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
-    use lance_table::format::pb::VectorIndexDetails;
-    use lance_table::format::pb::vector_index_details::Compression;
-
     if is_empty_vector_details(details) {
         return "Vector".to_string();
     }
@@ -194,39 +191,21 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     let Ok(d) = details.to_msg::<VectorIndexDetails>() else {
         return "Vector".to_string();
     };
-    let has_hnsw = d.hnsw_index_config.is_some();
-    match d.compression {
-        None => {
-            if has_hnsw {
-                "IVF_HNSW_FLAT"
-            } else {
-                "IVF_FLAT"
-            }
-        }
-        Some(Compression::Pq(_)) => {
-            if has_hnsw {
-                "IVF_HNSW_PQ"
-            } else {
-                "IVF_PQ"
-            }
-        }
-        Some(Compression::Sq(_)) => {
-            if has_hnsw {
-                "IVF_HNSW_SQ"
-            } else {
-                "IVF_SQ"
-            }
-        }
-        Some(Compression::Rq(_)) => "IVF_RQ",
+    let mut index_type = "IVF_".to_string();
+    if d.hnsw_index_config.is_some() {
+        index_type.push_str("HNSW_");
     }
-    .to_string()
+    match d.compression {
+        None => index_type.push_str("FLAT"),
+        Some(Compression::Pq(_)) => index_type.push_str("PQ"),
+        Some(Compression::Sq(_)) => index_type.push_str("SQ"),
+        Some(Compression::Rq(_)) => index_type.push_str("RQ"),
+    }
+    index_type
 }
 
 /// Serialize VectorIndexDetails as a JSON string.
 pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
-    use lance_table::format::pb::VectorIndexDetails;
-    use lance_table::format::pb::vector_index_details::*;
-
     if is_empty_vector_details(details) {
         return Ok("{}".to_string());
     }
