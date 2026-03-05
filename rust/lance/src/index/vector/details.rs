@@ -120,6 +120,16 @@ fn is_empty_vector_details(details: &prost_types::Any) -> bool {
     details.value.is_empty()
 }
 
+/// Returns true if this index has a VectorIndexDetails type_url but empty value bytes,
+/// indicating a legacy index that needs details inferred from disk.
+pub fn is_vector_index_with_empty_details(index: &IndexMetadata) -> bool {
+    index
+        .index_details
+        .as_ref()
+        .map(|d| d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty())
+        .unwrap_or(false)
+}
+
 /// Derive a human-readable index type string from VectorIndexDetails.
 pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
     use lance_table::format::pb::VectorIndexDetails;

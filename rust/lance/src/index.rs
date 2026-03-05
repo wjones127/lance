@@ -408,7 +408,8 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 }
 
 use vector::details::{
-    derive_vector_index_type, infer_vector_index_details, vector_details_as_json,
+    derive_vector_index_type, infer_vector_index_details, is_vector_index_with_empty_details,
+    vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 
@@ -674,34 +675,7 @@ impl DatasetIndexExt for Dataset {
             .collect();
 
         let mut results: Vec<Arc<dyn IndexDescription>> = Vec::new();
-        for mut segments in groups {
-            // For vector indices with empty details, try to infer from index files
-            if let Some(first) = segments.first() {
-                let is_empty_vector = first
-                    .index_details
-                    .as_ref()
-                    .map(|d| d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty())
-                    .unwrap_or(false);
-
-                if is_empty_vector {
-                    match infer_vector_index_details(self, first).await {
-                        Ok(inferred) => {
-                            let inferred = Arc::new(inferred);
-                            for seg in &mut segments {
-                                seg.index_details = Some(inferred.clone());
-                            }
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "Could not infer vector index details for {}: {}",
-                                first.name,
-                                err
-                            );
-                        }
-                    }
-                }
-            }
-
+        for segments in groups {
             let desc = IndexDescriptionImpl::try_new(segments, self)?;
             results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
         }
@@ -722,6 +696,36 @@ impl DatasetIndexExt for Dataset {
                 )
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
+
+                // Infer details for legacy vector indices (once per index name, concurrently).
+                let needs_inference: HashMap<&str, &IndexMetadata> = loaded_indices
+                    .iter()
+                    .filter(|idx| is_vector_index_with_empty_details(idx))
+                    .map(|idx| (idx.name.as_str(), idx))
+                    .collect();
+                let inferred: HashMap<String, Arc<prost_types::Any>> = futures::future::join_all(
+                    needs_inference
+                        .into_iter()
+                        .map(|(name, representative)| async move {
+                            let result = infer_vector_index_details(self, representative).await;
+                            (name.to_string(), result)
+                        }),
+                )
+                .await
+                .into_iter()
+                .filter_map(|(name, result)| match result {
+                    Ok(details) => Some((name, Arc::new(details))),
+                    Err(err) => {
+                        log::warn!("Could not infer vector index details for {}: {}", name, err);
+                        None
+                    }
+                })
+                .collect();
+                for index in &mut loaded_indices {
+                    if let Some(details) = inferred.get(&index.name) {
+                        index.index_details = Some(details.clone());
+                    }
+                }
                 let loaded_indices = Arc::new(loaded_indices);
                 self.index_cache
                     .insert_with_key(&metadata_key, loaded_indices.clone())
