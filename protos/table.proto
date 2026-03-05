@@ -471,6 +471,7 @@ message VectorIndexDetails {
 
   VectorMetricType metric_type = 1;
 
+  // 0 means unset (unknown or not applicable).
   uint64 target_partition_size = 2;
 
   optional HnswIndexDetails hnsw_index_config = 3;
@@ -493,9 +494,9 @@ message VectorIndexDetails {
 
   // An unset compression oneof means flat / no quantization.
   oneof compression {
-    ProductQuantization pq = 5;
-    ScalarQuantization sq = 6;
-    RabitQuantization rq = 7;
+    ProductQuantization pq = 4;
+    ScalarQuantization sq = 5;
+    RabitQuantization rq = 6;
   }
 }
 

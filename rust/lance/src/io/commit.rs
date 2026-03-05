@@ -565,37 +565,8 @@ fn must_recalculate_fragment_bitmap(
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
-    use crate::index::vector::details::{
-        infer_vector_index_details, needs_vector_details_inference,
-    };
-    let schema = dataset.schema();
-    let needs_inference: HashMap<&str, &IndexMetadata> = indices
-        .iter()
-        .filter(|idx| needs_vector_details_inference(idx, schema))
-        .map(|idx| (idx.name.as_str(), idx))
-        .collect();
-    let inferred: HashMap<String, Arc<prost_types::Any>> =
-        futures::future::join_all(needs_inference.into_iter().map(
-            |(name, representative)| async move {
-                let result = infer_vector_index_details(dataset, representative).await;
-                (name.to_string(), result)
-            },
-        ))
-        .await
-        .into_iter()
-        .filter_map(|(name, result)| match result {
-            Ok(details) => Some((name, Arc::new(details))),
-            Err(err) => {
-                log::warn!("Could not infer vector index details for {}: {}", name, err);
-                None
-            }
-        })
-        .collect();
-    for index in indices.iter_mut() {
-        if let Some(details) = inferred.get(&index.name) {
-            index.index_details = Some(details.clone());
-        }
-    }
+    use crate::index::vector::details::infer_missing_vector_details;
+    infer_missing_vector_details(dataset, indices).await;
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {

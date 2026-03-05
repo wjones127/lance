@@ -408,8 +408,7 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 }
 
 use vector::details::{
-    derive_vector_index_type, infer_vector_index_details, needs_vector_details_inference,
-    vector_details_as_json,
+    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 
@@ -707,37 +706,10 @@ impl DatasetIndexExt for Dataset {
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
         // before the full Dataset was available for inference.
-        let schema = self.schema();
-        let needs_inference: HashMap<&str, &IndexMetadata> = indices
-            .iter()
-            .filter(|idx| needs_vector_details_inference(idx, schema))
-            .map(|idx| (idx.name.as_str(), idx))
-            .collect();
-        if !needs_inference.is_empty() {
-            let inferred: HashMap<String, Arc<prost_types::Any>> =
-                futures::future::join_all(needs_inference.into_iter().map(
-                    |(name, representative)| async move {
-                        let result = infer_vector_index_details(self, representative).await;
-                        (name.to_string(), result)
-                    },
-                ))
-                .await
-                .into_iter()
-                .filter_map(|(name, result)| match result {
-                    Ok(details) => Some((name, Arc::new(details))),
-                    Err(err) => {
-                        log::warn!("Could not infer vector index details for {}: {}", name, err);
-                        None
-                    }
-                })
-                .collect();
-            if !inferred.is_empty() {
-                let mut updated = indices.as_ref().clone();
-                for index in &mut updated {
-                    if let Some(details) = inferred.get(&index.name) {
-                        index.index_details = Some(details.clone());
-                    }
-                }
+        {
+            let mut updated = indices.as_ref().clone();
+            infer_missing_vector_details(self, &mut updated).await;
+            if updated != *indices {
                 indices = Arc::new(updated);
                 self.index_cache
                     .insert_with_key(&metadata_key, indices.clone())
