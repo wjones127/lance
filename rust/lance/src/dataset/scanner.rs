@@ -12,28 +12,28 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
-use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
+use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_datafusion_err};
 use datafusion::functions_aggregate;
-use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
+use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
     union::UnionExec,
-    ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::ExprSchemable;
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::joins::PartitionMode;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -41,10 +41,10 @@ use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
-use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
-    escape_field_path_for_project, format_field_path, BlobHandling, Field, OnMissing, Projection,
+    BlobHandling, Field, OnMissing, Projection, escape_field_path_for_project, format_field_path,
 };
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -53,51 +53,53 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::aggregate::Aggregate;
 use lance_datafusion::exec::{
-    analyze_plan, execute_plan, LanceExecutionOptions, OneShotExec, StrictBatchSizeExec,
+    LanceExecutionOptions, OneShotExec, StrictBatchSizeExec, analyze_plan, execute_plan,
 };
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{IndexExprResult, PlannerIndexExt, INDEX_EXPR_RESULT_SCHEMA};
+use lance_index::IndexCriteria;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::expression::{INDEX_EXPR_RESULT_SCHEMA, IndexExprResult, PlannerIndexExt};
 use lance_index::scalar::inverted::query::{
-    fill_fts_query_column, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery,
+    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::scalar::FullTextSearchQuery;
-use lance_index::vector::{Query, DIST_COL};
-use lance_index::IndexCriteria;
+use lance_index::vector::{DIST_COL, Query};
+use lance_index::{DatasetIndexExt, scalar::expression::ScalarIndexExpr};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
-use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
-use tracing::{info_span, instrument, Span};
+use tracing::{Span, info_span, instrument};
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
+use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
-use crate::io::exec::fts::{BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec};
+use crate::io::exec::fts::{
+    BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+};
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, AddRowOffsetExec, LanceFilterExec, LanceScanConfig};
 use crate::io::exec::{
-    knn::new_knn_exec, project, AddRowAddrExec, FilterPlan as ExprFilterPlan,
-    KNNVectorDistanceExec, LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource,
-    ScanConfig, TakeExec,
+    AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
+    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    knn::{KNN_INDEX_SCHEMA, new_knn_exec},
+    project,
 };
-use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
+use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
 use crate::{Error, Result};
+use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
-use snafu::location;
 
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 
@@ -349,7 +351,7 @@ impl FilterPlan {
         if self.refine_query_filter {
             match &self.query_filter {
                 Some(QueryFilter::Fts(fts_query)) => {
-                    plan = scanner.flat_fts(plan, fts_query).await?;
+                    plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
                     plan = scanner.flat_knn(plan, vector_query)?;
@@ -417,25 +419,22 @@ impl ExprFilter {
                 let filter = planner.parse_filter(sql)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
-                let (ret_type, _) = filter.data_type_and_nullable(&df_schema)?;
-                if ret_type != DataType::Boolean {
-                    return Err(Error::InvalidInput {
-                        source: format!("The filter {} does not return a boolean", filter).into(),
-                        location: location!(),
-                    });
+                let ret_field = filter.to_field(&df_schema)?.1;
+                let ret_type = ret_field.data_type();
+                if ret_type != &DataType::Boolean {
+                    return Err(Error::invalid_input_source(
+                        format!("The filter {} does not return a boolean", filter).into(),
+                    ));
                 }
 
                 let optimized = planner.optimize_expr(filter).map_err(|e| {
-                    Error::invalid_input(
-                        format!("Error optimizing sql filter: {sql} ({e})"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
                 })?;
                 Ok(optimized)
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
-                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
                 let state = ctx.state();
@@ -445,17 +444,15 @@ impl ExprFilter {
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);
                 planner.optimize_expr(expr.clone()).map_err(|e| {
-                    Error::invalid_input(
-                        format!("Error optimizing substrait filter: {expr:?} ({e})"),
-                        location!(),
-                    )
+                    Error::invalid_input(format!(
+                        "Error optimizing substrait filter: {expr:?} ({e})"
+                    ))
                 })
             }
             #[cfg(not(feature = "substrait"))]
-            Self::Substrait(_) => Err(Error::NotSupported {
-                source: "Substrait filter is not supported in this build".into(),
-                location: location!(),
-            }),
+            Self::Substrait(_) => Err(Error::not_supported_source(
+                "Substrait filter is not supported in this build".into(),
+            )),
             Self::Datafusion(expr) => Ok(expr.clone()),
         }
     }
@@ -514,7 +511,7 @@ impl AggregateExpr {
         match self {
             #[cfg(feature = "substrait")]
             Self::Substrait(bytes) => {
-                use lance_datafusion::exec::{get_session_context, LanceExecutionOptions};
+                use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
                 use lance_datafusion::substrait::parse_substrait_aggregate;
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -927,17 +924,15 @@ impl TakeOperation {
                     // Check for _rowid = literal
                     if let (Expr::Column(col), Expr::Literal(lit, _)) =
                         (binary.left.as_ref(), binary.right.as_ref())
-                    {
-                        if let Some(ScalarValue::UInt64(Some(val))) =
+                        && let Some(ScalarValue::UInt64(Some(val))) =
                             safe_coerce_scalar(lit, &DataType::UInt64)
-                        {
-                            if col.name == ROW_ID {
-                                return Some((Self::RowIds(vec![val]), None));
-                            } else if col.name == ROW_ADDR {
-                                return Some((Self::RowAddrs(vec![val]), None));
-                            } else if col.name == ROW_OFFSET {
-                                return Some((Self::RowOffsets(vec![val]), None));
-                            }
+                    {
+                        if col.name == ROW_ID {
+                            return Some((Self::RowIds(vec![val]), None));
+                        } else if col.name == ROW_ADDR {
+                            return Some((Self::RowAddrs(vec![val]), None));
+                        } else if col.name == ROW_OFFSET {
+                            return Some((Self::RowOffsets(vec![val]), None));
                         }
                     }
                 }
@@ -959,17 +954,16 @@ impl TakeOperation {
                 }
                 _ => {}
             }
-        } else if let Expr::InList(in_expr) = expr {
-            if let Expr::Column(col) = in_expr.expr.as_ref() {
-                if let Some(u64s) = Self::extract_u64_list(&in_expr.list) {
-                    if col.name == ROW_ID {
-                        return Some((Self::RowIds(u64s), None));
-                    } else if col.name == ROW_ADDR {
-                        return Some((Self::RowAddrs(u64s), None));
-                    } else if col.name == ROW_OFFSET {
-                        return Some((Self::RowOffsets(u64s), None));
-                    }
-                }
+        } else if let Expr::InList(in_expr) = expr
+            && let Expr::Column(col) = in_expr.expr.as_ref()
+            && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
+        {
+            if col.name == ROW_ID {
+                return Some((Self::RowIds(u64s), None));
+            } else if col.name == ROW_ADDR {
+                return Some((Self::RowAddrs(u64s), None));
+            } else if col.name == ROW_OFFSET {
+                return Some((Self::RowOffsets(u64s), None));
             }
         }
         None
@@ -1065,7 +1059,6 @@ impl Scanner {
         if self.is_fragment_scan() {
             Err(Error::not_supported(
                 "This operation is not supported for fragment scan".to_string(),
-                location!(),
             ))
         } else {
             Ok(())
@@ -1210,10 +1203,7 @@ impl Scanner {
         if !fields.is_empty() {
             for field in fields.iter() {
                 if self.dataset.schema().field(field).is_none() {
-                    return Err(Error::invalid_input(
-                        format!("Column {} not found", field),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!("Column {} not found", field)));
                 }
             }
         }
@@ -1355,16 +1345,14 @@ impl Scanner {
         if limit.unwrap_or_default() < 0 {
             return Err(Error::invalid_input(
                 "Limit must be non-negative".to_string(),
-                location!(),
             ));
         }
-        if let Some(off) = offset {
-            if off < 0 {
-                return Err(Error::invalid_input(
-                    "Offset must be non-negative".to_string(),
-                    location!(),
-                ));
-            }
+        if let Some(off) = offset
+            && off < 0
+        {
+            return Err(Error::invalid_input(
+                "Offset must be non-negative".to_string(),
+            ));
         }
         self.limit = limit;
         self.offset = offset;
@@ -1382,15 +1370,11 @@ impl Scanner {
         }
 
         if k == 0 {
-            return Err(Error::invalid_input(
-                "k must be positive".to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("k must be positive".to_string()));
         }
         if q.is_empty() {
             return Err(Error::invalid_input(
                 "Query vector must have non-zero length".to_string(),
-                location!(),
             ));
         }
         // make sure the field exists
@@ -1400,58 +1384,46 @@ impl Scanner {
         let q = match q.data_type() {
             DataType::List(_) | DataType::FixedSizeList(_, _) => {
                 if !matches!(vector_type, DataType::List(_)) {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Query is multivector but column {}({})is not multivector",
-                            column, vector_type,
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "Query is multivector but column {}({})is not multivector",
+                        column, vector_type,
+                    )));
                 }
 
                 if let Some(list_array) = q.as_list_opt::<i32>() {
                     for i in 0..list_array.len() {
                         let vec = list_array.value(i);
                         if vec.len() != dim {
-                            return Err(Error::invalid_input(
-                                format!(
-                                    "query dim({}) doesn't match the column {} vector dim({})",
-                                    vec.len(),
-                                    column,
-                                    dim,
-                                ),
-                                location!(),
-                            ));
+                            return Err(Error::invalid_input(format!(
+                                "query dim({}) doesn't match the column {} vector dim({})",
+                                vec.len(),
+                                column,
+                                dim,
+                            )));
                         }
                     }
                     list_array.values().clone()
                 } else {
                     let fsl = q.as_fixed_size_list();
                     if fsl.value_length() as usize != dim {
-                        return Err(Error::invalid_input(
-                            format!(
-                                "query dim({}) doesn't match the column {} vector dim({})",
-                                fsl.value_length(),
-                                column,
-                                dim,
-                            ),
-                            location!(),
-                        ));
+                        return Err(Error::invalid_input(format!(
+                            "query dim({}) doesn't match the column {} vector dim({})",
+                            fsl.value_length(),
+                            column,
+                            dim,
+                        )));
                     }
                     fsl.values().clone()
                 }
             }
             _ => {
                 if q.len() != dim {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "query dim({}) doesn't match the column {} vector dim({})",
-                            q.len(),
-                            column,
-                            dim,
-                        ),
-                        location!(),
-                    ));
+                    return Err(Error::invalid_input(format!(
+                        "query dim({}) doesn't match the column {} vector dim({})",
+                        q.len(),
+                        column,
+                        dim,
+                    )));
                 }
                 q.slice(0, q.len())
             }
@@ -1464,15 +1436,12 @@ impl Scanner {
                 FloatType::try_from(dt)?,
             )?,
             _ => {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Column {} has element type {} and the query vector is {}",
-                        column,
-                        element_type,
-                        q.data_type(),
-                    ),
-                    location!(),
-                ));
+                return Err(Error::invalid_input(format!(
+                    "Column {} has element type {} and the query vector is {}",
+                    column,
+                    element_type,
+                    q.data_type(),
+                )));
             }
         };
 
@@ -1637,10 +1606,10 @@ impl Scanner {
                 self.dataset
                     .schema()
                     .field(&column.column_name)
-                    .ok_or(Error::invalid_input(
-                        format!("Column {} not found", &column.column_name),
-                        location!(),
-                    ))?;
+                    .ok_or(Error::invalid_input(format!(
+                        "Column {} not found",
+                        &column.column_name
+                    )))?;
             }
         }
         self.ordering = ordering;
@@ -1705,20 +1674,16 @@ impl Scanner {
         let field_path = lance_schema
             .resolve_case_insensitive(column_name)
             .ok_or_else(|| {
-                Error::invalid_input(
-                    format!("Field '{}' not found in schema", column_name),
-                    location!(),
-                )
+                Error::invalid_input(format!("Field '{}' not found in schema", column_name))
             })?;
 
         if field_path.len() == 1 {
             // Simple top-level column
-            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| Error::Internal {
-                message: format!(
+            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create column expression for '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         } else {
             // Nested field - build a chain of GetFieldFunc calls
@@ -1736,12 +1701,11 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| Error::Internal {
-                message: format!(
+            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
+                Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
-                ),
-                location: location!(),
+                ))
             })
         }
     }
@@ -1824,7 +1788,9 @@ impl Scanner {
         if self.autoproject_scoring_columns {
             if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                    log::warn!(
+                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_distance`.  Currently the `_distance` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
+                    );
                 }
                 let vector_expr = expressions::col(DIST_COL, current_schema)?;
                 output_expr.push((vector_expr, DIST_COL.to_string()));
@@ -1833,7 +1799,9 @@ impl Scanner {
                 && output_expr.iter().all(|(_, name)| name != SCORE_COL)
             {
                 if self.explicit_projection {
-                    log::warn!("Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning");
+                    log::warn!(
+                        "Deprecation warning, this behavior will change in the future. This search specified output columns but did not include `_score`.  Currently the `_score` column will be included.  In the future it will not.  Call `disable_scoring_autoprojection` to adopt the future behavior and avoid this warning"
+                    );
                 }
                 let score_expr = expressions::col(SCORE_COL, current_schema)?;
                 output_expr.push((score_expr, SCORE_COL.to_string()));
@@ -1844,11 +1812,11 @@ impl Scanner {
             let row_id_pos = output_expr
                 .iter()
                 .position(|(_, name)| name == ROW_ID)
-                .ok_or_else(|| Error::Internal {
-                    message:
+                .ok_or_else(|| {
+                    Error::internal(
                         "user specified with_row_id but the _rowid column was not in the output"
                             .to_string(),
-                    location: location!(),
+                    )
                 })?;
             if row_id_pos != output_expr.len() - 1 {
                 // Row id is not last column.  Need to rotate it to the last spot.
@@ -1859,10 +1827,7 @@ impl Scanner {
 
         if self.legacy_with_row_addr {
             let row_addr_pos = output_expr.iter().position(|(_, name)| name == ROW_ADDR).ok_or_else(|| {
-                Error::Internal {
-                    message: "user specified with_row_address but the _rowaddr column was not in the output".to_string(),
-                    location: location!(),
-                }
+                Error::internal("user specified with_row_address but the _rowaddr column was not in the output".to_string())
             })?;
             if row_addr_pos != output_expr.len() - 1 {
                 // Row addr is not last column.  Need to rotate it to the last spot.
@@ -1937,7 +1902,6 @@ impl Scanner {
                     .downcast_ref::<Int64Array>()
                     .ok_or(Error::invalid_input(
                         "Count plan did not return an Int64Array".to_string(),
-                        location!(),
                     ))?;
                 Ok(array.value(0) as u64)
             } else {
@@ -1956,7 +1920,6 @@ impl Scanner {
             if self.aggregate.is_none() {
                 return Err(Error::invalid_input(
                     "create_aggregate_plan called but no aggregate was set",
-                    location!(),
                 ));
             }
             // create_plan() now applies aggregate automatically when set
@@ -2042,33 +2005,39 @@ impl Scanner {
     }
 
     fn coerce_aggregate_expr_impl(expr: &Expr, schema: &DFSchema) -> Result<Expr> {
-        use datafusion::logical_expr::{expr::AggregateFunction, Expr, TypeSignature};
+        use datafusion::logical_expr::Expr;
+        use datafusion::logical_expr::expr::AggregateFunction;
+        use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 
         match expr {
             Expr::AggregateFunction(agg_func) => {
                 let func = &agg_func.func;
                 let args = &agg_func.params.args;
 
-                // Only UserDefined signature functions need explicit coercion
-                if !matches!(func.signature().type_signature, TypeSignature::UserDefined) {
-                    return Ok(expr.clone());
-                }
-
                 if args.is_empty() {
                     return Ok(expr.clone());
                 }
 
-                let current_types: Vec<arrow_schema::DataType> = args
+                let current_fields: Vec<arrow_schema::FieldRef> = args
                     .iter()
-                    .map(|e| e.get_type(schema))
-                    .collect::<std::result::Result<_, _>>()?;
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let dt = e.get_type(schema)?;
+                        Ok(Arc::new(arrow_schema::Field::new(
+                            format!("arg_{i}"),
+                            dt,
+                            true,
+                        )))
+                    })
+                    .collect::<std::result::Result<_, datafusion::common::DataFusionError>>()?;
 
-                let coerced_types = func.coerce_types(&current_types)?;
+                let coerced_fields = fields_with_udf(&current_fields, func.as_ref())?;
                 let coerced_args: Vec<Expr> = args
                     .iter()
-                    .zip(coerced_types.iter())
-                    .map(|(arg, target_type)| {
+                    .zip(coerced_fields.iter())
+                    .map(|(arg, target_field)| {
                         let arg_type = arg.get_type(schema)?;
+                        let target_type = target_field.data_type();
                         if arg_type == *target_type {
                             Ok(arg.clone())
                         } else {
@@ -2091,13 +2060,10 @@ impl Scanner {
                 let coerced_inner = Self::coerce_aggregate_expr_impl(&alias.expr, schema)?;
                 Ok(coerced_inner.alias(&alias.name))
             }
-            other => Err(Error::invalid_input(
-                format!(
-                    "Expected aggregate function expression, got {:?}",
-                    other.variant_name()
-                ),
-                location!(),
-            )),
+            other => Err(Error::invalid_input(format!(
+                "Expected aggregate function expression, got {:?}",
+                other.variant_name()
+            ))),
         }
     }
 
@@ -2180,28 +2146,23 @@ impl Scanner {
 
     fn validate_options(&self) -> Result<()> {
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
-            return Err(Error::InvalidInput {
-                source: "include_deleted_rows is set but with_row_id is false".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "include_deleted_rows is set but with_row_id is false".into(),
+            ));
         }
 
         if self.aggregate.is_some() {
             if self.limit.is_some() || self.offset.is_some() {
-                return Err(Error::InvalidInput {
-                    source:
-                        "Cannot use limit/offset with aggregate. Apply limit to the result instead."
-                            .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot use limit/offset with aggregate. Apply limit to the result instead."
+                        .into(),
+                ));
             }
             if self.ordering.is_some() {
-                return Err(Error::InvalidInput {
-                    source:
-                        "Cannot use order_by with aggregate. Apply ordering to the result instead."
-                            .into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot use order_by with aggregate. Apply ordering to the result instead."
+                        .into(),
+                ));
             }
         }
 
@@ -2255,23 +2216,19 @@ impl Scanner {
             && self.nearest.is_none()
             && self.full_text_query.is_none()
         {
-            return Err(Error::InvalidInput {
-                source: "Query filter can only be used with full text search or vector search"
-                    .into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Query filter can only be used with full text search or vector search".into(),
+            ));
         }
         if self.nearest.is_some() && filter_plan.vector_filter().is_some() {
-            return Err(Error::InvalidInput {
-                source: "Query filter can't be used with vector search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Query filter can't be used with vector search".into(),
+            ));
         }
         if self.full_text_query.is_some() && filter_plan.fts_filter().is_some() {
-            return Err(Error::InvalidInput {
-                source: "Fts filter can't be used with fts search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Fts filter can't be used with fts search".into(),
+            ));
         }
 
         Ok(filter_plan)
@@ -2380,10 +2337,7 @@ impl Scanner {
                     // SELECT 1 FROM t (not supported error)
                     // SELECT non_existent_column FROM t (column not found error)
                     let output_expr = self.calculate_final_projection(&ArrowSchema::empty())?;
-                    return Err(Error::NotSupported {
-                        source: format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into(),
-                        location: location!(),
-                    });
+                    return Err(Error::not_supported_source(format!("Scans must request at least one column.  Received only dynamic expressions: {:?}", output_expr).into()));
                 }
 
                 let take_op = filter_plan
@@ -2412,10 +2366,9 @@ impl Scanner {
                 }
             }
             _ => {
-                return Err(Error::InvalidInput {
-                    source: "Cannot have both nearest and full text search".into(),
-                    location: location!(),
-                })
+                return Err(Error::invalid_input_source(
+                    "Cannot have both nearest and full text search".into(),
+                ));
             }
         };
 
@@ -2461,7 +2414,15 @@ impl Scanner {
                     .union_columns(&required_columns, OnMissing::Error)?
             };
             plan = self.take(plan, agg_projection)?;
-            return self.apply_aggregate(plan, agg).await;
+            plan = self.apply_aggregate(plan, agg).await?;
+
+            let optimizer = get_physical_optimizer();
+            let options = Default::default();
+            for rule in optimizer.rules {
+                plan = rule.optimize(plan, &options)?;
+            }
+
+            return Ok(plan);
         }
 
         // Sort
@@ -2562,10 +2523,9 @@ impl Scanner {
 
         let plan: Arc<dyn ExecutionPlan> = if filter_plan.has_index_query() {
             if self.include_deleted_rows {
-                return Err(Error::InvalidInput {
-                    source: "Cannot include deleted rows in a scalar indexed scan".into(),
-                    location: location!(),
-                });
+                return Err(Error::invalid_input_source(
+                    "Cannot include deleted rows in a scalar indexed scan".into(),
+                ));
             }
             self.scalar_indexed_scan(projection, filter_plan, fragments)
                 .await
@@ -2839,20 +2799,20 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("source is an fts search");
         if self.include_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "Cannot include deleted rows in an FTS search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in an FTS search".into(),
+            ));
         }
 
         // The source is an FTS search
         if self.prefilter {
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.vector_filter() {
                 Some(vector_query) => {
+                    // Perform vector search first then rerank according to BM25 scores
                     let vector_plan = self
                         .vector_search(&filter_plan.expr_filter_plan, vector_query)
                         .await?;
-                    self.flat_fts(vector_plan, query).await?
+                    self.fts_rerank(vector_plan, query).await?
                 }
                 None => self.fts(&filter_plan.expr_filter_plan, query).await?,
             };
@@ -2872,16 +2832,12 @@ impl Scanner {
         filter_plan: &mut FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if self.include_deleted_rows {
-            return Err(Error::InvalidInput {
-                source: "Cannot include deleted rows in a nearest neighbor search".into(),
-                location: location!(),
-            });
+            return Err(Error::invalid_input_source(
+                "Cannot include deleted rows in a nearest neighbor search".into(),
+            ));
         }
         let Some(query) = self.nearest.as_ref() else {
-            return Err(Error::invalid_input(
-                "No nearest query".to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("No nearest query".to_string()));
         };
 
         if self.prefilter {
@@ -2947,7 +2903,6 @@ impl Scanner {
                 self.fragments_covered_by_fts_leaf(
                     match_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?,
                     accum,
                 )
@@ -2965,7 +2920,6 @@ impl Scanner {
                         .fragments_covered_by_fts_leaf(
                             mq.column.as_ref().ok_or(Error::invalid_input(
                                 "the column must be specified in the query".to_string(),
-                                location!(),
                             ))?,
                             accum,
                         )
@@ -2980,7 +2934,6 @@ impl Scanner {
                 self.fragments_covered_by_fts_leaf(
                     phrase_query.column.as_ref().ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
                     ))?,
                     accum,
                 )
@@ -3246,7 +3199,6 @@ impl Scanner {
                 if query.should.is_empty() && must.is_none() {
                     return Err(Error::invalid_input(
                         "boolean query must have at least one should/must query".to_string(),
-                        location!(),
                     ));
                 }
 
@@ -3271,17 +3223,16 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query.column.clone().ok_or(Error::invalid_input(
             "the column must be specified in the query".to_string(),
-            location!(),
         ))?;
 
         let index_meta = self
             .dataset
             .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
             .await?
-            .ok_or(Error::invalid_input(
-                format!("No Inverted index found for column {}", column),
-                location!(),
-            ))?;
+            .ok_or(Error::invalid_input(format!(
+                "No Inverted index found for column {}",
+                column
+            )))?;
 
         let details_any =
             crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
@@ -3289,11 +3240,8 @@ impl Scanner {
             .as_ref()
             .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
-            return Err(Error::invalid_input(
-                "position is not found but required for phrase queries, try recreating the index with position"
-                    .to_string(),
-                location!(),
-            ));
+            return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
+                .to_string()));
         }
 
         Ok(Arc::new(PhraseQueryExec::new(
@@ -3316,7 +3264,6 @@ impl Scanner {
             .as_ref()
             .ok_or(Error::invalid_input(
                 "the column must be specified in the query".to_string(),
-                location!(),
             ))?
             .clone();
 
@@ -3334,13 +3281,14 @@ impl Scanner {
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
                 // Get unindexed fragments and filter to target fragments
-                let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-                let target_bitmap =
-                    RoaringBitmap::from_iter(target_fragments.iter().map(|f| f.id as u32));
-                unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
+                let unindexed_fragments = self
+                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
                 // If all target fragments are unindexed, skip index entirely
                 if unindexed_fragments.len() == target_fragments.len() {
+                    if self.fast_search {
+                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                    }
                     let flat_match_plan = self
                         .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
                         .await?;
@@ -3355,7 +3303,7 @@ impl Scanner {
                     prefilter_source.clone(),
                 ));
 
-                if unindexed_fragments.is_empty() {
+                if self.fast_search || unindexed_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
                     let flat_match_plan = self
@@ -3365,9 +3313,12 @@ impl Scanner {
                 }
             }
             None => {
+                if self.fast_search {
+                    return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -3411,7 +3362,6 @@ impl Scanner {
             .as_ref()
             .ok_or(Error::invalid_input(
                 "the column must be specified in the query".to_string(),
-                location!(),
             ))?
             .clone();
 
@@ -3443,7 +3393,6 @@ impl Scanner {
             query.clone(),
             params.clone(),
             scan_node,
-            FTS_SCHEMA.clone(),
         ));
         Ok(flat_match_plan)
     }
@@ -3531,7 +3480,6 @@ impl Scanner {
             if matches!(q.refine_factor, Some(0)) {
                 return Err(Error::invalid_input(
                     "Refine factor cannot be zero".to_string(),
-                    location!(),
                 ));
             }
             let ann_node = match vector_type {
@@ -3558,6 +3506,9 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.fast_search {
+                return Ok(Arc::new(EmptyExec::new(KNN_INDEX_SCHEMA.clone())));
+            }
             // Resolve metric type for flat search (use default if not specified)
             let metric = q
                 .metric_type
@@ -3605,11 +3556,8 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Get unindexed fragments and filter to target fragments
-        let mut unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        if let Some(target_frags) = &self.fragments {
-            let target_bitmap = RoaringBitmap::from_iter(target_frags.iter().map(|f| f.id as u32));
-            unindexed_fragments.retain(|f| target_bitmap.contains(f.id as u32));
-        }
+        let unindexed_fragments =
+            self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
         if !unindexed_fragments.is_empty() {
             // need to set the metric type to be the same as the index
@@ -3671,9 +3619,11 @@ impl Scanner {
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let topk_appended = project(topk_appended, knn_node.schema().as_ref())?;
-            assert!(topk_appended
-                .schema()
-                .equivalent_names_and_types(&knn_node.schema()));
+            assert!(
+                topk_appended
+                    .schema()
+                    .equivalent_names_and_types(&knn_node.schema())
+            );
             // union
             let unioned = UnionExec::try_new(vec![Arc::new(topk_appended), knn_node])?;
             // Enforce only 1 partition.
@@ -3991,7 +3941,11 @@ impl Scanner {
         )?))
     }
 
-    async fn flat_fts(
+    /// Here we use a full text search as a post-filter.  Any rows that
+    /// do not contain at least one query token are removed.
+    ///
+    /// Only valid (currently) for match queries.
+    async fn flat_fts_filter(
         &self,
         input: Arc<dyn ExecutionPlan>,
         q: &FullTextSearchQuery,
@@ -4012,7 +3966,56 @@ impl Scanner {
                     .as_ref()
                     .ok_or(Error::invalid_input(
                         "the column must be specified in the query".to_string(),
-                        location!(),
+                    ))?
+                    .clone();
+                let input = if schema.column_with_name(&column).is_none() {
+                    let projection = self
+                        .dataset
+                        .empty_projection()
+                        .union_column(&column, OnMissing::Error)?;
+                    self.take(input, projection)?
+                } else {
+                    input
+                };
+
+                Ok(Arc::new(FlatMatchFilterExec::new(
+                    input,
+                    self.dataset.clone(),
+                    match_query.clone(),
+                    q.params(),
+                )))
+            }
+            _ => Err(Error::not_supported(
+                "Only Match queries are supported currently when using FTS as a post-filter",
+            )),
+        }
+    }
+
+    /// Here we consume all input (as unindexed) and rerank according to BM25 scores
+    ///
+    /// If there is an index on the column then we still use the index to determine the
+    /// tokenizer and inform the BM25 scoring (e.g. avg doc length, token frequency, etc.)
+    async fn fts_rerank(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let fts_query = if q.columns().is_empty() {
+            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
+            fill_fts_query_column(&q.query, &indexed_columns, false)?
+        } else {
+            q.query.clone()
+        };
+
+        match &fts_query {
+            FtsQuery::Match(match_query) => {
+                let schema = Arc::new((input.schema()).try_with_column(SCORE_FIELD.clone())?);
+
+                let column = match_query
+                    .column
+                    .as_ref()
+                    .ok_or(Error::invalid_input(
+                        "the column must be specified in the query".to_string(),
                     ))?
                     .clone();
                 let input = if schema.column_with_name(&column).is_none() {
@@ -4030,7 +4033,6 @@ impl Scanner {
                     match_query.clone(),
                     q.params(),
                     input,
-                    schema,
                 )))
             }
             _ => {
@@ -4166,6 +4168,16 @@ impl Scanner {
         } else {
             RoaringBitmap::from_iter(self.dataset.fragments().iter().map(|f| f.id as u32))
         }
+    }
+
+    /// Retain only fragments that are in the user-specified fragment list.
+    /// If no fragment list is specified, returns the fragments unchanged.
+    fn retain_target_fragments(&self, mut fragments: Vec<Fragment>) -> Vec<Fragment> {
+        if let Some(target) = &self.fragments {
+            let bitmap = RoaringBitmap::from_iter(target.iter().map(|f| f.id as u32));
+            fragments.retain(|f| bitmap.contains(f.id as u32));
+        }
+        fragments
     }
 
     fn get_indexed_frags(&self, index: &[IndexMetadata]) -> RoaringBitmap {
@@ -4309,20 +4321,23 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         required_frags: RoaringBitmap,
     ) -> Result<PreFilterSource> {
-        if filter_plan.is_empty() {
+        if filter_plan.is_empty() && self.fragments.is_none() {
             log::trace!("no filter plan, no prefilter");
             return Ok(PreFilterSource::None);
         }
 
-        let fragments = Arc::new(
-            self.dataset
-                .manifest
-                .fragments
-                .iter()
-                .filter(|f| required_frags.contains(f.id as u32))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
+        // get fragments covered by index
+        let fragments: Vec<Fragment> = self
+            .dataset
+            .manifest
+            .fragments
+            .iter()
+            .filter(|f| required_frags.contains(f.id as u32))
+            .cloned()
+            .collect();
+
+        // If explicitly specified fragments with .with_fragments(), intersect with those
+        let fragments = Arc::new(self.retain_target_fragments(fragments));
 
         // Can only use ScalarIndexExec when the scalar index is exact and we are not scanning
         // a subset of the fragments.
@@ -4399,15 +4414,14 @@ impl Scanner {
     #[instrument(level = "info", skip(self))]
     pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
-        let res = analyze_plan(
+        analyze_plan(
             plan,
             LanceExecutionOptions {
                 batch_size: self.batch_size,
                 ..Default::default()
             },
         )
-        .await;
-        res
+        .await
     }
 
     #[instrument(level = "info", skip(self))]
@@ -4529,8 +4543,8 @@ pub mod test_dataset {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_index::{
-        scalar::{inverted::tokenizer::InvertedIndexParams, ScalarIndexParams},
         IndexType,
+        scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
     };
 
     use crate::dataset::WriteParams;
@@ -4719,7 +4733,7 @@ mod test {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_datagen::{
-        array, gen_batch, ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount,
+        ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
@@ -4728,7 +4742,7 @@ mod test {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
-    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
     use lance_io::assert_io_gt;
     use lance_io::object_store::ObjectStoreParams;
 
@@ -4738,13 +4752,13 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::optimize::{compact_files, CompactionOptions};
-    use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::WriteMode;
     use crate::dataset::WriteParams;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
-        assert_plan_node_equals, DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
+        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
 
     #[test]
@@ -4752,17 +4766,23 @@ mod test {
         // Test that invalid environment variable values don't panic
 
         // Test invalid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None for invalid batch size");
 
         // Test valid LANCE_DEFAULT_BATCH_SIZE
-        std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, Some(2048), "Should parse valid batch size");
 
         // Test unset LANCE_DEFAULT_BATCH_SIZE
-        std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        unsafe {
+            std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
+        }
         let result = get_default_batch_size();
         assert_eq!(result, None, "Should return None when env var is not set");
     }
@@ -4775,43 +4795,61 @@ mod test {
         let test_var = "LANCE_TEST_PARSE_ENV_VAR_USIZE";
 
         // Test valid usize parsing
-        std::env::set_var(test_var, "12345");
+        unsafe {
+            std::env::set_var(test_var, "12345");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, Some(12345));
 
         // Test invalid usize parsing (triggers warning log)
-        std::env::set_var(test_var, "not_a_number");
+        unsafe {
+            std::env::set_var(test_var, "not_a_number");
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test unset env var
-        std::env::remove_var(test_var);
+        unsafe {
+            std::env::remove_var(test_var);
+        }
         let result: Option<usize> = parse_env_var(test_var, "Using default.");
         assert_eq!(result, None);
 
         // Test with u32 type
         let test_var_u32 = "LANCE_TEST_PARSE_ENV_VAR_U32";
-        std::env::set_var(test_var_u32, "42");
+        unsafe {
+            std::env::set_var(test_var_u32, "42");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, Some(42));
 
-        std::env::set_var(test_var_u32, "invalid");
+        unsafe {
+            std::env::set_var(test_var_u32, "invalid");
+        }
         let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u32);
+        unsafe {
+            std::env::remove_var(test_var_u32);
+        }
 
         // Test with u64 type
         let test_var_u64 = "LANCE_TEST_PARSE_ENV_VAR_U64";
-        std::env::set_var(test_var_u64, "9999999999");
+        unsafe {
+            std::env::set_var(test_var_u64, "9999999999");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, Some(9999999999));
 
-        std::env::set_var(test_var_u64, "-1");
+        unsafe {
+            std::env::set_var(test_var_u64, "-1");
+        }
         let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
         assert_eq!(result, None);
 
-        std::env::remove_var(test_var_u64);
+        unsafe {
+            std::env::remove_var(test_var_u64);
+        }
     }
 
     async fn make_binary_vector_dataset() -> Result<(TempStrDir, Dataset)> {
@@ -6196,7 +6234,7 @@ mod test {
         )]
         index_params: VectorIndexParams,
     ) {
-        use lance_arrow::{fixed_size_list_type, FixedSizeListArrayExt};
+        use lance_arrow::{FixedSizeListArrayExt, fixed_size_list_type};
 
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -6208,14 +6246,16 @@ mod test {
 
         let vector_values = Float32Array::from_iter_values((0..600).map(|x| x as f32));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..300)),
-                Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
-            ],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..300)),
+                    Arc::new(FixedSizeListArray::try_new_from_values(vector_values, 2).unwrap()),
+                ],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6282,13 +6322,15 @@ mod test {
             true,
         )]));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(LargeStringArray::from_iter_values(
-                (0..10).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from_iter_values(
+                    (0..10).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6338,13 +6380,15 @@ mod test {
             true,
         )]));
 
-        let batches = vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from_iter_values(
-                (0..20).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()];
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap(),
+        ];
 
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
@@ -6503,14 +6547,16 @@ mod test {
                 (0..32 * 512).map(|v| (v / 32) as f32 + 1.0).collect();
             let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
 
-            let batches = vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(0..512)),
-                    Arc::new(vectors.clone()),
-                ],
-            )
-            .unwrap()];
+            let batches = vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(0..512)),
+                        Arc::new(vectors.clone()),
+                    ],
+                )
+                .unwrap(),
+            ];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let mut dataset = Dataset::write(
@@ -6603,14 +6649,16 @@ mod test {
 
             // Add a second fragment and test the case where there are no deletion
             // files but there are missing fragments.
-            let batches = vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(512..1024)),
-                    Arc::new(vectors),
-                ],
-            )
-            .unwrap()];
+            let batches = vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(512..1024)),
+                        Arc::new(vectors),
+                    ],
+                )
+                .unwrap(),
+            ];
 
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
             let mut dataset = Dataset::write(
@@ -8484,6 +8532,25 @@ mod test {
         )
         .await?;
 
+        log::info!("Test case: Full text search with unindexed rows and fast_search");
+        let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      MatchQuery: column=s, query=hello"#;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                let scan = scan
+                    .project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))?;
+                scan.fast_search();
+                Ok(scan)
+            },
+            expected,
+        )
+        .await?;
+
         log::info!("Test case: Full text search with unindexed rows and prefilter");
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
@@ -8599,6 +8666,25 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fast_search_without_vector_index_returns_empty() {
+        let dataset = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = dataset.dataset.scan();
+        scanner.nearest("vec", &q, 10).unwrap().fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 10);
+        assert_eq!(fast_rows, 0);
     }
 
     #[rstest]
@@ -8937,6 +9023,40 @@ mod test {
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_fts_fast_search_excludes_unindexed_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        // Append rows after index build so they stay unindexed.
+        test_ds.append_data_with_range(10, 20).await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap();
+        let normal_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("15".to_owned())
+                    .with_column(Some("s".to_owned()))
+                    .into(),
+            ))
+            .unwrap()
+            .fast_search();
+        let fast_rows = scanner.try_into_batch().await.unwrap().num_rows();
+
+        assert_eq!(normal_rows, 2);
+        assert_eq!(fast_rows, 1);
     }
 
     async fn test_row_offset_read_helper(
@@ -9486,7 +9606,7 @@ mod test {
         );
     }
 
-    // Common test function for fragment list filtering
+    // Common test function for fragment list filtering (unindexed + indexed fragments)
     async fn test_fragment_list_filtering(
         test_ds: &TestVectorDataset,
         fragments: &[Fragment],
@@ -9517,9 +9637,9 @@ mod test {
             .unwrap();
         assert_values_in_range(i_array, 400..410, "Should only get results from fragment 2");
 
-        // Test 3: Query only indexed fragments (fragments 0 and 1)
+        // Test 3: Query a single indexed fragment (fragment 0 only)
         let mut scanner = build_scanner(&test_ds.dataset);
-        scanner.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
+        scanner.with_fragments(vec![fragments[0].clone()]);
         let batch = scanner.try_into_batch().await.unwrap();
         let i_array = batch
             .column_by_name("i")
@@ -9527,11 +9647,7 @@ mod test {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_values_in_range(
-            i_array,
-            0..400,
-            "Should only get results from indexed fragments",
-        );
+        assert_values_in_range(i_array, 0..200, "Should only get results from fragment 0");
 
         // Test 4: Query all indexed fragments (0, 1) plus one unindexed fragment (2), excluding fragment 3
         let mut scanner = build_scanner(&test_ds.dataset);
@@ -9552,11 +9668,33 @@ mod test {
             0..410,
             "Should get results from fragments 0, 1, and 2, excluding fragment 3",
         );
+
+        // Test 5: One indexed fragment (0) + one unindexed fragment (2), skipping indexed fragment 1 and unindexed fragment 3
+        let mut scanner = build_scanner(&test_ds.dataset);
+        scanner.with_fragments(vec![fragments[0].clone(), fragments[2].clone()]);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let i_array = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(
+            i_array
+                .iter()
+                .all(|v| v.is_some_and(|val| (0..200).contains(&val) || (400..410).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (0..200).contains(&val)))
+                && i_array
+                    .iter()
+                    .any(|v| v.is_some_and(|val| (400..410).contains(&val))),
+            "Should only get results from fragment 0 (indexed) and fragment 2 (unindexed)"
+        );
     }
 
     #[tokio::test]
     async fn test_vector_search_respects_fragment_list() {
-        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9564,20 +9702,16 @@ mod test {
         // Create index on first 2 fragments
         test_ds.make_vector_index().await.unwrap();
 
-        // Append two more fragments after indexing (these will be unindexed)
+        let query: Float32Array = (0..32).map(|v| v as f32).collect();
+
+        // Append two more unindexed fragments
         test_ds.append_data_with_range(400, 410).await.unwrap();
         test_ds.append_data_with_range(410, 420).await.unwrap();
 
-        // Now we have 4 fragments:
-        // Fragment 0: i=0..200 (indexed)
-        // Fragment 1: i=200..400 (indexed)
-        // Fragment 2: i=400..410 (unindexed)
-        // Fragment 3: i=410..420 (unindexed)
-
+        // Fragment 0: i=0..200 (indexed), Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed), Fragment 3: i=410..420 (unindexed)
         let fragments = test_ds.dataset.fragments();
         assert_eq!(fragments.len(), 4);
-
-        let query: Float32Array = (0..32).map(|v| v as f32).collect();
 
         test_fragment_list_filtering(&test_ds, fragments, |dataset| {
             let mut scanner = dataset.scan();
@@ -9589,7 +9723,6 @@ mod test {
 
     #[tokio::test]
     async fn test_fts_respects_fragment_list() {
-        // Create dataset with 2 initial fragments (400 rows, max 200 per file)
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -9597,20 +9730,16 @@ mod test {
         // Create FTS index on first 2 fragments
         test_ds.make_fts_index().await.unwrap();
 
-        // Append two more fragments after indexing (these will be unindexed)
+        // Append two more unindexed fragments
         test_ds.append_data_with_range(400, 410).await.unwrap();
         test_ds.append_data_with_range(410, 420).await.unwrap();
 
-        // Now we have 4 fragments:
-        // Fragment 0: i=0..200 (indexed)
-        // Fragment 1: i=200..400 (indexed)
-        // Fragment 2: i=400..410 (unindexed)
-        // Fragment 3: i=410..420 (unindexed)
-
+        // Fragment 0: i=0..200 (indexed), Fragment 1: i=200..400 (indexed)
+        // Fragment 2: i=400..410 (unindexed), Fragment 3: i=410..420 (unindexed)
         let fragments = test_ds.dataset.fragments();
         assert_eq!(fragments.len(), 4);
 
-        // "s-5" matches: s-5, s-50-59, s-150-159 (frag 0), s-250-259, s-350-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
+        // "s-5" matches: s-5, s-50..s-59, s-150..s-159 (frag 0), s-250..s-259, s-350..s-359 (frag 1), s-405 (frag 2), s-415 (frag 3)
         test_fragment_list_filtering(&test_ds, fragments, |dataset| {
             let mut scanner = dataset.scan();
             scanner

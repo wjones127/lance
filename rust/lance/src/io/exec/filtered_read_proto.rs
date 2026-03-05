@@ -24,11 +24,12 @@ use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
 use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
+use lance_io::object_store::StorageOptions;
 use lance_table::format::Fragment;
 use prost::Message;
-use snafu::location;
 
 use crate::Dataset;
+use crate::dataset::builder::DatasetBuilder;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
@@ -41,26 +42,54 @@ use super::filtered_read::{
 /// Build a [`TableIdentifier`] from a [`Dataset`].
 ///
 /// Default: lightweight mode (uri + version + etag only, no serialized manifest).
-pub fn table_identifier_from_dataset(dataset: &Dataset) -> pb::TableIdentifier {
-    pb::TableIdentifier {
+/// Includes the dataset's latest storage options (if any) so the remote executor
+/// can open or cache the dataset with the correct storage configuration.
+pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::TableIdentifier> {
+    Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
         version: dataset.manifest.version,
         manifest_etag: dataset.manifest_location.e_tag.clone(),
         serialized_manifest: None,
-    }
+        storage_options: dataset
+            .latest_storage_options()
+            .await?
+            .map(|StorageOptions(m)| m)
+            .unwrap_or_default(),
+    })
 }
 
 /// Build a [`TableIdentifier`] with serialized manifest bytes included.
 ///
 /// Fast path: remote executor skips manifest read from storage.
-pub fn table_identifier_from_dataset_with_manifest(dataset: &Dataset) -> pb::TableIdentifier {
+pub async fn table_identifier_from_dataset_with_manifest(
+    dataset: &Dataset,
+) -> Result<pb::TableIdentifier> {
     let manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
-    pb::TableIdentifier {
+    Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
         version: dataset.manifest.version,
         manifest_etag: dataset.manifest_location.e_tag.clone(),
         serialized_manifest: Some(manifest_proto.encode_to_vec()),
+        storage_options: dataset
+            .latest_storage_options()
+            .await?
+            .map(|StorageOptions(m)| m)
+            .unwrap_or_default(),
+    })
+}
+
+/// Open a dataset from a table identifier proto
+pub async fn open_dataset_from_table_identifier(
+    table_id: &pb::TableIdentifier,
+) -> Result<Arc<Dataset>> {
+    let mut builder = DatasetBuilder::from_uri(&table_id.uri).with_version(table_id.version);
+    if let Some(manifest_bytes) = &table_id.serialized_manifest {
+        builder = builder.with_serialized_manifest(manifest_bytes)?;
     }
+    if !table_id.storage_options.is_empty() {
+        builder = builder.with_storage_options(table_id.storage_options.clone());
+    }
+    Ok(Arc::new(builder.load().await?))
 }
 
 // =============================================================================
@@ -72,11 +101,11 @@ pub fn table_identifier_from_dataset_with_manifest(dataset: &Dataset) -> pb::Tab
 /// Uses `table_identifier_from_dataset` by default (no manifest bytes).
 /// The caller can replace the `table` field with
 /// [`table_identifier_from_dataset_with_manifest`] if desired.
-pub fn filtered_read_exec_to_proto(
+pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
-    let table = table_identifier_from_dataset(exec.dataset());
+    let table = table_identifier_from_dataset(exec.dataset()).await?;
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
@@ -96,19 +125,26 @@ pub fn filtered_read_exec_to_proto(
 }
 
 /// Reconstruct a [`FilteredReadExec`] from proto.
-///
-/// The `dataset` must already be opened on the remote side (using
-/// the `TableIdentifier` from the proto). The optional `index_input`
-/// child plan is provided by DataFusion's codec via its `inputs` parameter.
 pub async fn filtered_read_exec_from_proto(
     proto: pb::FilteredReadExecProto,
-    dataset: Arc<Dataset>,
+    dataset: Option<Arc<Dataset>>,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
-    let options_proto = proto.options.ok_or_else(|| Error::InvalidInput {
-        source: "Missing options in FilteredReadExecProto".into(),
-        location: location!(),
+    let dataset = match dataset {
+        Some(ds) => ds, // dataset could be opened or cached by the caller
+        None => {
+            let table_id = proto.table.as_ref().ok_or_else(|| {
+                Error::invalid_input_source(
+                    "Missing table identifier in FilteredReadExecProto".into(),
+                )
+            })?;
+            open_dataset_from_table_identifier(table_id).await?
+        }
+    };
+
+    let options_proto = proto.options.ok_or_else(|| {
+        Error::invalid_input_source("Missing options in FilteredReadExecProto".into())
     })?;
 
     let options = fr_options_from_proto(options_proto, &dataset, state).await?;
@@ -202,26 +238,19 @@ async fn fr_options_from_proto(
     if let Some(range) = proto.scan_range_before_filter {
         options = options
             .with_scan_range_before_filter(range_from_proto(&range))
-            .map_err(|e| Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
     if let Some(range) = proto.scan_range_after_filter {
         options = options
             .with_scan_range_after_filter(range_from_proto(&range))
-            .map_err(|e| Error::Internal {
-                message: e.to_string(),
-                location: location!(),
-            })?;
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
 
     // Deleted rows
     if proto.with_deleted_rows {
-        options = options.with_deleted_rows().map_err(|e| Error::Internal {
-            message: e.to_string(),
-            location: location!(),
-        })?;
+        options = options
+            .with_deleted_rows()
+            .map_err(|e| Error::internal(e.to_string()))?;
     }
 
     // Performance tuning
@@ -244,10 +273,9 @@ async fn fr_options_from_proto(
     if has_filters {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
-                Error::InvalidInput {
-                    source: "missing filter_schema_ipc but filters are present".into(),
-                    location: location!(),
-                }
+                Error::invalid_input_source(
+                    "missing filter_schema_ipc but filters are present".into(),
+                )
             })?)?;
 
         if let Some(bytes) = &proto.refine_filter_substrait {
@@ -325,10 +353,7 @@ async fn plan_from_proto(
     if !proto.fragment_filter_ids.is_empty() {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
-                Error::InvalidInput {
-                    source: "missing filter_schema_ipc but plan has filters".into(),
-                    location: location!(),
-                }
+                Error::invalid_input_source("missing filter_schema_ipc but plan has filters".into())
             })?)?;
 
         // Decode each unique expression once, then share via Arc.
@@ -339,17 +364,16 @@ async fn plan_from_proto(
         }
 
         for (frag_id, expr_id) in &proto.fragment_filter_ids {
-            let expr = decoded
-                .get(*expr_id as usize)
-                .ok_or_else(|| Error::InvalidInput {
-                    source: format!(
+            let expr = decoded.get(*expr_id as usize).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
                         "filter expression index {} out of bounds (have {})",
                         expr_id,
                         decoded.len()
                     )
                     .into(),
-                    location: location!(),
-                })?;
+                )
+            })?;
             filters.insert(*frag_id, Arc::clone(expr));
         }
     }
@@ -413,10 +437,8 @@ fn projection_from_proto(
     proto: Option<&pb::ProjectionProto>,
     base: Arc<dyn lance_core::datatypes::Projectable>,
 ) -> Result<Projection> {
-    let proto = proto.ok_or_else(|| Error::InvalidInput {
-        source: "Missing projection in proto".into(),
-        location: location!(),
-    })?;
+    let proto =
+        proto.ok_or_else(|| Error::invalid_input_source("Missing projection in proto".into()))?;
 
     let mut projection = Projection::empty(base);
     for field_id in &proto.field_ids {
@@ -467,10 +489,9 @@ fn threading_mode_from_proto(
         Some(pb::filtered_read_threading_mode_proto::Mode::MultiplePartitions(n)) => {
             Ok(FilteredReadThreadingMode::MultiplePartitions(*n as usize))
         }
-        None => Err(Error::InvalidInput {
-            source: "Missing threading mode in proto".into(),
-            location: location!(),
-        }),
+        None => Err(Error::invalid_input_source(
+            "Missing threading mode in proto".into(),
+        )),
     }
 }
 
@@ -499,9 +520,10 @@ fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<
                 .iter()
                 .find(|f| f.id == *id)
                 .cloned()
-                .ok_or_else(|| Error::InvalidInput {
-                    source: format!("Fragment {} not found in dataset", id).into(),
-                    location: location!(),
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!("Fragment {} not found in dataset", id).into(),
+                    )
                 })
         })
         .collect()
@@ -510,25 +532,19 @@ fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<
 fn schema_to_bytes(schema: &ArrowSchema) -> Result<Vec<u8>> {
     let options =
         arrow_ipc::writer::IpcWriteOptions::try_new(8, false, arrow_ipc::MetadataVersion::V5)
-            .map_err(|e| Error::Internal {
-                message: format!("Failed to create IPC write options: {}", e),
-                location: location!(),
-            })?;
-    let gen = arrow_ipc::writer::IpcDataGenerator::default();
+            .map_err(|e| Error::internal(format!("Failed to create IPC write options: {}", e)))?;
+    let generator = arrow_ipc::writer::IpcDataGenerator::default();
     let mut tracker = arrow_ipc::writer::DictionaryTracker::new(false);
-    let encoded = gen.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
+    let encoded = generator.schema_to_bytes_with_dictionary_tracker(schema, &mut tracker, &options);
     Ok(encoded.ipc_message.to_vec())
 }
 
 fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
-    let message = arrow_ipc::root_as_message(bytes).map_err(|e| Error::Internal {
-        message: format!("Failed to parse IPC schema message: {}", e),
-        location: location!(),
-    })?;
-    let ipc_schema = message.header_as_schema().ok_or_else(|| Error::Internal {
-        message: "IPC message does not contain a schema".to_string(),
-        location: location!(),
-    })?;
+    let message = arrow_ipc::root_as_message(bytes)
+        .map_err(|e| Error::internal(format!("Failed to parse IPC schema message: {}", e)))?;
+    let ipc_schema = message
+        .header_as_schema()
+        .ok_or_else(|| Error::internal("IPC message does not contain a schema".to_string()))?;
     let schema = arrow_ipc::convert::fb_to_schema(ipc_schema);
     Ok(Arc::new(schema))
 }
@@ -623,6 +639,7 @@ mod tests {
             version: 42,
             manifest_etag: Some("etag123".to_string()),
             serialized_manifest: None,
+            storage_options: HashMap::new(),
         };
         let bytes = id.encode_to_vec();
         let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
@@ -771,7 +788,7 @@ mod tests {
 
         let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
 
-        let proto = filtered_read_exec_to_proto(&exec, &state).unwrap();
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
 
         // Check table identifier
         let table = proto.table.as_ref().unwrap();
@@ -780,7 +797,7 @@ mod tests {
         assert!(table.serialized_manifest.is_none());
 
         // Roundtrip back
-        let back = filtered_read_exec_from_proto(proto, dataset.clone(), None, &state)
+        let back = filtered_read_exec_from_proto(proto, Some(dataset.clone()), None, &state)
             .await
             .unwrap();
 
@@ -799,7 +816,9 @@ mod tests {
     async fn test_table_identifier_with_manifest() {
         let dataset = make_test_dataset().await;
 
-        let id = table_identifier_from_dataset_with_manifest(&dataset);
+        let id = table_identifier_from_dataset_with_manifest(&dataset)
+            .await
+            .unwrap();
         assert_eq!(id.uri, dataset.uri());
         assert_eq!(id.version, dataset.manifest.version);
         assert!(id.serialized_manifest.is_some());

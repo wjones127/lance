@@ -301,12 +301,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
           CoalescePartitionsExec
             ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
               ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
-                CoalesceBatchesExec: target_batch_size=...
-                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                    CooperativeExec
-                      LanceRead: uri=test_dataset/data, projection=[id], ...
-                    RepartitionExec: ...
-                      StreamingTableExec: partition_sizes=1, ...
+                HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                  CooperativeExec
+                    LanceRead: uri=test_dataset/data, projection=[id], ...
+                  RepartitionExec: ...
+                    StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
 
         >>> # Or with explicit schema
@@ -321,9 +320,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
           CoalescePartitionsExec
             ProjectionExec: expr=[_rowid@1 as _rowid, _rowaddr@2 as _rowaddr, ...]
               ProjectionExec: expr=[id@2 IS NOT NULL as __common_expr_1, ...]
-                CoalesceBatchesExec: target_batch_size=...
-                  HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                    ...
+                HashJoinExec: mode=CollectLeft, join_type=Right, ...
+                  ...
         """
         return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
 
@@ -386,12 +384,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[_rowid@1 as _rowid, ...], metrics=[...]
                   ProjectionExec: elapsed=..., expr=[id@2 IS NOT NULL as __common_expr_1, ...], metrics=[...]
-                    CoalesceBatchesExec: elapsed=..., ..., metrics=[...]
-                      HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                        CooperativeExec, elapsed=..., metrics=[]
-                          LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                        RepartitionExec: ...
-                          StreamingTableExec: ..., metrics=[]
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
+                      CooperativeExec, elapsed=..., metrics=[]
+                        LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+                      RepartitionExec: ...
+                        StreamingTableExec: ..., metrics=[]
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -434,6 +431,8 @@ class LanceDataset(pa.dataset.Dataset):
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
         storage_options_provider: Optional[Any] = None,
+        namespace: Optional[Any] = None,
+        table_id: Optional[List[str]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -464,6 +463,8 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             session=session,
             storage_options_provider=storage_options_provider,
+            namespace=namespace,
+            table_id=table_id,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -2017,7 +2018,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
-    ):
+    ) -> DeleteResult:
         """
         Delete rows from the dataset.
 
@@ -2038,6 +2039,12 @@ class LanceDataset(pa.dataset.Dataset):
             regardless of how long it takes to complete. Subsequent attempts will be
             cancelled once this timeout is reached. Default is 30 seconds.
 
+        Returns
+        -------
+        dict
+            A dictionary containing the number of rows deleted, with the key
+            ``num_deleted_rows``.
+
         Examples
         --------
         >>> import lance
@@ -2045,17 +2052,11 @@ class LanceDataset(pa.dataset.Dataset):
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
-        >>> dataset.to_table()
-        pyarrow.Table
-        a: int64
-        b: string
-        ----
-        a: [[3]]
-        b: [["c"]]
+        {'num_deleted_rows': 2}
         """
         if isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
-        self._ds.delete(predicate, conflict_retries, retry_timeout)
+        return self._ds.delete(predicate, conflict_retries, retry_timeout)
 
     def truncate_table(self) -> None:
         """
@@ -2904,6 +2905,11 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
+        Optional parameters for `IVF_RQ`:
+
+            - num_bits
+                The number of bits for RQ (Rabit Quantization). Default is 1.
+
         Optional parameters for `IVF_HNSW_*`:
             max_level
                 Int, the maximum number of levels in the graph.
@@ -3395,6 +3401,8 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        namespace: Optional["LanceNamespace"] = None,
+        table_id: Optional[List[str]] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3461,6 +3469,12 @@ class LanceDataset(pa.dataset.Dataset):
             row IDs assign each row a monotonically increasing id that persists
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
+        namespace : LanceNamespace, optional
+            A namespace instance. Must be provided together with table_id.
+            Use lance.namespace.connect() to create a namespace.
+        table_id : List[str], optional
+            The table identifier within the namespace (e.g., ["workspace", "table"]).
+            Must be provided together with namespace.
 
         Returns
         -------
@@ -3531,6 +3545,8 @@ class LanceDataset(pa.dataset.Dataset):
                 detached=detached,
                 max_retries=max_retries,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3545,6 +3561,8 @@ class LanceDataset(pa.dataset.Dataset):
                 max_retries=max_retries,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
+                namespace=namespace,
+                table_id=table_id,
             )
         else:
             raise TypeError(
@@ -4166,6 +4184,10 @@ class Version(TypedDict):
 
 class UpdateResult(TypedDict):
     num_rows_updated: int
+
+
+class DeleteResult(TypedDict):
+    num_deleted_rows: int
 
 
 class AlterColumn(TypedDict):
@@ -5284,6 +5306,10 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
+        compaction_mode: Optional[
+            Literal["reencode", "try_binary_copy", "force_binary_copy"]
+        ] = None,
+        binary_copy_read_batch_bytes: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -5331,6 +5357,19 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
+        compaction_mode: str, optional
+            The compaction mode. Valid values:
+
+            - ``"reencode"``: Decode and re-encode data (default).
+            - ``"try_binary_copy"``: Try binary copy if fragments are
+              compatible, fall back to reencode otherwise.
+            - ``"force_binary_copy"``: Use binary copy or fail if fragments
+              are not compatible.
+        binary_copy_read_batch_bytes: int, optional
+            The batch size in bytes for reading during binary copy operations.
+            Controls how much data is read at once when performing binary copy.
+            Defaults to 16MB.
+
         Returns
         -------
         CompactionMetrics
@@ -5348,6 +5387,8 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
             batch_size=batch_size,
+            compaction_mode=compaction_mode,
+            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
         )
         return Compaction.execute(self._dataset, opts)
 
@@ -5618,7 +5659,7 @@ def write_dataset(
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
     data_storage_version: Optional[
-        Literal["stable", "2.0", "2.1", "2.2", "next", "legacy", "0.1"]
+        Literal["stable", "2.0", "2.1", "2.2", "2.3", "next", "legacy", "0.1"]
     ] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = True,
@@ -5628,6 +5669,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    allow_external_blob_outside_bases: bool = False,
     namespace: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
@@ -5722,6 +5764,9 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to the dataset root or a registered
+        base path. If True, external blob URIs outside registered bases are allowed.
     namespace : optional, LanceNamespace
         A namespace instance from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
@@ -5765,12 +5810,11 @@ def write_dataset(
 
         # Implement write_into_namespace logic in Python
         # This follows the same pattern as the Rust implementation:
-        # - CREATE mode: calls namespace.create_empty_table()
+        # - CREATE mode: calls namespace.declare_table()
         # - APPEND/OVERWRITE mode: calls namespace.describe_table()
         # - Both modes: create storage options provider and merge storage options
 
         from .namespace import (
-            CreateEmptyTableRequest,
             DeclareTableRequest,
             DescribeTableRequest,
             LanceNamespaceStorageOptionsProvider,
@@ -5778,37 +5822,8 @@ def write_dataset(
 
         # Determine which namespace method to call based on mode
         if mode == "create":
-            # Try declare_table first, fall back to deprecated create_empty_table
-            # for backward compatibility with older namespace implementations.
-            # create_empty_table support will be removed in 3.0.0.
-            if hasattr(namespace, "declare_table"):
-                try:
-                    from lance_namespace.errors import UnsupportedOperationError
-
-                    declare_request = DeclareTableRequest(id=table_id, location=None)
-                    response = namespace.declare_table(declare_request)
-                except (UnsupportedOperationError, NotImplementedError):
-                    # Fall back to deprecated create_empty_table
-                    warnings.warn(
-                        "create_empty_table is deprecated, use declare_table instead. "
-                        "Support will be removed in 3.0.0.",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
-                    fallback_request = CreateEmptyTableRequest(
-                        id=table_id, location=None
-                    )
-                    response = namespace.create_empty_table(fallback_request)
-            else:
-                # Namespace doesn't have declare_table, fall back to create_empty_table
-                warnings.warn(
-                    "create_empty_table is deprecated, use declare_table instead. "
-                    "Support will be removed in 3.0.0.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                fallback_request = CreateEmptyTableRequest(id=table_id, location=None)
-                response = namespace.create_empty_table(fallback_request)
+            declare_request = DeclareTableRequest(id=table_id, location=None)
+            response = namespace.declare_table(declare_request)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
             response = namespace.describe_table(request)
@@ -5821,6 +5836,9 @@ def write_dataset(
             raise ValueError(
                 f"Namespace did not return a table location in {mode} response"
             )
+
+        # Check if namespace manages versioning (commits go through namespace API)
+        managed_versioning = getattr(response, "managed_versioning", None) is True
 
         # Use namespace storage options
         namespace_storage_options = response.storage_options
@@ -5846,6 +5864,7 @@ def write_dataset(
         raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
     else:
         storage_options_provider = None
+        managed_versioning = False
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -5880,11 +5899,17 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
     }
 
     # Add storage_options_provider if created from namespace
     if storage_options_provider is not None:
         params["storage_options_provider"] = storage_options_provider
+
+    # Add namespace and table_id for managed versioning (external manifest store)
+    if managed_versioning and namespace is not None and table_id is not None:
+        params["namespace"] = namespace
+        params["table_id"] = table_id
 
     if commit_lock:
         if not callable(commit_lock):
