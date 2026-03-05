@@ -1575,9 +1575,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     assert info.segments[0].index_version == 1
     assert info.segments[0].created_at is not None
 
-    import json
-
-    details = json.loads(info.details)
+    details = info.details
     assert details["metric_type"] == "L2"
     assert details["compression"]["type"] == "pq"
     assert details["compression"]["num_bits"] == 8
