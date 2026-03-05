@@ -192,7 +192,7 @@ message VectorIndexDetails {
   // 0 means unset.
   uint64 target_partition_size = 2;
 
-  // Optional HNSW index configuration. If present, index does not use HNSW.
+  // Optional HNSW index configuration. If set, the index has an HNSW layer.
   optional HnswIndexDetails hnsw_index_config = 3;
 
   message ProductQuantization {

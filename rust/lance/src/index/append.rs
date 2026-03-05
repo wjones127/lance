@@ -212,10 +212,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
                 });
 
-            // Carry forward existing index details from the most recent index segment
+            // Carry forward existing index details, preferring the first segment
+            // that has populated (non-empty) details.
             let index_details = old_indices
-                .last()
-                .and_then(|idx| idx.index_details.as_ref())
+                .iter()
+                .rev()
+                .filter_map(|idx| idx.index_details.as_ref())
+                .find(|d| !d.value.is_empty())
                 .map(|d| d.as_ref().clone())
                 .unwrap_or_else(vector_index_details_default);
 

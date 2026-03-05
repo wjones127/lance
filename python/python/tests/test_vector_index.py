@@ -1564,7 +1564,7 @@ def test_describe_vector_index(indexed_dataset: LanceDataset):
     info = indexed_dataset.describe_indices()[0]
 
     assert info.name == "vector_idx"
-    assert info.type_url == "/lance.table.VectorIndexDetails"
+    assert info.type_url == "/lance.index.pb.VectorIndexDetails"
     assert info.index_type == "IVF_PQ"
     assert info.num_rows_indexed == 1000
     assert info.fields == [0]

@@ -169,7 +169,7 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
         .filter_map(|(name, result)| match result {
             Ok(details) => Some((name, Arc::new(details))),
             Err(err) => {
-                log::warn!("Could not infer vector index details for {}: {}", name, err);
+                tracing::warn!("Could not infer vector index details for {}: {}", name, err);
                 None
             }
         })

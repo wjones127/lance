@@ -669,20 +669,16 @@ impl DatasetIndexExt for Dataset {
         };
         indices.sort_by_key(|idx| &idx.name);
 
-        // Collect groups upfront so we don't hold chunk_by across await points
-        let groups: Vec<Vec<IndexMetadata>> = indices
+        indices
             .into_iter()
-            .chunk_by(|idx| idx.name.clone())
+            .chunk_by(|idx| &idx.name)
             .into_iter()
-            .map(|(_, segments)| segments.cloned().collect::<Vec<_>>())
-            .collect();
-
-        let mut results: Vec<Arc<dyn IndexDescription>> = Vec::new();
-        for segments in groups {
-            let desc = IndexDescriptionImpl::try_new(segments, self)?;
-            results.push(Arc::new(desc) as Arc<dyn IndexDescription>);
-        }
-        Ok(results)
+            .map(|(_, segments)| {
+                let segments = segments.cloned().collect::<Vec<_>>();
+                let desc = IndexDescriptionImpl::try_new(segments, self)?;
+                Ok(Arc::new(desc) as Arc<dyn IndexDescription>)
+            })
+            .collect::<Result<Vec<_>>>()
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
