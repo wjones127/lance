@@ -120,14 +120,26 @@ fn is_empty_vector_details(details: &prost_types::Any) -> bool {
     details.value.is_empty()
 }
 
-/// Returns true if this index has a VectorIndexDetails type_url but empty value bytes,
-/// indicating a legacy index that needs details inferred from disk.
-pub fn is_vector_index_with_empty_details(index: &IndexMetadata) -> bool {
-    index
-        .index_details
-        .as_ref()
-        .map(|d| d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty())
-        .unwrap_or(false)
+/// Returns true if this is a vector index whose details need to be inferred from disk.
+///
+/// This covers two legacy cases:
+/// - Very old indices (<=0.19.2) where `index_details` is `None` but the indexed
+///   field is a vector type
+/// - Newer pre-details indices where `index_details` has a VectorIndexDetails
+///   type_url but empty value bytes
+pub fn needs_vector_details_inference(
+    index: &IndexMetadata,
+    schema: &lance_core::datatypes::Schema,
+) -> bool {
+    match &index.index_details {
+        Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
+        None => index.fields.iter().any(|&field_id| {
+            schema
+                .field_by_id(field_id)
+                .map(|f| matches!(f.data_type(), arrow_schema::DataType::FixedSizeList(_, _)))
+                .unwrap_or(false)
+        }),
+    }
 }
 
 /// Derive a human-readable index type string from VectorIndexDetails.

@@ -408,7 +408,7 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 }
 
 use vector::details::{
-    derive_vector_index_type, infer_vector_index_details, is_vector_index_with_empty_details,
+    derive_vector_index_type, infer_vector_index_details, needs_vector_details_inference,
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
@@ -686,7 +686,7 @@ impl DatasetIndexExt for Dataset {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
         };
-        let indices = match self.index_cache.get_with_key(&metadata_key).await {
+        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
                 let mut loaded_indices = read_manifest_indexes(
@@ -696,21 +696,31 @@ impl DatasetIndexExt for Dataset {
                 )
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
+                let loaded_indices = Arc::new(loaded_indices);
+                self.index_cache
+                    .insert_with_key(&metadata_key, loaded_indices.clone())
+                    .await;
+                loaded_indices
+            }
+        };
 
-                // Infer details for legacy vector indices (once per index name, concurrently).
-                let needs_inference: HashMap<&str, &IndexMetadata> = loaded_indices
-                    .iter()
-                    .filter(|idx| is_vector_index_with_empty_details(idx))
-                    .map(|idx| (idx.name.as_str(), idx))
-                    .collect();
-                let inferred: HashMap<String, Arc<prost_types::Any>> = futures::future::join_all(
-                    needs_inference
-                        .into_iter()
-                        .map(|(name, representative)| async move {
-                            let result = infer_vector_index_details(self, representative).await;
-                            (name.to_string(), result)
-                        }),
-                )
+        // Infer details for legacy vector indices (once per index name, concurrently).
+        // This may run on indices that were opportunistically cached during Dataset::open
+        // before the full Dataset was available for inference.
+        let schema = self.schema();
+        let needs_inference: HashMap<&str, &IndexMetadata> = indices
+            .iter()
+            .filter(|idx| needs_vector_details_inference(idx, schema))
+            .map(|idx| (idx.name.as_str(), idx))
+            .collect();
+        if !needs_inference.is_empty() {
+            let inferred: HashMap<String, Arc<prost_types::Any>> =
+                futures::future::join_all(needs_inference.into_iter().map(
+                    |(name, representative)| async move {
+                        let result = infer_vector_index_details(self, representative).await;
+                        (name.to_string(), result)
+                    },
+                ))
                 .await
                 .into_iter()
                 .filter_map(|(name, result)| match result {
@@ -721,18 +731,19 @@ impl DatasetIndexExt for Dataset {
                     }
                 })
                 .collect();
-                for index in &mut loaded_indices {
+            if !inferred.is_empty() {
+                let mut updated = indices.as_ref().clone();
+                for index in &mut updated {
                     if let Some(details) = inferred.get(&index.name) {
                         index.index_details = Some(details.clone());
                     }
                 }
-                let loaded_indices = Arc::new(loaded_indices);
+                indices = Arc::new(updated);
                 self.index_cache
-                    .insert_with_key(&metadata_key, loaded_indices.clone())
+                    .insert_with_key(&metadata_key, indices.clone())
                     .await;
-                loaded_indices
             }
-        };
+        }
 
         if let Some(frag_reuse_index_meta) =
             indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -3181,6 +3192,114 @@ mod tests {
             "updated_at_timestamp_ms should be null when no indices have created_at timestamps"
         );
     }
+
+    #[tokio::test]
+    async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
+        use lance_linalg::distance::DistanceType;
+
+        // Create a fresh dataset with IVF_HNSW_SQ so inference produces non-default
+        // details (HNSW config + SQ compression) that survive proto serialization.
+        let test_dir = lance_core::utils::tempfile::TempDir::default();
+        let test_uri = test_dir.path_str();
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("vec", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(1024), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::Cosine,
+            IvfBuildParams {
+                num_partitions: Some(2),
+                ..Default::default()
+            },
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Verify the index has populated details.
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].index_type(), "IVF_HNSW_SQ");
+
+        // Simulate a legacy dataset by clearing details from the manifest.
+        // Write a new manifest with empty VectorIndexDetails value bytes.
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for idx in &mut indices {
+            if let Some(details) = idx.index_details.as_ref()
+                && details.type_url.ends_with("VectorIndexDetails")
+            {
+                idx.index_details = Some(Arc::new(vector_index_details_default()));
+            }
+        }
+        // Write back via a no-op commit that carries the cleared indices.
+        // We commit by doing a delete("false") after replacing the cached indices.
+        let metadata_key = crate::session::index_caches::IndexMetadataKey {
+            version: dataset.version().version,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&metadata_key, Arc::new(indices))
+            .await;
+        dataset.delete("false").await.unwrap();
+
+        // -- Part 1: Inference on load --
+        // Open with a fresh session so nothing is cached.
+        let dataset = DatasetBuilder::from_uri(&test_uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // load_indices should detect empty details and infer from index files.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let details = indices[0].index_details.as_ref().unwrap();
+        assert!(
+            !details.value.is_empty(),
+            "Details should have been inferred from index files"
+        );
+
+        // describe_indices should return a real type (not generic "Vector").
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_ne!(
+            descriptions[0].index_type(),
+            "Vector",
+            "Should have inferred a specific index type"
+        );
+        let inferred_type = descriptions[0].index_type().to_string();
+        let details_json: serde_json::Value =
+            serde_json::from_str(&descriptions[0].details().unwrap()).unwrap();
+        assert_eq!(details_json["metric_type"], "COSINE");
+
+        // -- Part 2: Migration persists inferred details --
+        let mut dataset = dataset;
+        dataset.delete("false").await.unwrap();
+
+        // Open with yet another fresh session.
+        let dataset = DatasetBuilder::from_uri(&test_uri)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // The migrated manifest should have non-empty details without
+        // needing to read index files again.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            !indices[0].index_details.as_ref().unwrap().value.is_empty(),
+            "Migrated manifest should have non-empty details"
+        );
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions[0].index_type(), inferred_type);
+    }
+
     #[rstest]
     #[case::btree("i", IndexType::BTree, Box::new(ScalarIndexParams::default()))]
     #[case::bitmap("i", IndexType::Bitmap, Box::new(ScalarIndexParams::default()))]

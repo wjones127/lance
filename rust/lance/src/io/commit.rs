@@ -566,11 +566,12 @@ fn must_recalculate_fragment_bitmap(
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     use crate::index::vector::details::{
-        infer_vector_index_details, is_vector_index_with_empty_details,
+        infer_vector_index_details, needs_vector_details_inference,
     };
+    let schema = dataset.schema();
     let needs_inference: HashMap<&str, &IndexMetadata> = indices
         .iter()
-        .filter(|idx| is_vector_index_with_empty_details(idx))
+        .filter(|idx| needs_vector_details_inference(idx, schema))
         .map(|idx| (idx.name.as_str(), idx))
         .collect();
     let inferred: HashMap<String, Arc<prost_types::Any>> =
