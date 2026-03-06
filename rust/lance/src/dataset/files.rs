@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -15,6 +16,7 @@ use arrow_array::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
+use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use lance_table::format::IndexMetadata;
 use lance_table::utils::LanceIteratorExtension;
@@ -33,6 +35,10 @@ mod arrow;
 mod file_types;
 
 const BATCH_SIZE: usize = 4096;
+/// Memory budget for in-flight manifests (estimated in-memory size).
+const MANIFEST_MEMORY_BUDGET: usize = 1024 * 1024 * 1024; // 1 GB
+/// Estimated ratio of in-memory size to on-disk size for manifests.
+const MANIFEST_DECOMPRESSION_RATIO: usize = 4;
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     match path.prefix_match(prefix) {
@@ -254,52 +260,92 @@ impl Dataset {
         // Manifest channel: Task 1 -> Task 2 (small buffer for backpressure
         // since manifests can be large).
         let (tx_manifest, mut rx_manifest) =
-            tokio::sync::mpsc::channel::<(Arc<lance_table::format::Manifest>, String)>(2);
+            tokio::sync::mpsc::channel::<(Arc<lance_table::format::Manifest>, String, usize)>(2);
         // Index channel: Task 1 -> Task 3.
         let (tx_indexes, mut rx_indexes) =
             tokio::sync::mpsc::channel::<(u64, Vec<IndexMetadata>)>(8);
 
-        // Memory tracking channel: Manifests can be large, so we may block on loading
-        // the next manifest until we see that memory usage is below the limit.
-        // TODO: implement backpressure: use the on-disk size to estimate the in-memory size of the manifest.
-        // Wait for enough memory to be available before reading the next manifest. When a manifest is read,
-        // it sends adds it size to the channel. When the Manifest is dropped, it subtracts its size from the channel.
-        let (tx_memory, rx_memory) = tokio::sync::watch::channel::<usize>(0);
+        // Tracks estimated in-memory size of in-flight manifests. Task 1 adds
+        // before sending; Task 2 subtracts after processing.
+        let inflight_mem = Arc::new(AtomicUsize::new(0));
+        let mem_notify = Arc::new(tokio::sync::Notify::new());
 
         // Task 1: Manifest Reader — reads manifests and index metadata, fans
         // out to Task 2 (file batches) and Task 3 (index listing).
         let tx_err = tx.clone();
         let os1 = object_store.clone();
         let base1 = base.clone();
+        let inflight_mem1 = inflight_mem.clone();
+        let mem_notify1 = mem_notify.clone();
         tokio::spawn(async move {
             let result: lance_core::Result<()> = async {
                 let manifest_locations =
                     commit_handler.list_manifest_locations(&base1, &os1, false);
+                let max_parallelism = os1.io_parallelism();
 
-                // Read up to 2 manifests concurrently to overlap I/O while
-                // bounding memory (manifests can be >1 GB).
-                let os_read = os1.clone();
-                let base_read = base1.clone();
-                let mut manifest_stream = manifest_locations
-                    .map(move |loc_result| {
-                        let os = os_read.clone();
-                        let base = base_read.clone();
-                        async move {
-                            let loc = loc_result?;
-                            let manifest = read_manifest(&os, &loc.path, loc.size).await?;
-                            let indexes = read_manifest_indexes(&os, &loc, &manifest).await?;
-                            let manifest_path = remove_prefix(&loc.path, &base).to_string();
-                            lance_core::Result::Ok((Arc::new(manifest), manifest_path, indexes))
+                let mut in_flight = FuturesUnordered::new();
+                let mut locations = std::pin::pin!(manifest_locations);
+                let mut locations_exhausted = false;
+
+                loop {
+                    // Try to launch new reads while under budget and parallelism limit.
+                    while !locations_exhausted && in_flight.len() < max_parallelism {
+                        let current_mem = inflight_mem1.load(Ordering::Acquire);
+                        // Allow at least 1 in-flight read even if over budget,
+                        // so we always make forward progress.
+                        if !in_flight.is_empty() && current_mem >= MANIFEST_MEMORY_BUDGET {
+                            break;
                         }
-                    })
-                    .buffer_unordered(2);
 
-                while let Some(item) = manifest_stream.next().await {
-                    let (manifest, manifest_path, indexes) = item?;
+                        match locations.next().await {
+                            Some(Ok(loc)) => {
+                                let estimated =
+                                    loc.size.unwrap_or(0) as usize * MANIFEST_DECOMPRESSION_RATIO;
+                                inflight_mem1.fetch_add(estimated, Ordering::AcqRel);
+
+                                let os = os1.clone();
+                                let base = base1.clone();
+                                in_flight.push(async move {
+                                    let manifest = read_manifest(&os, &loc.path, loc.size).await?;
+                                    let indexes =
+                                        read_manifest_indexes(&os, &loc, &manifest).await?;
+                                    let manifest_path = remove_prefix(&loc.path, &base).to_string();
+                                    lance_core::Result::Ok((
+                                        Arc::new(manifest),
+                                        manifest_path,
+                                        indexes,
+                                        estimated,
+                                    ))
+                                });
+                            }
+                            Some(Err(e)) => return Err(e),
+                            None => {
+                                locations_exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if in_flight.is_empty() {
+                        break;
+                    }
+
+                    // Wait for the next completed read, or a memory-freed
+                    // notification so we can try launching more.
+                    let item = tokio::select! {
+                        biased;
+                        item = in_flight.next() => item,
+                        _ = mem_notify1.notified() => continue,
+                    };
+
+                    let Some(item) = item else { break };
+                    let (manifest, manifest_path, indexes, estimated) = item?;
                     let version = manifest.version;
-                    // Fan out to Task 2 and Task 3. If a receiver is gone the
-                    // consumer has dropped the stream, so we stop.
-                    if tx_manifest.send((manifest, manifest_path)).await.is_err() {
+                    if tx_manifest
+                        .send((manifest, manifest_path, estimated))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
                     if !indexes.is_empty() && tx_indexes.send((version, indexes)).await.is_err() {
@@ -319,10 +365,12 @@ impl Dataset {
         });
 
         // Task 2: File Batch Emitter — converts manifests into file-row batches.
+        // After processing each manifest, releases its estimated memory so Task 1
+        // can read more.
         let tx2 = tx.clone();
         let uri2 = uri.clone();
         tokio::spawn(async move {
-            while let Some((manifest, manifest_path)) = rx_manifest.recv().await {
+            while let Some((manifest, manifest_path, estimated)) = rx_manifest.recv().await {
                 let batches = manifest_file_batches(&manifest, &uri2, &manifest_path);
                 for batch_result in batches {
                     let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
@@ -330,6 +378,11 @@ impl Dataset {
                         return;
                     }
                 }
+                // The manifest Arc may still be alive in the channel or downstream,
+                // but we're done iterating it — release memory budget.
+                drop(manifest);
+                inflight_mem.fetch_sub(estimated, Ordering::AcqRel);
+                mem_notify.notify_one();
             }
         });
 
