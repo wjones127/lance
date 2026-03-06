@@ -16,6 +16,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
 use futures::{StreamExt, TryStreamExt};
+use lance_table::format::IndexMetadata;
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
 use uuid::Uuid;
@@ -241,52 +242,131 @@ impl Dataset {
         let object_store = self.object_store.clone();
         let commit_handler = self.commit_handler.clone();
 
+        // We use 3 tasks:
+        //
+        // T1: List manifests ─────► T2: List files in Manifest
+        //       │                           │
+        //       ▼                           ▼
+        // T3: List index files ───► <File list channel>
+
+        // Output channel: both Task 2 and Task 3 send batches here.
         let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
+        // Manifest channel: Task 1 -> Task 2 (small buffer for backpressure
+        // since manifests can be large).
+        let (tx_manifest, mut rx_manifest) =
+            tokio::sync::mpsc::channel::<(Arc<lance_table::format::Manifest>, String)>(2);
+        // Index channel: Task 1 -> Task 3.
+        let (tx_indexes, mut rx_indexes) =
+            tokio::sync::mpsc::channel::<(u64, Vec<IndexMetadata>)>(8);
 
-        let _task = tokio::spawn(async move {
+        // Memory tracking channel: Manifests can be large, so we may block on loading
+        // the next manifest until we see that memory usage is below the limit.
+        // TODO: implement backpressure: use the on-disk size to estimate the in-memory size of the manifest.
+        // Wait for enough memory to be available before reading the next manifest. When a manifest is read,
+        // it sends adds it size to the channel. When the Manifest is dropped, it subtracts its size from the channel.
+        let (tx_memory, rx_memory) = tokio::sync::watch::channel::<usize>(0);
+
+        // Task 1: Manifest Reader — reads manifests and index metadata, fans
+        // out to Task 2 (file batches) and Task 3 (index listing).
+        let tx_err = tx.clone();
+        let os1 = object_store.clone();
+        let base1 = base.clone();
+        tokio::spawn(async move {
             let result: lance_core::Result<()> = async {
-                let mut manifest_locations =
-                    commit_handler.list_manifest_locations(&base, &object_store, false);
+                let manifest_locations =
+                    commit_handler.list_manifest_locations(&base1, &os1, false);
 
-                // uuid -> files under that index directory.
-                // Cached to avoid re-listing the same UUID directory across manifest versions.
-                let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
-
-                while let Some(loc) = manifest_locations.next().await {
-                    let loc = loc?;
-                    let manifest = read_manifest(&object_store, &loc.path, loc.size).await?;
-                    let manifest_path = remove_prefix(&loc.path, &base);
-                    let batches = manifest_file_batches(&manifest, &uri, manifest_path.as_ref());
-                    for batch_result in batches {
-                        let df_result =
-                            batch_result.map_err(datafusion::error::DataFusionError::from);
-                        if tx.send(df_result).await.is_err() {
-                            return Ok(());
+                // Read up to 2 manifests concurrently to overlap I/O while
+                // bounding memory (manifests can be >1 GB).
+                let os_read = os1.clone();
+                let base_read = base1.clone();
+                let mut manifest_stream = manifest_locations
+                    .map(move |loc_result| {
+                        let os = os_read.clone();
+                        let base = base_read.clone();
+                        async move {
+                            let loc = loc_result?;
+                            let manifest = read_manifest(&os, &loc.path, loc.size).await?;
+                            let indexes = read_manifest_indexes(&os, &loc, &manifest).await?;
+                            let manifest_path = remove_prefix(&loc.path, &base).to_string();
+                            lance_core::Result::Ok((Arc::new(manifest), manifest_path, indexes))
                         }
+                    })
+                    .buffer_unordered(2);
+
+                while let Some(item) = manifest_stream.next().await {
+                    let (manifest, manifest_path, indexes) = item?;
+                    let version = manifest.version;
+                    // Fan out to Task 2 and Task 3. If a receiver is gone the
+                    // consumer has dropped the stream, so we stop.
+                    if tx_manifest.send((manifest, manifest_path)).await.is_err() {
+                        return Ok(());
                     }
-
-                    let indexes = read_manifest_indexes(&object_store, &loc, &manifest).await?;
-                    let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
-                    let index_paths =
-                        get_index_files(uuids, &base, &object_store, &mut uuid_cache).await?;
-                    if !index_paths.is_empty() {
-                        let batch = index_file_batch(manifest.version, &uri, &index_paths).await?;
-                        if tx.send(Ok(batch)).await.is_err() {
-                            return Ok(());
-                        }
+                    if !indexes.is_empty() && tx_indexes.send((version, indexes)).await.is_err() {
+                        return Ok(());
                     }
                 }
-
                 Ok(())
             }
             .await;
 
             if let Err(e) = result {
-                // Best-effort: send the error to the stream consumer. If the
-                // receiver is already gone we silently discard it.
-                let _ = tx
+                let _ = tx_err
                     .send(Err(datafusion::error::DataFusionError::from(e)))
                     .await;
+            }
+            // Dropping tx_manifest and tx_indexes signals completion to tasks 2 & 3.
+        });
+
+        // Task 2: File Batch Emitter — converts manifests into file-row batches.
+        let tx2 = tx.clone();
+        let uri2 = uri.clone();
+        tokio::spawn(async move {
+            while let Some((manifest, manifest_path)) = rx_manifest.recv().await {
+                let batches = manifest_file_batches(&manifest, &uri2, &manifest_path);
+                for batch_result in batches {
+                    let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
+                    if tx2.send(df_result).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Task 3: Index File Lister — lists index directories and emits index
+        // file batches.
+        let tx3 = tx;
+        let uri3 = uri;
+        let os3 = object_store;
+        let base3 = base;
+        tokio::spawn(async move {
+            let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
+            while let Some((version, indexes)) = rx_indexes.recv().await {
+                let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
+                match get_index_files(uuids, &base3, &os3, &mut uuid_cache).await {
+                    Ok(index_paths) if !index_paths.is_empty() => {
+                        match index_file_batch(version, &uri3, &index_paths).await {
+                            Ok(batch) => {
+                                if tx3.send(Ok(batch)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx3
+                                    .send(Err(datafusion::error::DataFusionError::from(e)))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx3
+                            .send(Err(datafusion::error::DataFusionError::from(e)))
+                            .await;
+                        return;
+                    }
+                    _ => {}
+                }
             }
         });
 
