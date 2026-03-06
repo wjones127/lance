@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use arrow::pyarrow::{PyArrowType, ToPyArrow};
@@ -580,16 +581,20 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
-        format!(
-            "IndexDescription(name={}, type_url={}, num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={}, total_size_bytes={:?})",
+        let mut repr = format!(
+            "IndexDescription(name='{}', type_url='{}', num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={}",
             self.name,
             self.type_url,
             self.num_rows_indexed,
             self.fields,
             self.field_names,
-            self.segments.len(),
-            self.total_size_bytes
-        )
+            self.segments.len()
+        );
+        if let Some(byte_size) = self.total_size_bytes {
+            write!(repr, ", total_size_bytes={}", byte_size).unwrap();
+        }
+        repr.push(')');
+        repr
     }
 }
 
