@@ -60,7 +60,6 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
 use serde_json::json;
-use snafu::location;
 use tracing::{info, instrument};
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
@@ -1301,10 +1300,10 @@ impl DatasetIndexInternalExt for Dataset {
         // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
         // file list (available since file sizes tracking was added). If the file list is not
         // available (older indices), we fall back to checking file existence via HEAD request.
-        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
-            message: format!("Index with id {} does not exist", uuid),
-            location: location!(),
-        })?;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
         // Check if this is a vector index by looking at the files list
         let is_vector_index = if let Some(files) = &index_meta.files {
