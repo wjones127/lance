@@ -16,7 +16,7 @@ import pyarrow as pa
 import shutil
 import os
 
-print(f"Using lance version: {lance.__version__}")
+assert lance.__version__ == "2.0.0-beta.1"
 
 # Create output directory
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "index_without_file_sizes")

@@ -598,10 +598,17 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             );
         }
 
-        // Migrate file sizes for indices that don't have them
+        // Migrate file sizes for indices that don't have them.
+        // Use indice_files_dir to handle shallow-cloned indices with base_id.
         if index.files.is_none() && !is_system_index(index) {
-            let index_dir = dataset.indices_dir().child(index.uuid.to_string());
-            match list_index_files_with_sizes(&dataset.object_store, &index_dir).await {
+            let result = async {
+                let index_dir = dataset
+                    .indice_files_dir(index)?
+                    .child(index.uuid.to_string());
+                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+            }
+            .await;
+            match result {
                 Ok(files) => {
                     log::debug!(
                         "Migrated file sizes for index {} (uuid: {}): {} files",
