@@ -31,8 +31,8 @@ use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexFile, IndexMetadata,
-    Manifest, WriterVersion, is_detached_version, pb,
+    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -600,7 +600,8 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
 
         // Migrate file sizes for indices that don't have them
         if index.files.is_none() && !is_system_index(index) {
-            match collect_index_file_sizes(dataset, index).await {
+            let index_dir = dataset.indices_dir().child(index.uuid.to_string());
+            match list_index_files_with_sizes(&dataset.object_store, &index_dir).await {
                 Ok(files) => {
                     log::debug!(
                         "Migrated file sizes for index {} (uuid: {}): {} files",
@@ -624,31 +625,6 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
     }
 
     Ok(())
-}
-
-/// Collect file sizes for an index by listing all files in its directory.
-async fn collect_index_file_sizes(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-) -> Result<Vec<IndexFile>> {
-    let index_dir = dataset.indices_dir().child(index.uuid.to_string());
-    let mut files = Vec::new();
-    let mut stream = dataset.object_store.read_dir_all(&index_dir, None);
-    while let Some(meta) = stream.next().await {
-        let meta = meta?;
-        // Get relative path by stripping the index_dir prefix
-        let relative_path = meta
-            .location
-            .as_ref()
-            .strip_prefix(index_dir.as_ref())
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
-        files.push(IndexFile {
-            path: relative_path,
-            size_bytes: meta.size,
-        });
-    }
-    Ok(files)
 }
 
 pub(crate) struct BadFragmentBitmapError {

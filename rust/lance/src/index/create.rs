@@ -438,15 +438,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: created_index.files.map(|files| {
-                files
-                    .into_iter()
-                    .map(|f| lance_table::format::IndexFile {
-                        path: f.path,
-                        size_bytes: f.size_bytes,
-                    })
-                    .collect()
-            }),
+            files: created_index.files,
         })
     }
 

@@ -299,7 +299,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    let mut created_index = plugin
+    let created_index = plugin
         .train_index(
             training_data,
             &index_store,
@@ -308,9 +308,6 @@ pub(super) async fn build_scalar_index(
             progress,
         )
         .await?;
-
-    // Capture file sizes after index creation
-    created_index.files = Some(index_store.list_files_with_sizes().await?);
 
     Ok(created_index)
 }

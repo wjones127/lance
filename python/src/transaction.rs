@@ -688,7 +688,7 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
                 value: new_details_value,
             },
             new_index_version,
-            files: None,
+            new_index_files: None,
         }))
     }
 }

@@ -153,7 +153,7 @@ impl FromJObjectWithEnv<RewrittenIndex> for JObject<'_> {
                 value: new_index_details_value,
             },
             new_index_version: new_index_version as u32,
-            files: None,
+            new_index_files: None,
         })
     }
 }

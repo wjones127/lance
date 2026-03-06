@@ -297,7 +297,7 @@ pub(crate) async fn remap_index(
         }
     };
 
-    let (created_index, files) = match generic.index_type() {
+    let created_index = match generic.index_type() {
         it if it.is_scalar() => {
             let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
 
@@ -308,7 +308,7 @@ pub(crate) async fn remap_index(
                 return Ok(RemapResult::Drop);
             }
 
-            let created = match scalar_index.index_type() {
+            match scalar_index.index_type() {
                 IndexType::Inverted => {
                     let inverted_index = scalar_index
                         .as_any()
@@ -343,11 +343,7 @@ pub(crate) async fn remap_index(
                     }
                 }
                 _ => scalar_index.remap(row_id_map, &new_store).await?,
-            };
-
-            // File sizes were captured by the remap/train operation above.
-            let files = created.files.clone();
-            (created, files)
+            }
         }
         it if it.is_vector() => {
             let index_version = u32::try_from(matched.index_version).map_err(|_| {
@@ -370,17 +366,14 @@ pub(crate) async fn remap_index(
             let index_dir = dataset.indices_dir().child(new_id.to_string());
             let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
 
-            (
-                CreatedIndex {
-                    index_details: prost_types::Any::from_msg(
-                        &lance_table::format::pb::VectorIndexDetails::default(),
-                    )
-                    .unwrap(),
-                    index_version,
-                    files: None,
-                },
-                Some(files),
-            )
+            CreatedIndex {
+                index_details: prost_types::Any::from_msg(
+                    &lance_table::format::pb::VectorIndexDetails::default(),
+                )
+                .unwrap(),
+                index_version,
+                files: Some(files),
+            }
         }
         _ => {
             return Err(Error::index(format!(
@@ -395,7 +388,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files,
+        files: created_index.files,
     }))
 }
 
