@@ -226,6 +226,29 @@ async fn index_file_batch(version: u64, base_uri: &str, paths: &[Path]) -> Resul
     builder.finish()
 }
 
+/// Progress update for [`Dataset::tracked_files_with_options`].
+#[derive(Debug, Clone)]
+pub struct TrackedFilesProgress {
+    /// Number of manifests processed so far.
+    pub manifests_processed: usize,
+    /// Total number of manifests, if known. This becomes `Some` once all
+    /// manifest locations have been listed (up to the 50k buffering limit,
+    /// or when the listing stream is exhausted).
+    pub manifests_total: Option<usize>,
+}
+
+/// Options for [`Dataset::tracked_files_with_options`].
+#[derive(Default)]
+pub struct TrackedFilesOptions {
+    /// If set, only include manifests with `version >= min_version`.
+    pub min_version: Option<u64>,
+    /// If set, called each time a manifest has been fully processed.
+    pub progress: Option<Box<dyn Fn(TrackedFilesProgress) + Send + Sync>>,
+}
+
+/// Maximum number of manifest locations to buffer for progress counting.
+const MAX_BUFFERED_LOCATIONS: usize = 50_000;
+
 impl Dataset {
     /// Returns one row per (version, file) for every file referenced in any manifest.
     ///
@@ -243,45 +266,101 @@ impl Dataset {
     ///
     /// Output order is non-deterministic.
     pub async fn tracked_files(&self) -> Result<SendableRecordBatchStream> {
+        self.tracked_files_with_options(TrackedFilesOptions::default())
+            .await
+    }
+
+    /// Like [`Self::tracked_files`], but with additional options for filtering
+    /// and progress reporting.
+    pub async fn tracked_files_with_options(
+        &self,
+        options: TrackedFilesOptions,
+    ) -> Result<SendableRecordBatchStream> {
+        use lance_table::io::commit::ManifestLocation;
+
         let base = self.base.clone();
         let uri = self.uri().to_string();
         let object_store = self.object_store.clone();
         let commit_handler = self.commit_handler.clone();
 
-        // We use 3 tasks:
+        // Pipeline architecture:
         //
-        // T1: List manifests ─────► T2: List files in Manifest
-        //       │                           │
-        //       ▼                           ▼
-        // T3: List index files ───► <File list channel>
+        // Lister ──► tx_locations ──► Reader ──┬──► tx_manifest ──► Emitter ──► tx (output)
+        //                                      └──► tx_indexes  ──► IndexLister ──► tx (output)
 
-        // Output channel: both Task 2 and Task 3 send batches here.
+        // Output channel: Emitter and IndexLister both send batches here.
         let (tx, rx) = tokio::sync::mpsc::channel::<datafusion::error::Result<RecordBatch>>(4);
-        // Manifest channel: Task 1 -> Task 2 (small buffer for backpressure
+        // Location channel: Lister -> Reader. Large buffer since locations are
+        // small (~100 bytes each) and we want the lister to run ahead.
+        let (tx_locations, mut rx_locations) =
+            tokio::sync::mpsc::channel::<ManifestLocation>(MAX_BUFFERED_LOCATIONS);
+        // Manifest channel: Reader -> Emitter (small buffer for backpressure
         // since manifests can be large).
         let (tx_manifest, mut rx_manifest) =
             tokio::sync::mpsc::channel::<(Arc<lance_table::format::Manifest>, String, usize)>(2);
-        // Index channel: Task 1 -> Task 3.
+        // Index channel: Reader -> IndexLister.
         let (tx_indexes, mut rx_indexes) =
             tokio::sync::mpsc::channel::<(u64, Vec<IndexMetadata>)>(8);
 
-        // Tracks estimated in-memory size of in-flight manifests. Task 1 adds
-        // before sending; Task 2 subtracts after processing.
+        // Tracks estimated in-memory size of in-flight manifests. Reader adds
+        // before sending; Emitter subtracts after processing.
         let inflight_mem = Arc::new(AtomicUsize::new(0));
         let mem_notify = Arc::new(tokio::sync::Notify::new());
 
-        // Task 1: Manifest Reader — reads manifests and index metadata, fans
-        // out to Task 2 (file batches) and Task 3 (index listing).
-        let tx_err = tx.clone();
-        let os1 = object_store.clone();
-        let base1 = base.clone();
-        let inflight_mem1 = inflight_mem.clone();
-        let mem_notify1 = mem_notify.clone();
+        // Progress: total is set by Lister once listing finishes, read by Emitter.
+        // Uses 0 as sentinel for "unknown".
+        let total_manifests = Arc::new(AtomicUsize::new(0));
+        let total_known = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // --- Lister task ---
+        // Lists manifest locations, applies min_version filter, and counts the
+        // total. Locations are lightweight so we buffer up to MAX_BUFFERED_LOCATIONS.
+        let tx_err_lister = tx.clone();
+        let os_lister = object_store.clone();
+        let base_lister = base.clone();
+        let total_manifests_lister = total_manifests.clone();
+        let total_known_lister = total_known.clone();
+        let min_version = options.min_version;
         tokio::spawn(async move {
             let result: lance_core::Result<()> = async {
-                let manifest_locations =
-                    commit_handler.list_manifest_locations(&base1, &os1, false);
-                let max_parallelism = os1.io_parallelism();
+                let mut locations =
+                    commit_handler.list_manifest_locations(&base_lister, &os_lister, false);
+                let mut count = 0usize;
+                while let Some(loc) = locations.next().await {
+                    let loc = loc?;
+                    if let Some(min_v) = min_version {
+                        if loc.version < min_v {
+                            continue;
+                        }
+                    }
+                    count += 1;
+                    if tx_locations.send(loc).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                total_manifests_lister.store(count, Ordering::Release);
+                total_known_lister.store(true, Ordering::Release);
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                let _ = tx_err_lister
+                    .send(Err(datafusion::error::DataFusionError::from(e)))
+                    .await;
+            }
+        });
+
+        // --- Reader task ---
+        // Reads manifests with memory-aware parallelism and fans out to
+        // Emitter (file batches) and IndexLister (index metadata).
+        let tx_err_reader = tx.clone();
+        let os_reader = object_store.clone();
+        let base_reader = base.clone();
+        let inflight_mem_reader = inflight_mem.clone();
+        let mem_notify_reader = mem_notify.clone();
+        tokio::spawn(async move {
+            let result: lance_core::Result<()> = async {
+                let max_parallelism = os_reader.io_parallelism();
 
                 type ManifestResult = lance_core::Result<(
                     Arc<lance_table::format::Manifest>,
@@ -292,15 +371,14 @@ impl Dataset {
                 let mut in_flight: FuturesUnordered<
                     std::pin::Pin<Box<dyn Future<Output = ManifestResult> + Send>>,
                 > = FuturesUnordered::new();
-                let mut locations = std::pin::pin!(manifest_locations);
                 let mut locations_exhausted = false;
 
                 loop {
-                    // Can we launch more reads?
                     let can_launch = !locations_exhausted
                         && in_flight.len() < max_parallelism
                         && (in_flight.is_empty()
-                            || inflight_mem1.load(Ordering::Acquire) < MANIFEST_MEMORY_BUDGET);
+                            || inflight_mem_reader.load(Ordering::Acquire)
+                                < MANIFEST_MEMORY_BUDGET);
 
                     if in_flight.is_empty() && !can_launch {
                         break;
@@ -325,16 +403,17 @@ impl Dataset {
                                 return Ok(());
                             }
                         }
-                        // Fetch the next location and start a read.
-                        loc_result = locations.next(), if can_launch => {
-                            match loc_result {
-                                Some(Ok(loc)) => {
+                        // Receive next location and start a read.
+                        loc = rx_locations.recv(), if can_launch => {
+                            match loc {
+                                Some(loc) => {
                                     let estimated =
-                                        loc.size.unwrap_or(0) as usize * MANIFEST_DECOMPRESSION_RATIO;
-                                    inflight_mem1.fetch_add(estimated, Ordering::AcqRel);
+                                        loc.size.unwrap_or(0) as usize
+                                            * MANIFEST_DECOMPRESSION_RATIO;
+                                    inflight_mem_reader.fetch_add(estimated, Ordering::AcqRel);
 
-                                    let os = os1.clone();
-                                    let base = base1.clone();
+                                    let os = os_reader.clone();
+                                    let base = base_reader.clone();
                                     in_flight.push(Box::pin(async move {
                                         let manifest =
                                             read_manifest(&os, &loc.path, loc.size).await?;
@@ -350,15 +429,14 @@ impl Dataset {
                                         ))
                                     }));
                                 }
-                                Some(Err(e)) => return Err(e),
                                 None => {
                                     locations_exhausted = true;
                                 }
                             }
                         }
-                        // Wake up when Task 2 frees memory so we can
-                        // re-evaluate whether to launch more reads.
-                        _ = mem_notify1.notified(), if !can_launch && !in_flight.is_empty() => {}
+                        // Wake up when Emitter frees memory.
+                        _ = mem_notify_reader.notified(),
+                            if !can_launch && !in_flight.is_empty() => {}
                     }
                 }
                 Ok(())
@@ -366,55 +444,67 @@ impl Dataset {
             .await;
 
             if let Err(e) = result {
-                let _ = tx_err
+                let _ = tx_err_reader
                     .send(Err(datafusion::error::DataFusionError::from(e)))
                     .await;
             }
-            // Dropping tx_manifest and tx_indexes signals completion to tasks 2 & 3.
         });
 
-        // Task 2: File Batch Emitter — converts manifests into file-row batches.
-        // After processing each manifest, releases its estimated memory so Task 1
-        // can read more.
-        let tx2 = tx.clone();
-        let uri2 = uri.clone();
+        // --- Emitter task ---
+        // Converts manifests into file-row batches, releases memory budget,
+        // and reports progress.
+        let tx_emitter = tx.clone();
+        let uri_emitter = uri.clone();
+        let progress_cb = options.progress;
         tokio::spawn(async move {
+            let mut processed = 0usize;
             while let Some((manifest, manifest_path, estimated)) = rx_manifest.recv().await {
-                let batches = manifest_file_batches(&manifest, &uri2, &manifest_path);
+                let batches = manifest_file_batches(&manifest, &uri_emitter, &manifest_path);
                 for batch_result in batches {
                     let df_result = batch_result.map_err(datafusion::error::DataFusionError::from);
-                    if tx2.send(df_result).await.is_err() {
+                    if tx_emitter.send(df_result).await.is_err() {
                         return;
                     }
                 }
-                // The manifest Arc may still be alive in the channel or downstream,
-                // but we're done iterating it — release memory budget.
                 drop(manifest);
                 inflight_mem.fetch_sub(estimated, Ordering::AcqRel);
                 mem_notify.notify_one();
+
+                processed += 1;
+                if let Some(ref cb) = progress_cb {
+                    let total = if total_known.load(Ordering::Acquire) {
+                        Some(total_manifests.load(Ordering::Acquire))
+                    } else {
+                        None
+                    };
+                    cb(TrackedFilesProgress {
+                        manifests_processed: processed,
+                        manifests_total: total,
+                    });
+                }
             }
         });
 
-        // Task 3: Index File Lister — lists index directories and emits index
-        // file batches.
-        let tx3 = tx;
-        let uri3 = uri;
-        let os3 = object_store;
-        let base3 = base;
+        // --- IndexLister task ---
+        // Lists index directories and emits index file batches.
+        let tx_idx = tx;
+        let uri_idx = uri;
+        let os_idx = object_store;
+        let base_idx = base;
         tokio::spawn(async move {
             let mut uuid_cache: HashMap<Uuid, Vec<object_store::ObjectMeta>> = HashMap::new();
             while let Some((version, indexes)) = rx_indexes.recv().await {
                 let uuids: Vec<Uuid> = indexes.iter().map(|idx| idx.uuid).collect();
-                match get_index_files(uuids, &base3, &os3, &mut uuid_cache).await {
+                match get_index_files(uuids, &base_idx, &os_idx, &mut uuid_cache).await {
                     Ok(index_paths) if !index_paths.is_empty() => {
-                        match index_file_batch(version, &uri3, &index_paths).await {
+                        match index_file_batch(version, &uri_idx, &index_paths).await {
                             Ok(batch) => {
-                                if tx3.send(Ok(batch)).await.is_err() {
+                                if tx_idx.send(Ok(batch)).await.is_err() {
                                     return;
                                 }
                             }
                             Err(e) => {
-                                let _ = tx3
+                                let _ = tx_idx
                                     .send(Err(datafusion::error::DataFusionError::from(e)))
                                     .await;
                                 return;
@@ -422,7 +512,7 @@ impl Dataset {
                         }
                     }
                     Err(e) => {
-                        let _ = tx3
+                        let _ = tx_idx
                             .send(Err(datafusion::error::DataFusionError::from(e)))
                             .await;
                         return;
@@ -679,6 +769,104 @@ mod tests {
             "expected 'index file' rows after vector index creation; got types: {:?}",
             types
         );
+    }
+
+    fn collect_versions(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column_by_name("version")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap();
+                (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_tracked_files_min_version() {
+        let uri = "memory://test_tracked_files_min_version";
+
+        // Create 3 versions.
+        let mut ds = Dataset::write(make_simple_batch(), uri, None)
+            .await
+            .unwrap();
+        ds.append(make_simple_batch(), None).await.unwrap();
+        ds.append(make_simple_batch(), None).await.unwrap();
+
+        // Without filter: should have rows from versions 1, 2, 3.
+        let stream = ds.tracked_files().await.unwrap();
+        let all_batches = collect_rows(stream).await;
+        let all_versions: HashSet<i64> = collect_versions(&all_batches).into_iter().collect();
+        assert!(all_versions.contains(&1));
+        assert!(all_versions.contains(&2));
+        assert!(all_versions.contains(&3));
+
+        // With min_version=3: should only have version 3.
+        let stream = ds
+            .tracked_files_with_options(TrackedFilesOptions {
+                min_version: Some(3),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let filtered_batches = collect_rows(stream).await;
+        let filtered_versions: HashSet<i64> =
+            collect_versions(&filtered_batches).into_iter().collect();
+        assert_eq!(filtered_versions, HashSet::from([3]));
+
+        // With min_version=2: should have versions 2 and 3.
+        let stream = ds
+            .tracked_files_with_options(TrackedFilesOptions {
+                min_version: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let filtered_batches = collect_rows(stream).await;
+        let filtered_versions: HashSet<i64> =
+            collect_versions(&filtered_batches).into_iter().collect();
+        assert_eq!(filtered_versions, HashSet::from([2, 3]));
+    }
+
+    #[tokio::test]
+    async fn test_tracked_files_progress() {
+        let uri = "memory://test_tracked_files_progress";
+
+        let mut ds = Dataset::write(make_simple_batch(), uri, None)
+            .await
+            .unwrap();
+        ds.append(make_simple_batch(), None).await.unwrap();
+        ds.append(make_simple_batch(), None).await.unwrap();
+
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+
+        let stream = ds
+            .tracked_files_with_options(TrackedFilesOptions {
+                progress: Some(Box::new(move |p| {
+                    updates_clone.lock().unwrap().push(p);
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Consume the full stream to drive all tasks to completion.
+        let _batches = collect_rows(stream).await;
+
+        let updates = updates.lock().unwrap();
+        // Should have exactly 3 progress updates (one per manifest).
+        assert_eq!(updates.len(), 3, "expected 3 progress updates");
+        // Processed counts should be monotonically increasing.
+        for (i, u) in updates.iter().enumerate() {
+            assert_eq!(u.manifests_processed, i + 1);
+        }
+        // The last update should know the total.
+        let last = updates.last().unwrap();
+        assert_eq!(last.manifests_total, Some(3));
     }
 
     #[tokio::test]

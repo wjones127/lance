@@ -2428,9 +2428,41 @@ impl Dataset {
         Ok(PyArrowType(reader))
     }
 
-    fn tracked_files(&self) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+    #[pyo3(signature = (*, min_version=None, progress=None))]
+    fn tracked_files(
+        &self,
+        min_version: Option<u64>,
+        progress: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::dataset::files::{TrackedFilesOptions, TrackedFilesProgress};
+
+        let progress_cb: Option<Box<dyn Fn(TrackedFilesProgress) + Send + Sync>> =
+            if let Some(cb) = progress {
+                if !cb.is_callable() {
+                    return Err(PyValueError::new_err("progress must be callable"));
+                }
+                let cb = cb.clone().unbind();
+                Some(Box::new(move |p: TrackedFilesProgress| {
+                    Python::attach(|py| {
+                        let total: Option<usize> = p.manifests_total;
+                        match cb.call1(py, (p.manifests_processed, total)) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                log::error!("Error in tracked_files progress callback: {}", e);
+                            }
+                        }
+                    });
+                }))
+            } else {
+                None
+            };
+
+        let options = TrackedFilesOptions {
+            min_version,
+            progress: progress_cb,
+        };
         let stream = rt()
-            .block_on(None, self.ds.tracked_files())?
+            .block_on(None, self.ds.tracked_files_with_options(options))?
             .infer_error()?;
         let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
             stream,
