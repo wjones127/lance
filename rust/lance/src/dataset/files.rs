@@ -17,7 +17,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
 use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Future, StreamExt, TryStreamExt};
 use lance_table::format::IndexMetadata;
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
@@ -283,73 +283,82 @@ impl Dataset {
                     commit_handler.list_manifest_locations(&base1, &os1, false);
                 let max_parallelism = os1.io_parallelism();
 
-                let mut in_flight = FuturesUnordered::new();
+                type ManifestResult = lance_core::Result<(
+                    Arc<lance_table::format::Manifest>,
+                    String,
+                    Vec<IndexMetadata>,
+                    usize,
+                )>;
+                let mut in_flight: FuturesUnordered<
+                    std::pin::Pin<Box<dyn Future<Output = ManifestResult> + Send>>,
+                > = FuturesUnordered::new();
                 let mut locations = std::pin::pin!(manifest_locations);
                 let mut locations_exhausted = false;
 
                 loop {
-                    // Try to launch new reads while under budget and parallelism limit.
-                    while !locations_exhausted && in_flight.len() < max_parallelism {
-                        let current_mem = inflight_mem1.load(Ordering::Acquire);
-                        // Allow at least 1 in-flight read even if over budget,
-                        // so we always make forward progress.
-                        if !in_flight.is_empty() && current_mem >= MANIFEST_MEMORY_BUDGET {
-                            break;
-                        }
+                    // Can we launch more reads?
+                    let can_launch = !locations_exhausted
+                        && in_flight.len() < max_parallelism
+                        && (in_flight.is_empty()
+                            || inflight_mem1.load(Ordering::Acquire) < MANIFEST_MEMORY_BUDGET);
 
-                        match locations.next().await {
-                            Some(Ok(loc)) => {
-                                let estimated =
-                                    loc.size.unwrap_or(0) as usize * MANIFEST_DECOMPRESSION_RATIO;
-                                inflight_mem1.fetch_add(estimated, Ordering::AcqRel);
-
-                                let os = os1.clone();
-                                let base = base1.clone();
-                                in_flight.push(async move {
-                                    let manifest = read_manifest(&os, &loc.path, loc.size).await?;
-                                    let indexes =
-                                        read_manifest_indexes(&os, &loc, &manifest).await?;
-                                    let manifest_path = remove_prefix(&loc.path, &base).to_string();
-                                    lance_core::Result::Ok((
-                                        Arc::new(manifest),
-                                        manifest_path,
-                                        indexes,
-                                        estimated,
-                                    ))
-                                });
-                            }
-                            Some(Err(e)) => return Err(e),
-                            None => {
-                                locations_exhausted = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if in_flight.is_empty() {
+                    if in_flight.is_empty() && !can_launch {
                         break;
                     }
 
-                    // Wait for the next completed read, or a memory-freed
-                    // notification so we can try launching more.
-                    let item = tokio::select! {
+                    tokio::select! {
                         biased;
-                        item = in_flight.next() => item,
-                        _ = mem_notify1.notified() => continue,
-                    };
+                        // Always drain completed reads first.
+                        Some(item) = in_flight.next(), if !in_flight.is_empty() => {
+                            let (manifest, manifest_path, indexes, estimated) = item?;
+                            let version = manifest.version;
+                            if tx_manifest
+                                .send((manifest, manifest_path, estimated))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                            if !indexes.is_empty()
+                                && tx_indexes.send((version, indexes)).await.is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        // Fetch the next location and start a read.
+                        loc_result = locations.next(), if can_launch => {
+                            match loc_result {
+                                Some(Ok(loc)) => {
+                                    let estimated =
+                                        loc.size.unwrap_or(0) as usize * MANIFEST_DECOMPRESSION_RATIO;
+                                    inflight_mem1.fetch_add(estimated, Ordering::AcqRel);
 
-                    let Some(item) = item else { break };
-                    let (manifest, manifest_path, indexes, estimated) = item?;
-                    let version = manifest.version;
-                    if tx_manifest
-                        .send((manifest, manifest_path, estimated))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                    if !indexes.is_empty() && tx_indexes.send((version, indexes)).await.is_err() {
-                        return Ok(());
+                                    let os = os1.clone();
+                                    let base = base1.clone();
+                                    in_flight.push(Box::pin(async move {
+                                        let manifest =
+                                            read_manifest(&os, &loc.path, loc.size).await?;
+                                        let indexes =
+                                            read_manifest_indexes(&os, &loc, &manifest).await?;
+                                        let manifest_path =
+                                            remove_prefix(&loc.path, &base).to_string();
+                                        lance_core::Result::Ok((
+                                            Arc::new(manifest),
+                                            manifest_path,
+                                            indexes,
+                                            estimated,
+                                        ))
+                                    }));
+                                }
+                                Some(Err(e)) => return Err(e),
+                                None => {
+                                    locations_exhausted = true;
+                                }
+                            }
+                        }
+                        // Wake up when Task 2 frees memory so we can
+                        // re-evaluate whether to launch more reads.
+                        _ = mem_notify1.notified(), if !can_launch && !in_flight.is_empty() => {}
                     }
                 }
                 Ok(())
