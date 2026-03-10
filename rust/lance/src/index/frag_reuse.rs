@@ -9,6 +9,7 @@ use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndex,
     FragReuseIndexDetails, FragReuseVersion,
 };
+use lance_io::traits::Writer;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -147,7 +148,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         writer
             .write_all(new_index_details_proto.encode_to_vec().as_slice())
             .await?;
-        writer.shutdown().await?;
+        Writer::shutdown(writer.as_mut()).await?;
         let external_file = ExternalFile {
             path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
             offset: 0,
