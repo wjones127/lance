@@ -33,7 +33,7 @@ pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::expression::{
     IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
-use lance_index::scalar::inverted::InvertedIndexPlugin;
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, ScalarIndex};
@@ -83,7 +83,7 @@ use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_in
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
+use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, InvertedIndexDataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 
@@ -1337,6 +1337,31 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+
+        // Try to rehydrate from cached data-only representation (zero IO)
+        let data_key = InvertedIndexDataKey {
+            uuid,
+            fri_uuid: frag_reuse_uuid.as_ref(),
+        };
+        if let Some(data) = self.index_cache.get_with_key(&data_key).await {
+            let index_meta = self
+                .load_index(uuid)
+                .await?
+                .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+            let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(
+                self,
+                &index_meta,
+            )?);
+            let uuid_str = uuid.to_string();
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+            let index_cache = self
+                .index_cache
+                .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
+            let index = InvertedIndex::from_data(&data, index_store, &index_cache)?;
+            return Ok(index as Arc<dyn ScalarIndex>);
+        }
+
+        // Fall back to the existing ScalarIndexCacheKey (full index objects)
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
             return Ok(index);
@@ -1352,6 +1377,15 @@ impl DatasetIndexInternalExt for Dataset {
         info!(target: TRACE_IO_EVENTS, index_uuid=uuid, r#type=IO_TYPE_OPEN_SCALAR, index_type=index.index_type().to_string());
         metrics.record_index_load();
 
+        // If this is an FTS index, extract and cache the data-only representation
+        if let Some(inverted) = index.as_any().downcast_ref::<InvertedIndex>() {
+            let index_data = inverted.to_data();
+            self.index_cache
+                .insert_with_key(&data_key, Arc::new(index_data))
+                .await;
+        }
+
+        // Also cache the full index for the current session
         self.index_cache
             .insert_unsized_with_key(&cache_key, index.clone())
             .await;

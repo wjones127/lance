@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf};
@@ -94,6 +95,15 @@ pub struct InvertedIndexParams {
     /// This can be useful for distributed indexing where merge is handled separately.
     #[serde(default)]
     pub(crate) skip_merge: bool,
+}
+
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.lance_tokenizer.deep_size_of_children(context)
+            + self.base_tokenizer.deep_size_of_children(context)
+            // Language is a simple enum, no heap allocation
+            + self.custom_stop_words.deep_size_of_children(context)
+    }
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {

@@ -10,6 +10,8 @@ use std::{
 };
 use std::{collections::HashMap, ops::Range, time::Instant};
 
+use tokio::sync::OnceCell;
+
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -162,6 +164,53 @@ impl FromStr for TokenSetFormat {
 impl DeepSizeOf for TokenSetFormat {
     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
         0
+    }
+}
+
+/// Data-only representation of [`PostingListReader`] metadata.
+///
+/// Contains all the metadata needed to reconstruct a [`PostingListReader`]
+/// without holding any IO-bound state (readers, caches).
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct PostingListData {
+    file_path: String,
+    offsets: Option<Vec<usize>>,
+    max_scores: Option<Vec<f32>>,
+    lengths: Option<Vec<u32>>,
+    has_position: bool,
+    num_rows: usize,
+}
+
+/// Data-only representation of an [`InvertedPartition`].
+///
+/// Contains all the data needed to reconstruct an [`InvertedPartition`]
+/// without holding any IO-bound state (stores, readers, caches).
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct InvertedPartitionData {
+    id: u64,
+    pub(crate) tokens: TokenSet,
+    pub(crate) docs: DocSet,
+    pub(crate) posting_list_data: PostingListData,
+    token_set_format: TokenSetFormat,
+}
+
+/// Data-only representation of an [`InvertedIndex`].
+///
+/// This is the cache-friendly representation that contains no IO-bound state
+/// (no readers, stores, or schedulers). It can be stored in the index cache
+/// and rehydrated into a live [`InvertedIndex`] with fresh IO resources.
+#[derive(Debug, Clone)]
+pub struct InvertedIndexData {
+    pub(crate) params: InvertedIndexParams,
+    pub(crate) token_set_format: TokenSetFormat,
+    pub(crate) partitions: Vec<InvertedPartitionData>,
+}
+
+impl DeepSizeOf for InvertedIndexData {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.params.deep_size_of_children(context)
+            + self.token_set_format.deep_size_of_children(context)
+            + self.partitions.deep_size_of_children(context)
     }
 }
 
@@ -376,9 +425,12 @@ impl InvertedIndex {
             let store = store.clone();
             let index_cache_clone = index_cache.clone();
             async move {
-                let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list =
-                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
+                let invert_list = PostingListReader::try_new(
+                    store,
+                    INVERT_LIST_FILE.to_string(),
+                    &index_cache_clone,
+                )
+                .await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -490,6 +542,46 @@ impl InvertedIndex {
                 Self::load_legacy_index(store, frag_reuse_index, index_cache).await
             }
         }
+    }
+
+    /// Extract a data-only representation suitable for caching.
+    ///
+    /// The returned [`InvertedIndexData`] contains no IO-bound state and can
+    /// be cheaply stored in the index cache with accurate `DeepSizeOf` reporting.
+    pub fn to_data(&self) -> InvertedIndexData {
+        InvertedIndexData {
+            params: self.params.clone(),
+            token_set_format: self.token_set_format,
+            partitions: self.partitions.iter().map(|p| p.to_data()).collect(),
+        }
+    }
+
+    /// Rehydrate a live index from cached data with fresh IO resources.
+    ///
+    /// This performs zero IO — the store and cache are attached but not used
+    /// until a query actually needs to read posting lists.
+    pub fn from_data(
+        data: &InvertedIndexData,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        let tokenizer = data.params.build()?;
+        let partitions = data
+            .partitions
+            .iter()
+            .map(|pd| {
+                let part_cache = index_cache.with_key_prefix(&format!("part-{}", pd.id));
+                Arc::new(InvertedPartition::from_data(pd, store.clone(), &part_cache))
+            })
+            .collect();
+
+        Ok(Arc::new(Self {
+            params: data.params.clone(),
+            store,
+            tokenizer,
+            token_set_format: data.token_set_format,
+            partitions,
+        }))
     }
 }
 
@@ -723,8 +815,8 @@ impl InvertedPartition {
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let inverted_list =
+            PostingListReader::try_new(store.clone(), posting_file_path(id), index_cache).await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
 
@@ -736,6 +828,38 @@ impl InvertedPartition {
             docs,
             token_set_format,
         })
+    }
+
+    /// Extract a data-only representation for caching.
+    fn to_data(&self) -> InvertedPartitionData {
+        InvertedPartitionData {
+            id: self.id,
+            tokens: self.tokens.clone(),
+            docs: self.docs.clone(),
+            posting_list_data: self.inverted_list.to_data(),
+            token_set_format: self.token_set_format,
+        }
+    }
+
+    /// Reconstruct a partition from cached data with fresh IO resources.
+    /// Performs zero IO — the reader is lazily opened on first use.
+    fn from_data(
+        data: &InvertedPartitionData,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+    ) -> Self {
+        Self {
+            id: data.id,
+            store: store.clone(),
+            tokens: data.tokens.clone(),
+            inverted_list: Arc::new(PostingListReader::from_data(
+                &data.posting_list_data,
+                store,
+                index_cache,
+            )),
+            docs: data.docs.clone(),
+            token_set_format: data.token_set_format,
+        }
     }
 
     fn map(&self, token: &str) -> Option<u32> {
@@ -1208,7 +1332,10 @@ impl TokenSet {
 }
 
 pub struct PostingListReader {
-    reader: Arc<dyn IndexReader>,
+    reader: OnceCell<Arc<dyn IndexReader>>,
+    // Store + file path for lazily opening the reader on first use
+    store: Arc<dyn IndexStore>,
+    file_path: String,
 
     // legacy format only
     offsets: Option<Vec<usize>>,
@@ -1221,6 +1348,8 @@ pub struct PostingListReader {
     lengths: Option<Vec<u32>>,
 
     has_position: bool,
+
+    num_rows: usize,
 
     index_cache: WeakLanceCache,
 }
@@ -1243,11 +1372,21 @@ impl DeepSizeOf for PostingListReader {
 }
 
 impl PostingListReader {
+    /// Get the reader, opening the file lazily if needed.
+    async fn reader(&self) -> Result<&Arc<dyn IndexReader>> {
+        self.reader
+            .get_or_try_init(|| async { self.store.open_index_file(&self.file_path).await })
+            .await
+    }
+
     pub(crate) async fn try_new(
-        reader: Arc<dyn IndexReader>,
+        store: Arc<dyn IndexStore>,
+        file_path: String,
         index_cache: &LanceCache,
     ) -> Result<Self> {
+        let reader = store.open_index_file(&file_path).await?;
         let has_position = reader.schema().field(POSITION_COL).is_some();
+        let num_rows = reader.num_rows();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
             let (offsets, max_scores) = Self::load_metadata(reader.schema())?;
             (Some(offsets), max_scores, None)
@@ -1266,14 +1405,53 @@ impl PostingListReader {
             (None, Some(max_scores), Some(lengths))
         };
 
+        let once = OnceCell::new();
+        // Safety: cell is freshly created, set cannot fail
+        let _ = once.set(reader);
+
         Ok(Self {
-            reader,
+            reader: once,
+            store,
+            file_path,
             offsets,
             max_scores,
             lengths,
             has_position,
+            num_rows,
             index_cache: WeakLanceCache::from(index_cache),
         })
+    }
+
+    /// Extract a data-only representation for caching.
+    fn to_data(&self) -> PostingListData {
+        PostingListData {
+            file_path: self.file_path.clone(),
+            offsets: self.offsets.clone(),
+            max_scores: self.max_scores.clone(),
+            lengths: self.lengths.clone(),
+            has_position: self.has_position,
+            num_rows: self.num_rows,
+        }
+    }
+
+    /// Reconstruct from cached data with fresh IO resources.
+    /// The reader is NOT opened here — it will be lazily opened on first use.
+    fn from_data(
+        data: &PostingListData,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+    ) -> Self {
+        Self {
+            reader: OnceCell::new(),
+            store,
+            file_path: data.file_path.clone(),
+            offsets: data.offsets.clone(),
+            max_scores: data.max_scores.clone(),
+            lengths: data.lengths.clone(),
+            has_position: data.has_position,
+            num_rows: data.num_rows,
+            index_cache: WeakLanceCache::from(index_cache),
+        }
     }
 
     // for legacy format
@@ -1299,7 +1477,7 @@ impl PostingListReader {
     pub fn len(&self) -> usize {
         match self.offsets {
             Some(ref offsets) => offsets.len(),
-            None => self.reader.num_rows(),
+            None => self.num_rows,
         }
     }
 
@@ -1316,10 +1494,7 @@ impl PostingListReader {
 
         match self.offsets {
             Some(ref offsets) => {
-                let next_offset = offsets
-                    .get(token_id + 1)
-                    .copied()
-                    .unwrap_or(self.reader.num_rows());
+                let next_offset = offsets.get(token_id + 1).copied().unwrap_or(self.num_rows);
                 next_offset - offsets[token_id]
             }
             None => {
@@ -1346,8 +1521,8 @@ impl PostingListReader {
             } else {
                 vec![POSTING_COL]
             };
-            let batch = self
-                .reader
+            let reader = self.reader().await?;
+            let batch = reader
                 .read_range(token_id..token_id + 1, Some(&columns))
                 .await?;
             Ok(batch)
@@ -1367,8 +1542,8 @@ impl PostingListReader {
         let length = self.posting_len(token_id);
         let token_id = token_id as usize;
         let offset = self.offsets.as_ref().unwrap()[token_id];
-        let batch = self
-            .reader
+        let reader = self.reader().await?;
+        let batch = reader
             .read_range(offset..offset + length, Some(&columns))
             .await?;
         Ok(batch)
@@ -1506,10 +1681,8 @@ impl PostingListReader {
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
         let columns = self.posting_columns(with_position);
-        let batch = self
-            .reader
-            .read_range(0..self.reader.num_rows(), Some(&columns))
-            .await?;
+        let reader = self.reader().await?;
+        let batch = reader.read_range(0..self.num_rows, Some(&columns)).await?;
         Ok(batch)
     }
 
@@ -1528,8 +1701,8 @@ impl PostingListReader {
 
     async fn read_positions(&self, token_id: u32) -> Result<ListArray> {
         let positions = self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
-            let batch = self
-                .reader
+            let reader = self.reader().await?;
+            let batch = reader
                 .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                 .await.map_err(|e| {
                     match e {

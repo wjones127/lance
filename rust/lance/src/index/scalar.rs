@@ -1829,4 +1829,93 @@ mod tests {
             "Should have 0 rows with value='banana' after deletion"
         );
     }
+
+    #[tokio::test]
+    async fn test_fts_rehydration_from_cached_data() {
+        use crate::dataset::Dataset;
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::session::Session;
+        use lance_datagen::{BatchCount, ByteCount, RowCount, array};
+        use lance_index::DatasetIndexExt;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use lance_io::assert_io_eq;
+        use std::sync::Arc;
+
+        let session = Arc::new(Session::default());
+        let uri = "memory://test_fts_rehydration";
+
+        // Create dataset with text column and FTS index
+        let reader = lance_datagen::gen_batch()
+            .col("text", array::rand_utf8(ByteCount::from(50), false))
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(crate::dataset::WriteParams {
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Re-open dataset to get updated metadata
+        let dataset = DatasetBuilder::from_uri(uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index_uuid = indices
+            .iter()
+            .find(|idx| idx.name == "text_fts")
+            .unwrap()
+            .uuid
+            .to_string();
+
+        // First open: loads from disk and caches the data-only representation
+        let _index = dataset
+            .open_scalar_index("text", &index_uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Reset IO stats
+        let _ = dataset.object_store().io_stats_incremental();
+
+        // Second open on a fresh dataset (no full-index cache, but data cache persists)
+        // Re-open dataset so the ScalarIndexCacheKey won't hit (different dataset instance)
+        let dataset2 = DatasetBuilder::from_uri(uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let _ = dataset2.object_store().io_stats_incremental(); // reset after manifest load
+
+        let _index2 = dataset2
+            .open_scalar_index("text", &index_uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Rehydration from InvertedIndexData should NOT read any index files.
+        // The only IO should be from load_index() which reads manifest metadata,
+        // but since we share a session, the manifest is already cached.
+        // We do need to create a LanceIndexStore, which doesn't do IO.
+        let io_stats = dataset2.object_store().io_stats_incremental();
+        assert_io_eq!(io_stats, read_iops, 0);
+    }
 }

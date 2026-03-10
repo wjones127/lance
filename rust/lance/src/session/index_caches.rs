@@ -15,6 +15,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::scalar::inverted::InvertedIndexData;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -127,5 +128,27 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("type/{}", self.uuid))
+    }
+}
+
+/// Cache key for data-only FTS index representation.
+///
+/// Keyed by `(index_uuid, fri_uuid)` since the cached data contains
+/// FRI-remapped row IDs and is specific to a particular FRI state.
+#[derive(Debug)]
+pub struct InvertedIndexDataKey<'a> {
+    pub uuid: &'a str,
+    pub fri_uuid: Option<&'a Uuid>,
+}
+
+impl CacheKey for InvertedIndexDataKey<'_> {
+    type ValueType = InvertedIndexData;
+
+    fn key(&self) -> Cow<'_, str> {
+        if let Some(fri_uuid) = self.fri_uuid {
+            format!("fts-data/{}-{}", self.uuid, fri_uuid).into()
+        } else {
+            format!("fts-data/{}", self.uuid).into()
+        }
     }
 }
