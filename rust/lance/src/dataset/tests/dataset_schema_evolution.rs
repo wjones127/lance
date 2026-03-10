@@ -563,10 +563,6 @@ async fn prepare_initial_dataset_with_list_struct_col(version: LanceFileVersion)
 /// — causing `ArrayData::try_new` to panic.
 #[tokio::test]
 async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
-    use lance_core::utils::tempfile::TempStrDir;
-
-    let test_uri = TempStrDir::default();
-
     // Fragment 0: struct column with an `extra` sub-field of DataType::Null.
     // This simulates a user inserting rows from Python/pandas where `extra` is all None.
     let meta0 = StructArray::new(
@@ -593,9 +589,9 @@ async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
     )
     .unwrap();
 
-    Dataset::write(
+    let mut ds = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch0)], schema0),
-        &test_uri,
+        "memory://",
         Some(WriteParams::default()),
     )
     .await
@@ -622,9 +618,8 @@ async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
     )
     .unwrap();
 
-    Dataset::write(
+    ds.append(
         RecordBatchIterator::new(vec![Ok(batch1)], schema1),
-        &test_uri,
         Some(WriteParams {
             mode: WriteMode::Append,
             ..Default::default()
@@ -633,14 +628,12 @@ async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
     .await
     .unwrap();
 
-    let dataset = Dataset::open(&test_uri).await.unwrap();
-
     // Scanning reads both fragments. Fragment 1 is missing `meta.extra: Null`, so Lance adds
     // a NullReader for it. MergeStream merges the real batch (with null struct rows) and the
     // NullReader batch (all-null `meta` struct). The recursive merge in `merge()` descends into
     // `meta`, where `right_validity` (from the all-null NullReader struct) has non-zero null
     // count and the child column has DataType::Null — previously panicked:
     // "Arrays of type Null cannot contain a null bitmask".
-    let result = dataset.scan().try_into_batch().await.unwrap();
+    let result = ds.scan().try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), 4);
 }

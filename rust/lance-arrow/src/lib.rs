@@ -1565,7 +1565,7 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float32Array, Int32Array, StructArray};
+    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
     use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
 
@@ -1997,8 +1997,6 @@ mod tests {
         // Reproduces ENT-990: panic in adjust_child_validity when a Null-typed column
         // exists on one side and the parent struct has null rows.
         // Arrow's Null type has no null bitmap, so passing one to ArrayData::try_new panics.
-        use arrow_array::NullArray;
-
         let left_struct = StructArray::new(
             Fields::from(vec![Field::new("a", DataType::Int32, true)]),
             vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
