@@ -191,6 +191,10 @@ impl Session {
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }
+
+    pub async fn index_cache_entries(&self) -> Vec<(String, usize)> {
+        self.index_cache.0.debug_cache_entries().await.collect()
+    }
 }
 
 impl Default for Session {

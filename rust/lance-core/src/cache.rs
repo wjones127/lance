@@ -268,6 +268,15 @@ impl LanceCache {
         }
     }
 
+    pub async fn debug_cache_entries(&self) -> impl Iterator<Item = (String, usize)> + Send + '_ {
+        self.cache.run_pending_tasks().await;
+        let iter = self
+            .cache
+            .iter()
+            .map(|(key, value)| (key.0.clone(), (value.size_accessor)(&value.record)));
+        Box::new(iter)
+    }
+
     pub async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
