@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use pyo3::{pyclass, pymethods};
+use pyo3::{
+    Bound, Python, pyclass, pymethods,
+    types::{PyDict, PyDictMethods},
+};
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
@@ -66,5 +69,40 @@ impl Session {
     /// Return whether the other session is the same as this one.
     pub fn is_same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Return a list of (key, size_bytes) tuples for each entry in the index cache.
+    pub fn index_cache_entries(&self) -> Vec<(String, usize)> {
+        let inner = self.inner.clone();
+        rt().block_on(None, inner.index_cache_entries())
+            .unwrap_or_default()
+    }
+
+    /// Return cache statistics for the index cache.
+    pub fn index_cache_stats<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        let inner = self.inner.clone();
+        let stats = rt()
+            .block_on(None, inner.index_cache_stats())
+            .expect("Failed to get index cache stats");
+        let dict = PyDict::new(py);
+        dict.set_item("hits", stats.hits).unwrap();
+        dict.set_item("misses", stats.misses).unwrap();
+        dict.set_item("num_entries", stats.num_entries).unwrap();
+        dict.set_item("size_bytes", stats.size_bytes).unwrap();
+        dict
+    }
+
+    /// Return cache statistics for the metadata cache.
+    pub fn metadata_cache_stats<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        let inner = self.inner.clone();
+        let stats = rt()
+            .block_on(None, inner.metadata_cache_stats())
+            .expect("Failed to get metadata cache stats");
+        let dict = PyDict::new(py);
+        dict.set_item("hits", stats.hits).unwrap();
+        dict.set_item("misses", stats.misses).unwrap();
+        dict.set_item("num_entries", stats.num_entries).unwrap();
+        dict.set_item("size_bytes", stats.size_bytes).unwrap();
+        dict
     }
 }
