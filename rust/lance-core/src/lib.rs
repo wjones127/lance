@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 pub mod cache;
 pub mod container;
 pub mod datatypes;
+pub mod deepsize;
 pub mod error;
 pub mod levenshtein;
 pub mod traits;

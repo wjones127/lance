@@ -4011,6 +4011,7 @@ version = "4.0.0-beta.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-data",
  "arrow-schema",
  "async-trait",
  "byteorder",
