@@ -3419,18 +3419,23 @@ impl Scanner {
         let matching_index = if let Some(index) =
             indices.iter().find(|i| i.fields.contains(&column_id))
         {
-            // TODO: Once we do https://github.com/lance-format/lance/issues/5231, we
-            // should be able to get the metric type directly from the index metadata,
-            // at least for newer indexes.
-            let idx = self
-                .dataset
-                .open_vector_index(
-                    q.column.as_str(),
-                    &index.uuid.to_string(),
-                    &NoOpMetricsCollector,
-                )
-                .await?;
-            let index_metric = idx.metric_type();
+            // Try to get metric type from index metadata first (fast path for newer indices)
+            let index_metric = if let Some(metric) =
+                crate::index::vector::details::metric_type_from_index_metadata(index)
+            {
+                metric
+            } else {
+                // Fall back to opening the index for legacy indices without details
+                let idx = self
+                    .dataset
+                    .open_vector_index(
+                        q.column.as_str(),
+                        &index.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                idx.metric_type()
+            };
 
             // Check if user's requested metric is compatible with index
             let use_this_index = match q.metric_type {
@@ -3450,7 +3455,7 @@ impl Scanner {
             };
 
             if use_this_index {
-                Some((index, idx, index_metric))
+                Some((index, index_metric))
             } else {
                 None
             }
@@ -3459,7 +3464,7 @@ impl Scanner {
         };
 
         // Only return index and deltas if there is an index on the column and at least one of the target fragments are indexed
-        let index_and_deltas = if let Some((index, _idx, index_metric)) = matching_index {
+        let index_and_deltas = if let Some((index, index_metric)) = matching_index {
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
             let index_frags = self.get_indexed_frags(&deltas);
             if !index_frags.is_empty() {

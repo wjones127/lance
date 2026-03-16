@@ -21,6 +21,7 @@ use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
+use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use serde::Serialize;
 
@@ -113,6 +114,33 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
 pub fn vector_index_details_default() -> prost_types::Any {
     let details = lance_index::pb::VectorIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
+}
+
+/// Extract metric type from index metadata without opening the index file.
+///
+/// For newer indices with populated `VectorIndexDetails`, returns the metric type directly.
+/// For legacy indices without details, returns `None` and caller should fall back to opening the index.
+///
+/// # Arguments
+/// * `index` - The index metadata containing serialized VectorIndexDetails
+///
+/// # Returns
+/// * `Some(DistanceType)` if details are present and valid
+/// * `None` if details are absent or empty (legacy index without details)
+pub fn metric_type_from_index_metadata(index: &IndexMetadata) -> Option<DistanceType> {
+    let index_details = index.index_details.as_ref()?;
+
+    // Empty value bytes indicates legacy index that needs to be opened for details
+    if index_details.value.is_empty() {
+        return None;
+    }
+
+    let details = index_details.to_msg::<VectorIndexDetails>().ok()?;
+
+    // Try to convert the metric_type field. This works even if metric_type is 0 (L2),
+    // since L2 is a valid metric type.
+    let metric_enum = VectorMetricType::try_from(details.metric_type).ok()?;
+    Some(DistanceType::from(metric_enum))
 }
 
 /// Returns true if the proto value represents a "truly empty" VectorIndexDetails
@@ -586,5 +614,115 @@ mod tests {
     fn test_json_empty_details() {
         let details = vector_index_details_default();
         assert_eq!(vector_details_as_json(&details).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_metric_type_from_index_metadata_populated() {
+        // Test that populated details return the metric type.
+        // Note: We add a non-default compression field so the proto doesn't serialize to empty bytes.
+        let details = make_details(
+            VectorMetricType::L2,
+            None,
+            Some(Compression::Pq(ProductQuantization {
+                num_bits: 8,
+                num_sub_vectors: 16,
+            })),
+        );
+        let index_details = Some(std::sync::Arc::new(details));
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            name: "test_index".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        };
+
+        let metric = metric_type_from_index_metadata(&index);
+        assert_eq!(metric, Some(DistanceType::L2));
+    }
+
+    #[test]
+    fn test_metric_type_from_index_metadata_empty() {
+        // Test that empty details return None (legacy index)
+        let details = vector_index_details_default();
+        let index_details = Some(std::sync::Arc::new(details));
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            name: "test_index".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        };
+
+        let metric = metric_type_from_index_metadata(&index);
+        assert_eq!(metric, None);
+    }
+
+    #[test]
+    fn test_metric_type_from_index_metadata_none() {
+        // Test that missing details return None
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            name: "test_index".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+        };
+
+        let metric = metric_type_from_index_metadata(&index);
+        assert_eq!(metric, None);
+    }
+
+    #[test]
+    fn test_metric_type_from_index_metadata_all_metrics() {
+        // Test all supported metric types.
+        // Note: We add a non-default compression field so the proto doesn't serialize to empty bytes.
+        let metrics = [
+            VectorMetricType::L2,
+            VectorMetricType::Cosine,
+            VectorMetricType::Dot,
+            VectorMetricType::Hamming,
+        ];
+        let expected = [
+            DistanceType::L2,
+            DistanceType::Cosine,
+            DistanceType::Dot,
+            DistanceType::Hamming,
+        ];
+
+        for (metric_enum, expected_distance) in metrics.iter().zip(expected.iter()) {
+            let details = make_details(
+                *metric_enum,
+                None,
+                Some(Compression::Sq(ScalarQuantization { num_bits: 8 })),
+            );
+            let index_details = Some(std::sync::Arc::new(details));
+            let index = IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                fields: vec![0],
+                name: "test_index".to_string(),
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details,
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+            };
+
+            let metric = metric_type_from_index_metadata(&index);
+            assert_eq!(metric, Some(*expected_distance));
+        }
     }
 }
