@@ -30,12 +30,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::mask::{RowAddrMask, RowAddrTreeMap};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
@@ -160,7 +160,7 @@ impl FromStr for TokenSetFormat {
 }
 
 impl DeepSizeOf for TokenSetFormat {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }
@@ -185,7 +185,7 @@ impl Debug for InvertedIndex {
 }
 
 impl DeepSizeOf for InvertedIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.partitions.deep_size_of_children(context)
     }
 }
@@ -894,7 +894,7 @@ impl Default for TokenMap {
 }
 
 impl DeepSizeOf for TokenMap {
-    fn deep_size_of_children(&self, ctx: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::HashMap(map) => map.deep_size_of_children(ctx),
             Self::Fst(map) => map.as_fst().size(),
@@ -1235,7 +1235,7 @@ impl std::fmt::Debug for PostingListReader {
 }
 
 impl DeepSizeOf for PostingListReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.offsets.deep_size_of_children(context)
             + self.max_scores.deep_size_of_children(context)
             + self.lengths.deep_size_of_children(context)
@@ -1576,7 +1576,7 @@ impl PostingListReader {
 pub struct Positions(ListArray);
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.0.get_buffer_memory_size()
     }
 }
@@ -1734,7 +1734,7 @@ pub struct PlainPostingList {
 }
 
 impl DeepSizeOf for PlainPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.row_ids.len() * std::mem::size_of::<u64>()
             + self.frequencies.len() * std::mem::size_of::<u32>()
             + self
@@ -1836,7 +1836,7 @@ pub struct CompressedPostingList {
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.blocks.get_buffer_memory_size()
             + self
                 .positions

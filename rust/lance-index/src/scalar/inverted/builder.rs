@@ -19,11 +19,11 @@ use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bitpacking::{BitPacker, BitPacker4x};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
-use deepsize::DeepSizeOf;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     impl DeepSizeOf for CountingStore {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }

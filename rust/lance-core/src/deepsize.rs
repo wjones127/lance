@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub use lance_derive::DeepSizeOf;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::{size_of, size_of_val};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::{Arc, RwLock};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_data::ArrayData;
@@ -71,11 +74,64 @@ impl_deep_size_primitive!(
     ()
 );
 
+impl DeepSizeOf for str {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
 impl DeepSizeOf for String {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         self.capacity()
     }
 }
+
+impl DeepSizeOf for AtomicU64 {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+impl DeepSizeOf for AtomicUsize {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+impl<T: DeepSizeOf, const N: usize> DeepSizeOf for [T; N] {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.iter()
+            .map(|item| item.deep_size_of_children(context))
+            .sum()
+    }
+}
+
+impl<T: DeepSizeOf> DeepSizeOf for RwLock<T> {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.read()
+            .map(|val| val.deep_size_of_children(context))
+            .unwrap_or(0)
+    }
+}
+
+// Tuples
+macro_rules! impl_deep_size_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: DeepSizeOf),+> DeepSizeOf for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn deep_size_of_children(&self, context: &mut Context) -> usize {
+                let ($($name,)+) = self;
+                0 $(+ $name.deep_size_of_children(context))+
+            }
+        }
+    };
+}
+
+impl_deep_size_tuple!(A, B);
+impl_deep_size_tuple!(A, B, C);
+impl_deep_size_tuple!(A, B, C, D);
+impl_deep_size_tuple!(A, B, C, D, E);
+impl_deep_size_tuple!(A, B, C, D, E, F);
 
 impl<T: DeepSizeOf> DeepSizeOf for Vec<T> {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {

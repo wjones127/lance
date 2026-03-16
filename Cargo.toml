@@ -15,6 +15,7 @@ members = [
     "rust/lance-namespace-impls",
     "rust/lance-namespace-datafusion",
     "rust/lance-table",
+    "rust/lance-derive",
     "rust/lance-test-macros",
     "rust/lance-testing",
     "rust/lance-tools",
@@ -69,6 +70,7 @@ lance-namespace-datafusion = { version = "=4.0.0-beta.8", path = "./rust/lance-n
 lance-namespace-reqwest-client = "0.5.2"
 lance-table = { version = "=4.0.0-beta.8", path = "./rust/lance-table" }
 lance-test-macros = { version = "=4.0.0-beta.8", path = "./rust/lance-test-macros" }
+lance-derive = { version = "=4.0.0-beta.8", path = "./rust/lance-derive" }
 lance-testing = { version = "=4.0.0-beta.8", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
@@ -132,7 +134,6 @@ datafusion-optimizer = "52.1.0"
 datafusion-physical-expr = "52.1.0"
 datafusion-physical-plan = "52.1.0"
 datafusion-substrait = "52.1.0"
-deepsize = "0.2.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }

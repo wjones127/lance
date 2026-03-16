@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 #![cfg_attr(coverage, feature(coverage_attribute))]
 
+// Allow the derive macro to reference `lance_core::deepsize` from within this crate.
+extern crate self as lance_core;
+
 use arrow_schema::{DataType, Field as ArrowField};
 use std::sync::LazyLock;
 

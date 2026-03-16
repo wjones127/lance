@@ -8,8 +8,8 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::{Float32Type, UInt32Type};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::deepsize::DeepSizeOf;
 
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
@@ -334,7 +334,7 @@ struct HnswBuilder {
 }
 
 impl DeepSizeOf for HnswBuilder {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.params.deep_size_of_children(context)
             + self.nodes.deep_size_of_children(context)
             + self.level_count.deep_size_of_children(context)

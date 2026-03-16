@@ -5,11 +5,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError};
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
@@ -63,7 +63,7 @@ pub struct CloudObjectReader {
 }
 
 impl DeepSizeOf for CloudObjectReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skipping object_store because there is no easy way to do that and it shouldn't be too big
         self.path.as_ref().deep_size_of_children(context)
     }
@@ -351,7 +351,7 @@ impl Reader for SmallReader {
 }
 
 impl DeepSizeOf for SmallReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
         if let Ok(guard) = self.inner.state.try_lock()

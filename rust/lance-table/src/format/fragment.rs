@@ -3,8 +3,8 @@
 
 use std::num::NonZero;
 
-use deepsize::DeepSizeOf;
 use lance_core::Error;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
 use lance_io::utils::CachedFileSize;

@@ -44,7 +44,6 @@ clap = { version = "4.1.1", features = ["derive"], optional = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
-deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
 itertools.workspace = true

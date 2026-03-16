@@ -15,8 +15,8 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::mask::RowSetOps;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -291,7 +291,7 @@ impl BitmapIndex {
 }
 
 impl DeepSizeOf for BitmapIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut total_size = 0;
 
         total_size += self.index_map.deep_size_of_children(context);

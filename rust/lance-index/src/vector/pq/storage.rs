@@ -17,8 +17,8 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
@@ -65,7 +65,7 @@ pub struct ProductQuantizationMetadata {
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook
             .as_ref()
             .map(|codebook| codebook.get_array_memory_size())
@@ -152,7 +152,7 @@ pub struct ProductQuantizationStorage {
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.batch.get_array_memory_size()
             + self
                 .metadata
