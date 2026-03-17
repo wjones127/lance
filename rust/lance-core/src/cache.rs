@@ -638,7 +638,9 @@ impl<'a> Iterator for DebugEntryIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|(key, record)| {
-            let size_bytes = record.deep_size_of();
+            // Measure with a fresh context to get independent size
+            let size_bytes = record.deep_size_of_children(&mut Context::new());
+            // Measure with shared context to account for Arc deduplication
             let incremental_size_bytes = record.deep_size_of_children(&mut self.context);
             DebugEntry {
                 key,
