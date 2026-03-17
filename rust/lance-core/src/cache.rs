@@ -22,7 +22,8 @@ type ArcAny = Arc<dyn Any + Send + Sync>;
 #[derive(Clone)]
 pub struct SizedRecord {
     record: ArcAny,
-    size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
+    size_fn: Arc<dyn Fn(&ArcAny, &mut Context) -> usize + Send + Sync>,
+    type_name: &'static str,
 }
 
 impl std::fmt::Debug for SizedRecord {
@@ -34,19 +35,23 @@ impl std::fmt::Debug for SizedRecord {
 }
 
 impl DeepSizeOf for SizedRecord {
-    fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        (self.size_accessor)(&self.record)
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        (self.size_fn)(&self.record, context)
     }
 }
 
 impl SizedRecord {
     fn new<T: DeepSizeOf + Send + Sync + 'static>(record: Arc<T>) -> Self {
-        // +8 for the size of the Arc pointer itself
-        let size_accessor =
-            |record: &ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() + 8 };
+        let type_name = std::any::type_name::<T>();
+        // Thread context through to avoid double-counting shared allocations
+        let size_fn = |record: &ArcAny, context: &mut Context| -> usize {
+            let val = record.downcast_ref::<T>().unwrap();
+            std::mem::size_of_val(val) + val.deep_size_of_children(context)
+        };
         Self {
             record,
-            size_accessor: Arc::new(size_accessor),
+            size_fn: Arc::new(size_fn),
+            type_name,
         }
     }
 }
@@ -68,10 +73,10 @@ impl std::fmt::Debug for LanceCache {
 }
 
 impl DeepSizeOf for LanceCache {
-    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.cache
             .iter()
-            .map(|(_, v)| (v.size_accessor)(&v.record))
+            .map(|(_, v)| v.deep_size_of_children(context))
             .sum()
     }
 }
@@ -81,7 +86,10 @@ impl LanceCache {
         let cache = Cache::builder()
             .max_capacity(capacity as u64)
             .weigher(|_, v: &SizedRecord| {
-                (v.size_accessor)(&v.record).try_into().unwrap_or(u32::MAX)
+                let mut ctx = Context::new();
+                (v.deep_size_of_children(&mut ctx) + 8)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
             })
             .support_invalidation_closures()
             .build();
@@ -158,11 +166,12 @@ impl LanceCache {
     async fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
         let key = self.get_key(key);
         let record = SizedRecord::new(metadata);
+        let mut ctx = Context::new();
         tracing::trace!(
             target: "lance_cache::insert",
             key = key,
             type_id = std::any::type_name::<T>(),
-            size = (record.size_accessor)(&record.record),
+            size = record.deep_size_of_children(&mut ctx) + 8,
         );
         self.cache.insert((key, TypeId::of::<T>()), record).await;
     }
@@ -270,11 +279,19 @@ impl LanceCache {
 
     pub async fn debug_cache_entries(&self) -> impl Iterator<Item = (String, usize)> + Send + '_ {
         self.cache.run_pending_tasks().await;
-        let iter = self
-            .cache
-            .iter()
-            .map(|(key, value)| (key.0.clone(), (value.size_accessor)(&value.record)));
+        let iter = self.cache.iter().map(|(key, value)| {
+            let mut ctx = Context::new();
+            (key.0.clone(), value.deep_size_of_children(&mut ctx) + 8)
+        });
         Box::new(iter)
+    }
+
+    pub async fn debug_entries(&self) -> DebugEntryIter<'_> {
+        self.cache.run_pending_tasks().await;
+        DebugEntryIter {
+            iter: self.cache.iter(),
+            context: Context::new(),
+        }
     }
 
     pub async fn clear(&self) {
@@ -600,6 +617,36 @@ impl CacheStats {
         } else {
             self.misses as f32 / (self.hits + self.misses) as f32
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct DebugEntry {
+    pub key: Arc<(String, TypeId)>,
+    pub type_name: &'static str,
+    pub size_bytes: usize,
+    pub incremental_size_bytes: usize,
+}
+
+pub struct DebugEntryIter<'a> {
+    iter: moka::future::Iter<'a, (String, TypeId), SizedRecord>,
+    context: Context,
+}
+
+impl<'a> Iterator for DebugEntryIter<'a> {
+    type Item = DebugEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(key, record)| {
+            let size_bytes = record.deep_size_of();
+            let incremental_size_bytes = record.deep_size_of_children(&mut self.context);
+            DebugEntry {
+                key,
+                type_name: record.type_name,
+                size_bytes,
+                incremental_size_bytes,
+            }
+        })
     }
 }
 
