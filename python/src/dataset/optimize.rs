@@ -23,8 +23,12 @@ use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple
 
 use super::*;
 
-fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionOptions> {
-    let mut opts = CompactionOptions::default();
+fn parse_compaction_options(
+    options: &Bound<'_, PyDict>,
+    config: &std::collections::HashMap<String, String>,
+) -> PyResult<CompactionOptions> {
+    let mut opts = CompactionOptions::from_dataset_config(config)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     for (key, value) in options.into_iter() {
         let key: String = key.extract()?;
@@ -44,6 +48,9 @@ fn parse_compaction_options(options: &Bound<'_, PyDict>) -> PyResult<CompactionO
             }
             "materialize_deletions_threshold" => {
                 opts.materialize_deletions_threshold = value.extract()?;
+            }
+            "defer_index_remap" => {
+                opts.defer_index_remap = value.extract()?;
             }
             "num_threads" => {
                 opts.num_threads = value.extract()?;
@@ -482,7 +489,8 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let options = options.downcast::<PyDict>()?;
-        let opts = parse_compaction_options(options)?;
+        let config = dataset.ds.manifest.config.clone();
+        let opts = parse_compaction_options(options, &config)?;
         let mut new_ds = dataset.ds.as_ref().clone();
         let fut = compact_files(&mut new_ds, opts, None);
         let metrics = rt().block_on(None, async move {
@@ -515,7 +523,8 @@ impl PyCompaction {
         // Make sure we parse the options within a scoped GIL context, so we
         // aren't holding the GIL while blocking the thread on the operation.
         let options = options.downcast::<PyDict>()?;
-        let opts = parse_compaction_options(options)?;
+        let config = dataset.ds.manifest.config.clone();
+        let opts = parse_compaction_options(options, &config)?;
         let plan = rt()
             .block_on(None, async move {
                 plan_compaction(dataset.ds.as_ref(), &opts).await

@@ -1558,13 +1558,14 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
         let cleanup_stats = rt()
             .block_on(None, async {
@@ -1581,6 +1582,9 @@ impl Dataset {
                 }
                 if let Some(v) = error_if_tagged_old_versions {
                     builder = builder.error_if_tagged_old_versions(v);
+                }
+                if let Some(v) = delete_rate_limit {
+                    builder = builder.delete_rate_limit(v)?;
                 }
 
                 self.ds.cleanup_with_policy(builder.build()).await
@@ -1937,8 +1941,11 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
-                    if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
-                        params = params.skip_merge(skip_merge.extract()?);
+                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
+                        params = params.memory_limit_mb(memory_limit.extract()?);
+                    }
+                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
+                        params = params.num_workers(num_workers.extract()?);
                     }
                 }
                 Box::new(params)
@@ -3205,6 +3212,7 @@ fn prepare_vector_index_params(
     let mut sq_params = SQBuildParams::default();
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
+    let mut skip_transpose = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -3334,6 +3342,10 @@ fn prepare_vector_index_params(
             index_file_version = IndexFileVersion::try_from(&version)
                 .map_err(|e| PyValueError::new_err(format!("Invalid index_file_version: {e}")))?;
         }
+
+        if let Some(value) = kwargs.get_item("skip_transpose")? {
+            skip_transpose = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -3378,6 +3390,7 @@ fn prepare_vector_index_params(
         ))),
     }?;
     params.version(index_file_version);
+    params.skip_transpose(skip_transpose);
     Ok(params)
 }
 

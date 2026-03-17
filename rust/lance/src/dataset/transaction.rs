@@ -9,41 +9,8 @@
 //! one another. We can also rebuild manifests when retrying committing a
 //! manifest.
 //!
-//! ## Conflict Resolution
-//!
-//! Transactions are compatible with one another if they don't conflict.
-//! Currently, conflict resolution always assumes a Serializable isolation
-//! level.
-//!
-//! Below are the compatibilities between conflicting transactions. The columns
-//! represent the operation that has been applied, while the rows represent the
-//! operation that is being checked for compatibility to see if it can retry.
-//! ✅ indicates that the operation is compatible, while ❌ indicates that it is
-//! a conflict. Some operations have additional conditions that must be met for
-//! them to be compatible.
-//!
-//! NOTE/TODO(rmeng): DataReplacement conflict resolution is not fully implemented
-//!
-//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | UpdateConfig | DataReplacement |
-//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|--------------|-----------------|
-//! | Append           | ✅     | ✅              | ❌                | ✅           | ✅      | ❌     | ❌      | ✅           | ✅
-//! | Delete / Update  | ✅     | 1️⃣              | ❌                | ✅           | 1️⃣      | ❌     | ❌      | ✅           | ✅
-//! | Overwrite/Create | ✅     | ✅              | ✅                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
-//! | Create index     | ✅     | ✅              | ❌                | ✅           | ✅      | ✅     | ✅      | ✅           | 3️⃣
-//! | Rewrite          | ✅     | 1️⃣              | ❌                | ❌           | 1️⃣      | ❌     | ❌      | ✅           | 3️⃣
-//! | Merge            | ❌     | ❌              | ❌                | ❌           | ✅      | ❌     | ❌      | ✅           | ✅
-//! | Project          | ✅     | ✅              | ❌                | ❌           | ✅      | ❌     | ✅      | ✅           | ✅
-//! | UpdateConfig     | ✅     | ✅              | 2️⃣                | ✅           | ✅      | ✅     | ✅      | 2️⃣           | ✅
-//! | DataReplacement  | ✅     | ✅              | ❌                | 3️⃣           | 1️⃣      | ✅     | 3️⃣      | ✅           | 3️⃣
-//!
-//! 1️⃣ Delete, update, and rewrite are compatible with each other and themselves only if
-//! they affect distinct fragments. Otherwise, they conflict.
-//! 2️⃣ Operations that mutate the config conflict if one of the operations upserts a key
-//! that if referenced by another concurrent operation or if both operations modify the schema
-//! metadata or the same field metadata.
-//! 3️⃣ DataReplacement on a column without index is compatible with any operation AS LONG AS
-//! the operation does not modify the region of the column being replaced.
-//!
+//! For more details please refer to the
+//! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
@@ -1972,13 +1939,17 @@ impl Transaction {
                 removed_indices,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+                let removed_uuids = removed_indices
+                    .iter()
+                    .map(|old_index| old_index.uuid)
+                    .collect::<HashSet<_>>();
+                let new_uuids = new_indices
+                    .iter()
+                    .map(|new_index| new_index.uuid)
+                    .collect::<HashSet<_>>();
                 final_indices.retain(|existing_index| {
-                    !new_indices
-                        .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
+                    !removed_uuids.contains(&existing_index.uuid)
+                        && !new_uuids.contains(&existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
             }
@@ -3509,7 +3480,37 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use chrono::Utc;
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_io::utils::CachedFileSize;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn sample_manifest() -> Manifest {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    fn sample_index_metadata(name: &str) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            name: name.to_string(),
+            dataset_version: 0,
+            fragment_bitmap: Some([0].into_iter().collect()),
+            index_details: None,
+            index_version: 1,
+            created_at: Some(Utc::now()),
+            base_id: None,
+            files: None,
+        }
+    }
 
     #[test]
     fn test_rewrite_fragments() {
@@ -3564,11 +3565,6 @@ mod tests {
 
     #[test]
     fn test_merge_fragments_valid() {
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::datatypes::Schema as LanceSchema;
-        use lance_table::format::Manifest;
-        use std::sync::Arc;
-
         // Create a simple schema for testing
         let schema = ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -3643,6 +3639,82 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_keeps_unremoved_same_name_indices() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert!(final_indices.iter().any(|idx| idx.uuid == first_index.uuid));
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
+    }
+
+    #[test]
+    fn test_create_index_build_manifest_deduplicates_relisted_indices_by_uuid() {
+        let manifest = sample_manifest();
+        let first_index = sample_index_metadata("vector_idx");
+        let second_index = sample_index_metadata("vector_idx");
+        let third_index = sample_index_metadata("vector_idx");
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![first_index.clone(), third_index.clone()],
+                removed_indices: vec![second_index.clone()],
+            },
+            None,
+        );
+
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![first_index.clone(), second_index.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(final_indices.len(), 2);
+        assert_eq!(
+            final_indices
+                .iter()
+                .filter(|idx| idx.uuid == first_index.uuid)
+                .count(),
+            1
+        );
+        assert!(final_indices.iter().any(|idx| idx.uuid == third_index.uuid));
+        assert!(
+            !final_indices
+                .iter()
+                .any(|idx| idx.uuid == second_index.uuid)
+        );
     }
 
     #[test]

@@ -2419,6 +2419,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -2458,6 +2459,12 @@ class LanceDataset(pa.dataset.Dataset):
             tagged versions match the parameters. Otherwise, tagged versions will
             be ignored without any error and only untagged versions will be
             cleaned up.
+
+        delete_rate_limit: int, optional
+            Maximum number of delete operations per second. When not set (default),
+            deletions run at full speed. Set this to a positive integer to avoid
+            hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
+            For example, ``delete_rate_limit=100`` limits to 100 operations/second.
         """
         if older_than is None and retain_versions is None:
             older_than = timedelta(days=14)
@@ -2467,6 +2474,7 @@ class LanceDataset(pa.dataset.Dataset):
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
+            delete_rate_limit,
         )
 
     def create_scalar_index(
@@ -2598,10 +2606,21 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
-        skip_merge: bool, default False
-            This is for the ``INVERTED`` index. If True, the index will skip the
-            partition merge stage after indexing. This can be useful for
-            distributed/fragment-level indexing where a later merge is desired.
+        memory_limit: int, optional
+            This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
+            If set, Lance divides this budget evenly across the workers. If unset,
+            the default will be 2 GiB per worker. This parameter is only used for the
+            current build and is not persisted with the index.
+
+            A larger memory limit will create an index with fewer shards which will
+            be easier to search so this is a trade-off between build resources and
+            search cost.
+        num_workers: int, optional
+            This is for the ``INVERTED`` index. Number of workers to use for
+            the current build. The effective worker count is clamped to
+            ``[1, num_compute_cpus]``. If unset, Lance uses ``num_compute_cpus``
+            workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
+            only used for the current build and is not persisted with the index.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
@@ -2796,6 +2815,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        skip_transpose: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -3270,6 +3290,9 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
+
+        if skip_transpose:
+            kwargs["skip_transpose"] = True
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -4708,6 +4731,35 @@ class ColumnOrdering:
     nulls_first: bool = False
 
 
+def _needs_substrait_placeholder(t: pa.DataType) -> bool:
+    """Return True if *t* contains a type that PyArrow's substrait serializer
+    cannot handle at any nesting depth.
+
+    Three cases require a placeholder:
+
+    * ``fixed_size_list`` — substrait has no equivalent type.
+    * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
+      represent them.
+    * A struct whose fields carry non-``None`` metadata — substrait rejects
+      such structs.  Extension types leave ``metadata={}`` on struct fields
+      after a lance round-trip; ``{}`` is non-``None``.
+    """
+    if pa.types.is_fixed_size_list(t):
+        return True
+    if isinstance(t, pa.lib.BaseExtensionType):
+        return True
+    if pa.types.is_struct(t):
+        for i in range(t.num_fields):
+            f = t.field(i)
+            if f.metadata is not None:
+                return True
+            if _needs_substrait_placeholder(f.type):
+                return True
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _needs_substrait_placeholder(t.value_type)
+    return False
+
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
@@ -4866,14 +4918,14 @@ class ScannerBuilder:
 
                 fields_without_lists = []
                 counter = 0
-                # Pyarrow cannot handle fixed size lists when converting
-                # types to Substrait. So we can't use those in our filter,
-                # which is ok for now but we need to replace them with some
-                # kind of placeholder because Substrait is going to use
-                # ordinal field references and we want to make sure those are
-                # correct.
+                # Pyarrow cannot handle certain types when converting to
+                # Substrait (e.g. fixed_size_list at any nesting depth, or
+                # struct fields with non-None metadata left by extension types
+                # after a lance round-trip).  We replace any top-level field
+                # whose type tree contains such a type with an int8 placeholder
+                # so that ordinal field references in the filter remain correct.
                 for field in self.ds.schema:
-                    if pa.types.is_fixed_size_list(field.type):
+                    if _needs_substrait_placeholder(field.type):
                         pos = counter
                         counter += 1
                         fields_without_lists.append(
@@ -5299,11 +5351,12 @@ class DatasetOptimizer:
     def compact_files(
         self,
         *,
-        target_rows_per_fragment: int = 1024 * 1024,
-        max_rows_per_group: int = 1024,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
         max_bytes_per_file: Optional[int] = None,
-        materialize_deletions: bool = True,
-        materialize_deletions_threshold: float = 0.1,
+        materialize_deletions: Optional[bool] = None,
+        materialize_deletions_threshold: Optional[float] = None,
+        defer_index_remap: Optional[bool] = None,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
         compaction_mode: Optional[
@@ -5325,14 +5378,33 @@ class DatasetOptimizer:
         not be compacted because the fragments it is adjacent to do not need
         compaction.
 
+        Default values for these options can be stored in the dataset manifest
+        config using keys prefixed with ``lance.compaction.``. For example,
+        setting the config key ``lance.compaction.target_rows_per_fragment`` to
+        ``"500000"`` will use 500,000 as the default target rows per fragment.
+        Explicitly provided parameters take precedence over manifest config
+        values, which in turn take precedence over hardcoded defaults.
+
+        Supported config keys: ``lance.compaction.target_rows_per_fragment``,
+        ``lance.compaction.max_rows_per_group``,
+        ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.materialize_deletions``,
+        ``lance.compaction.materialize_deletions_threshold``,
+        ``lance.compaction.defer_index_remap``,
+        ``lance.compaction.batch_size``,
+        ``lance.compaction.compaction_mode``,
+        ``lance.compaction.binary_copy_read_batch_bytes``.
+
         Parameters
         ----------
-        target_rows_per_fragment: int, default 1024*1024
+        target_rows_per_fragment: int, optional
             The target number of rows per fragment. This is the number of rows
-            that will be in each fragment after compaction.
-        max_rows_per_group: int, default 1024
+            that will be in each fragment after compaction. If not specified,
+            uses the manifest config value, or 1024*1024.
+        max_rows_per_group: int, optional
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+            If not specified, uses the manifest config value, or 1024.
 
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
@@ -5343,12 +5415,17 @@ class DatasetOptimizer:
             that are smaller than `target_rows_per_fragment`.
 
             The default will use the default from ``write_dataset``.
-        materialize_deletions: bool, default True
+        materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
-            longer present in the file.
-        materialize_deletions_threshold: float, default 0.1
+            longer present in the file. If not specified, uses the manifest
+            config value, or True.
+        materialize_deletions_threshold: float, optional
             The fraction of original rows that are soft deleted in a fragment
-            before the fragment is a candidate for compaction.
+            before the fragment is a candidate for compaction. If not specified,
+            uses the manifest config value, or 0.1.
+        defer_index_remap: bool, optional
+            Whether to defer index remapping during compaction. If not specified,
+            uses the manifest config value, or False.
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
@@ -5379,17 +5456,22 @@ class DatasetOptimizer:
         --------
         lance.optimize.Compaction
         """
-        opts = dict(
-            target_rows_per_fragment=target_rows_per_fragment,
-            max_rows_per_group=max_rows_per_group,
-            max_bytes_per_file=max_bytes_per_file,
-            materialize_deletions=materialize_deletions,
-            materialize_deletions_threshold=materialize_deletions_threshold,
-            num_threads=num_threads,
-            batch_size=batch_size,
-            compaction_mode=compaction_mode,
-            binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
-        )
+        opts = {
+            k: v
+            for k, v in dict(
+                target_rows_per_fragment=target_rows_per_fragment,
+                max_rows_per_group=max_rows_per_group,
+                max_bytes_per_file=max_bytes_per_file,
+                materialize_deletions=materialize_deletions,
+                materialize_deletions_threshold=materialize_deletions_threshold,
+                defer_index_remap=defer_index_remap,
+                num_threads=num_threads,
+                batch_size=batch_size,
+                compaction_mode=compaction_mode,
+                binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+            ).items()
+            if v is not None
+        }
         return Compaction.execute(self._dataset, opts)
 
     def optimize_indices(self, **kwargs):

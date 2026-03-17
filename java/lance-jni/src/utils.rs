@@ -141,8 +141,9 @@ pub fn build_compaction_options(
     defer_index_remap: &JObject,               // Optional<Boolean>
     compaction_mode: &JObject,                 // Optional<String>
     binary_copy_read_batch_bytes: &JObject,    // Optional<Long>
+    config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
-    let mut compaction_options = CompactionOptions::default();
+    let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
 
     if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
         compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
@@ -430,6 +431,7 @@ pub fn get_vector_index_params(
                 metric_type: distance_type,
                 stages,
                 version: IndexFileVersion::V3,
+                skip_transpose: false,
             })
         },
     )?;

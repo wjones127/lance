@@ -28,12 +28,13 @@ use lance_core::datatypes::Schema;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::writer::FileWriter;
+use lance_encoding::version::LanceFileVersion;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, pack_codes, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -77,6 +78,7 @@ use tracing::{Level, instrument, span};
 
 use crate::Dataset;
 use crate::dataset::ProjectionRequest;
+use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
 
@@ -149,6 +151,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // whether to transpose codes when building storage
     transpose_codes: bool,
 
+    // lance file version for writing index files
+    format_version: LanceFileVersion,
+
     progress: Arc<dyn IndexBuildProgress>,
 }
 
@@ -170,6 +175,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<Self> {
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -192,6 +198,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -235,6 +242,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let temp_dir = TempStdDir::default();
         let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+        let format_version = dataset_format_version(&dataset);
         Ok(Self {
             store: dataset.object_store().clone(),
             column,
@@ -256,6 +264,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
+            format_version,
             progress: Arc::new(NoopIndexBuildProgress),
         })
     }
@@ -279,21 +288,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // step 2. shuffle the dataset
         if self.shuffle_reader.is_none() {
-            progress.stage_start("shuffle", None, "batches").await?;
+            let num_rows = self.num_rows_to_shuffle().await?;
+            progress.stage_start("shuffle", num_rows, "rows").await?;
             self.shuffle_dataset().await?;
             progress.stage_complete("shuffle").await?;
         }
 
-        // step 3. build partitions
+        // step 3. build and merge partitions
         let num_partitions = self.ivf.as_ref().map(|ivf| ivf.num_partitions() as u64);
         progress
-            .stage_start("build_partitions", num_partitions, "partitions")
+            .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
-
-        // step 4. merge all partitions
         self.merge_partitions(build_idx_stream).await?;
-        progress.stage_complete("build_partitions").await?;
+        progress.stage_complete("merge_partitions").await?;
 
         Ok(self.merged_num)
     }
@@ -504,6 +512,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 RecordBatch::try_new(new_schema.clone(), batch.columns().to_vec()).unwrap()
             }),
         )
+    }
+
+    async fn num_rows_to_shuffle(&self) -> Result<Option<u64>> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Ok(None);
+        };
+        match &self.fragment_filter {
+            Some(fragment_ids) => {
+                let fragments: Vec<_> = dataset
+                    .get_fragments()
+                    .into_iter()
+                    .filter(|f| fragment_ids.contains(&(f.id() as u32)))
+                    .collect();
+                let counts = futures::stream::iter(fragments)
+                    .map(|f| async move { f.count_rows(None).await })
+                    .buffer_unordered(16) // ref: Dataset::count_all_rows()
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok(Some(counts.iter().sum::<usize>() as u64))
+            }
+            None => Ok(Some(dataset.count_rows(None).await? as u64)),
+        }
     }
 
     async fn shuffle_dataset(&mut self) -> Result<()> {
@@ -1016,6 +1046,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let is_pq = Q::quantization_type() == QuantizationType::Product;
+        let is_rq = Q::quantization_type() == QuantizationType::Rabit;
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1024,15 +1055,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut fields = vec![ROW_ID_FIELD.clone(), quantizer.field()];
         fields.extend(quantizer.extra_fields());
         let storage_schema: Schema = (&arrow_schema::Schema::new(fields)).try_into()?;
+        let writer_options = FileWriterOptions {
+            format_version: Some(self.format_version),
+            ..Default::default()
+        };
         let mut storage_writer = FileWriter::try_new(
             self.store.create(&storage_path).await?,
             storage_schema.clone(),
-            Default::default(),
+            writer_options.clone(),
         )?;
         let mut index_writer = FileWriter::try_new(
             self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
-            Default::default(),
+            writer_options,
         )?;
 
         // maintain the IVF partitions
@@ -1046,7 +1081,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
-            progress.stage_progress("build_partitions", part_id).await?;
+            progress.stage_progress("merge_partitions", part_id).await?;
             let Some((storage, index, loss)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 
@@ -1084,6 +1119,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, original_fsl)?;
                 }
 
+                if is_rq && batch.column_by_name(RABIT_CODE_COLUMN).is_some() {
+                    // RQ storage batches reaching merge_partitions always come
+                    // from RabitQuantizationStorage, which canonicalizes codes
+                    // into packed layout in try_from_batch/remap. Materialize
+                    // row-major bytes so row-wise sort operates on per-row codes.
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let unpacked = Arc::new(unpack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, unpacked)?;
+                }
+
                 // Enforce a stable ROW_ID ordering for all auxiliary batches so that the
                 // PQ code column moves together with ROW_ID.
                 batch = stable_sort_batch_by_row_id(&batch)?;
@@ -1105,6 +1153,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         bytes_per_code as i32,
                     )?);
                     batch = batch.replace_column_by_name(PQ_CODE_COLUMN, transposed_fsl)?;
+                }
+
+                if is_rq
+                    && self.transpose_codes
+                    && batch.column_by_name(RABIT_CODE_COLUMN).is_some()
+                {
+                    let codes_fsl = batch
+                        .column_by_name(RABIT_CODE_COLUMN)
+                        .unwrap()
+                        .as_fixed_size_list();
+                    let packed = Arc::new(pack_codes(codes_fsl));
+                    batch = batch.replace_column_by_name(RABIT_CODE_COLUMN, packed)?;
                 }
 
                 storage_writer.write_batch(&batch).await?;
@@ -1150,8 +1210,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         let quant_type = Q::quantization_type();
         let transposed = match quant_type {
-            QuantizationType::Product => self.transpose_codes,
-            QuantizationType::Rabit => true,
+            QuantizationType::Product | QuantizationType::Rabit => self.transpose_codes,
             _ => false,
         };
         // For now, each partition's metadata is just the quantizer,
