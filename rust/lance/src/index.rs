@@ -62,6 +62,10 @@ use scalar::index_matches_criteria;
 use serde_json::json;
 use tracing::{info, instrument};
 use uuid::Uuid;
+use vector::details::{
+    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
+};
+pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
 
@@ -410,11 +414,6 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     };
     Ok(proto)
 }
-
-use vector::details::{
-    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
-};
-pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 
 struct IndexDescriptionImpl {
     name: String,
