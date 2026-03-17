@@ -1576,8 +1576,8 @@ impl PostingListReader {
 pub struct Positions(ListArray);
 
 impl DeepSizeOf for Positions {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.0.get_buffer_memory_size()
+    fn deep_size_of_children(&self, cx: &mut lance_core::deepsize::Context) -> usize {
+        (&self.0 as &dyn Array).deep_size_of_children(cx)
     }
 }
 
@@ -1734,13 +1734,13 @@ pub struct PlainPostingList {
 }
 
 impl DeepSizeOf for PlainPostingList {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.row_ids.len() * std::mem::size_of::<u64>()
-            + self.frequencies.len() * std::mem::size_of::<u32>()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.row_ids.deep_size_of_children(context)
+            + self.frequencies.deep_size_of_children(context)
             + self
                 .positions
                 .as_ref()
-                .map(Array::get_buffer_memory_size)
+                .map(|arr| (arr as &dyn Array).deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }

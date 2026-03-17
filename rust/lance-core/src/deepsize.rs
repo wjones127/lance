@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 
 use arrow_array::{Array, RecordBatch};
+use arrow_buffer::ArrowNativeType;
 use arrow_data::ArrayData;
 
 pub struct Context {
@@ -245,6 +246,20 @@ impl DeepSizeOf for RecordBatch {
             .iter()
             .map(|col| col.deep_size_of_children(context))
             .sum()
+    }
+}
+
+impl<T> DeepSizeOf for arrow_buffer::ScalarBuffer<T>
+where
+    T: ArrowNativeType,
+{
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // ScalarBuffer wraps a Buffer; track it to avoid double-counting
+        if context.mark_seen(self.as_ptr() as usize) {
+            self.len() * size_of::<T>()
+        } else {
+            0
+        }
     }
 }
 
