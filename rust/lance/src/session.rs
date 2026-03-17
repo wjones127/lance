@@ -198,6 +198,21 @@ impl Session {
     pub async fn index_cache_entries(&self) -> Vec<(String, usize)> {
         self.index_cache.0.debug_cache_entries().await.collect()
     }
+
+    /// Return a record batch reader for debug information about the index cache.
+    ///
+    /// This returns a reader that yields record batches with columns:
+    /// - key: str - the cache key
+    /// - type_name: str - the type name of the cached value
+    /// - size_bytes: uint64 - the size measured independently with a fresh context
+    /// - incremental_size_bytes: uint64 - the size measured with shared allocation deduplication
+    ///
+    /// The difference between size_bytes and incremental_size_bytes shows how much
+    /// memory is shared via Arc pointers.
+    pub fn debug_index_cache(&self) -> Box<dyn arrow_array::RecordBatchReader + Send> {
+        let cache = self.index_cache.0.clone();
+        debug_index_cache(cache)
+    }
 }
 
 impl Default for Session {

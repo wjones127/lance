@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use arrow::pyarrow::PyArrowType;
+use arrow_array::RecordBatchReader;
 use pyo3::{
-    Bound, Python, pyclass, pymethods,
+    Bound, PyResult, Python, pyclass, pymethods,
     types::{PyDict, PyDictMethods},
 };
 
@@ -104,5 +106,20 @@ impl Session {
         dict.set_item("num_entries", stats.num_entries).unwrap();
         dict.set_item("size_bytes", stats.size_bytes).unwrap();
         dict
+    }
+
+    /// Return a record batch reader for debug information about the index cache.
+    ///
+    /// This returns a reader that yields record batches with columns:
+    /// - key: str - the cache key
+    /// - type_name: str - the type name of the cached value
+    /// - size_bytes: uint64 - the size measured independently with a fresh context
+    /// - incremental_size_bytes: uint64 - the size measured with shared allocation deduplication
+    ///
+    /// The difference between size_bytes and incremental_size_bytes shows how much
+    /// memory is shared via Arc pointers.
+    pub fn debug_index_cache(&self) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let reader = self.inner.debug_index_cache();
+        Ok(PyArrowType(reader))
     }
 }
