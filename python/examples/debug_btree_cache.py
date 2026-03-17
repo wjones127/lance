@@ -135,8 +135,7 @@ def main():
 
         # Step 3: Run range queries using the index
         # Scan the full table to load index into cache
-        for i in range(3):
-            _ = ds.to_table()
+        ds.prewarm_index("uuid_idx")
         print_step("3. After scanning with index loaded", session)
 
         # Step 4: Create BTREE index on ID
@@ -145,8 +144,7 @@ def main():
         print_step("4. After creating BTREE index on id", session)
 
         # Step 5: Run additional scans
-        for i in range(3):
-            _ = ds.to_table()
+        ds.prewarm_index("uuid_idx")
         print_step("5. After additional scans", session)
 
         # Step 6: Append more data with new UUIDs
@@ -165,8 +163,7 @@ def main():
         print_step("6. After appending more data", session)
 
         # Step 7: Query the new data
-        for i in range(3):
-            _ = ds.to_table()
+        ds.prewarm_index("uuid_idx")
         print_step("7. After querying appended data", session)
 
         # Step 8: Compact files
@@ -175,8 +172,7 @@ def main():
         print_step("8. After compacting", session)
 
         # Step 9: Final queries on compacted data
-        for i in range(3):
-            _ = ds.to_table()
+        ds.prewarm_index("uuid_idx")
         print_step("9. After final queries on compacted data", session)
 
     finally:

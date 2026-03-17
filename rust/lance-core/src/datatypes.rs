@@ -374,10 +374,10 @@ pub struct Dictionary {
 }
 
 impl DeepSizeOf for Dictionary {
-    fn deep_size_of_children(&self, _context: &mut crate::deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut crate::deepsize::Context) -> usize {
         self.values
             .as_ref()
-            .map(|v| v.get_array_memory_size())
+            .map(|v| (v.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }

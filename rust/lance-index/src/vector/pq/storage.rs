@@ -8,7 +8,7 @@
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
 use arrow::datatypes::{self, UInt8Type};
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::AsArray,
@@ -65,10 +65,10 @@ pub struct ProductQuantizationMetadata {
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.codebook
             .as_ref()
-            .map(|codebook| codebook.get_array_memory_size())
+            .map(|codebook| (codebook as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }
@@ -152,13 +152,15 @@ pub struct ProductQuantizationStorage {
 }
 
 impl DeepSizeOf for ProductQuantizationStorage {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
             + self
                 .metadata
                 .codebook
                 .as_ref()
-                .map(|codebook| codebook.get_array_memory_size())
+                .map(|codebook| {
+                    (codebook as &dyn arrow_array::Array).deep_size_of_children(context)
+                })
                 .unwrap_or(0)
     }
 }

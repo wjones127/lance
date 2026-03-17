@@ -41,8 +41,8 @@ pub struct FlatIndex {
 }
 
 impl DeepSizeOf for FlatIndex {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.data.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.data.deep_size_of_children(context)
     }
 }
 

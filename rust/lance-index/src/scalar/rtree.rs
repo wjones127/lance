@@ -235,8 +235,8 @@ pub enum RTreeCacheKey {
 pub struct RTreeCacheValue(Arc<RecordBatch>);
 
 impl DeepSizeOf for RTreeCacheValue {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.0.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
     }
 }
 

@@ -38,8 +38,8 @@ pub struct FlatFloatStorage {
 }
 
 impl DeepSizeOf for FlatFloatStorage {
-    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
     }
 }
 
@@ -190,8 +190,8 @@ pub struct FlatBinStorage {
 }
 
 impl DeepSizeOf for FlatBinStorage {
-    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.batch.deep_size_of_children(context)
     }
 }
 

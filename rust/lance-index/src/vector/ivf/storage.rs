@@ -44,7 +44,7 @@ impl DeepSizeOf for IvfModel {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.centroids
             .as_ref()
-            .map(|centroids| centroids.get_array_memory_size())
+            .map(|centroids| (centroids as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or_default()
             + self.lengths.deep_size_of_children(context)
             + self.offsets.deep_size_of_children(context)

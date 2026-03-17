@@ -47,12 +47,12 @@ pub struct ProductQuantizer {
 }
 
 impl DeepSizeOf for ProductQuantizer {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.codebook.get_array_memory_size()
-            + self.num_sub_vectors.deep_size_of_children(_context)
-            + self.num_bits.deep_size_of_children(_context)
-            + self.dimension.deep_size_of_children(_context)
-            + self.distance_type.deep_size_of_children(_context)
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        (&self.codebook as &dyn arrow_array::Array).deep_size_of_children(context)
+            + self.num_sub_vectors.deep_size_of_children(context)
+            + self.num_bits.deep_size_of_children(context)
+            + self.dimension.deep_size_of_children(context)
+            + self.distance_type.deep_size_of_children(context)
     }
 }
 

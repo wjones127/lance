@@ -64,10 +64,10 @@ fn default_rotation_type_compat() -> RQRotationType {
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.rotate_mat
             .as_ref()
-            .map(|inv_p| inv_p.get_array_memory_size())
+            .map(|inv_p| (inv_p as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
             + self
                 .fast_rotation_signs
@@ -152,7 +152,7 @@ pub struct RabitQuantizationStorage {
 
 impl DeepSizeOf for RabitQuantizationStorage {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.batch.get_array_memory_size()
+        self.metadata.deep_size_of_children(context) + self.batch.deep_size_of_children(context)
     }
 }
 

@@ -131,7 +131,7 @@ def main():
         )
         # ~100 MiB of text data
         data = rand_batches(schema, num_batches=100, batch_size_bytes=1024 * 1024)
-        ds = lance.write_dataset(data, uri)
+        ds = lance.write_dataset(data, uri, max_rows_per_file=100)
         ds = lance.dataset(uri, session=session)
         print_step("1. After creating dataset", session)
 
@@ -149,13 +149,8 @@ def main():
         print_step("3. After FTS queries", session)
 
         # Step 4: Append more data
-        more_texts = [
-            f"appended document {i} with new content about subject {i % 5}"
-            for i in range(1000, 2000)
-        ]
-        more_table = pa.table({"id": range(1000, 2000), "text": more_texts})
-        lance.write_dataset(more_table, uri, mode="append")
-        ds = lance.dataset(uri, session=session)
+        more_table = rand_batches(schema, num_batches=1, batch_size_bytes=1024 * 1024)
+        ds = lance.write_dataset(more_table, ds, mode="append")
         print_step("4. After appending data", session)
 
         # Step 5: Query again (should use index for original data)
@@ -167,12 +162,12 @@ def main():
         print_step("5. After querying appended data", session)
 
         # Step 6: Optimize indices
-        ds.optimize.optimize_indices()
-        ds = lance.dataset(uri, session=session)
-        print_step("6. After optimizing indices", session)
+        # ds.optimize.optimize_indices()
+        # ds = lance.dataset(uri, session=session)
+        # print_step("6. After optimizing indices", session)
 
         # Step 7: Compact
-        ds.optimize.compact_files()
+        ds.optimize.compact_files(defer_index_remap=True)
         ds = lance.dataset(uri, session=session)
         print_step("7. After compacting", session)
 
