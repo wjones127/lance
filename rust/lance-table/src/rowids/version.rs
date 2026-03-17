@@ -7,9 +7,9 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
+use lance_core::deepsize::DeepSizeOf;
 use lance_table::format::pb;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ pub struct MergedGeneration {
 }
 
 impl DeepSizeOf for MergedGeneration {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0 // UUID is 16 bytes fixed size, no heap allocations
     }
 }
@@ -164,7 +164,7 @@ pub struct RegionManifest {
 }
 
 impl DeepSizeOf for RegionManifest {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.flushed_generations.deep_size_of_children(context)
     }
 }

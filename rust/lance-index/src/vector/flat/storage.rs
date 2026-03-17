@@ -17,7 +17,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
 };
 use arrow_schema::SchemaRef;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_linalg::distance::DistanceType;
@@ -38,7 +38,7 @@ pub struct FlatFloatStorage {
 }
 
 impl DeepSizeOf for FlatFloatStorage {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.batch.get_array_memory_size()
     }
 }
@@ -190,7 +190,7 @@ pub struct FlatBinStorage {
 }
 
 impl DeepSizeOf for FlatBinStorage {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
         self.batch.get_array_memory_size()
     }
 }

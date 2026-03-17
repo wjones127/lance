@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use deepsize::DeepSizeOf;
+use crate::deepsize::DeepSizeOf;
 
 use super::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 

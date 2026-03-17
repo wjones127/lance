@@ -15,7 +15,7 @@ use moka::future::Cache;
 
 use crate::Result;
 
-pub use deepsize::{Context, DeepSizeOf};
+pub use crate::deepsize::{Context, DeepSizeOf};
 
 type ArcAny = Arc<dyn Any + Send + Sync>;
 

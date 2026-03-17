@@ -18,8 +18,8 @@ mod test {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::{Context, DeepSizeOf};
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::deepsize::{Context, DeepSizeOf};
     use lance_core::{cache::LanceCache, utils::tempfile::TempStdFile};
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{Index, IndexType, vector::Query};

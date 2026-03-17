@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
 use bitvec::vec::BitVec;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 
 use crate::vector::hnsw::builder::HnswQueryParams;
 

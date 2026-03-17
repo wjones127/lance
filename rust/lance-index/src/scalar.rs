@@ -17,8 +17,8 @@ use std::{any::Any, ops::Bound, sync::Arc};
 
 use datafusion_expr::Expr;
 use datafusion_expr::expr::ScalarFunction;
-use deepsize::DeepSizeOf;
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;

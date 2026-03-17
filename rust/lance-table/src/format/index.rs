@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -69,7 +69,7 @@ impl IndexMetadata {
 }
 
 impl DeepSizeOf for IndexMetadata {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
             + self.name.deep_size_of_children(context)

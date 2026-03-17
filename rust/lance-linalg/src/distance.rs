@@ -23,10 +23,10 @@ pub mod l2;
 pub mod norm_l2;
 
 pub use cosine::*;
-use deepsize::DeepSizeOf;
 pub use dot::*;
 use hamming::hamming_distance_arrow_batch;
 pub use l2::*;
+use lance_core::deepsize::DeepSizeOf;
 pub use norm_l2::*;
 
 use crate::Result;

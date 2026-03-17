@@ -6,10 +6,10 @@ use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
 use std::{collections::BTreeMap, io::Read};
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
@@ -301,7 +301,7 @@ pub enum RowAddrSelection {
 }
 
 impl DeepSizeOf for RowAddrSelection {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut crate::deepsize::Context) -> usize {
         match self {
             Self::Full => 0,
             Self::Partial(bitmap) => bitmap.serialized_size(),
@@ -1794,7 +1794,7 @@ mod tests {
 
     #[test]
     fn test_row_addr_selection_deep_size_of() {
-        use deepsize::DeepSizeOf;
+        use crate::deepsize::DeepSizeOf;
 
         // Test Full variant - should have minimal size (just the enum discriminant)
         let full = RowAddrSelection::Full;

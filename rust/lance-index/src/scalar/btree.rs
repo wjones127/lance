@@ -36,12 +36,12 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{CacheKey, LanceCache, WeakLanceCache},
@@ -82,7 +82,7 @@ pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
 pub struct OrderableScalarValue(pub ScalarValue);
 
 impl DeepSizeOf for OrderableScalarValue {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // deepsize and size both factor in the size of the ScalarValue
         self.0.size() - std::mem::size_of::<ScalarValue>()
     }
@@ -1034,7 +1034,7 @@ pub struct BTreeIndex {
 }
 
 impl DeepSizeOf for BTreeIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
         // sub_index and fri.
         self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
@@ -2613,9 +2613,9 @@ mod tests {
     };
     use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
-    use deepsize::DeepSizeOf;
     use futures::TryStreamExt;
     use futures::stream;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
