@@ -1836,13 +1836,13 @@ pub struct CompressedPostingList {
 }
 
 impl DeepSizeOf for CompressedPostingList {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.blocks.get_buffer_memory_size()
+    fn deep_size_of_children(&self, cx: &mut lance_core::deepsize::Context) -> usize {
+        (&self.blocks as &dyn Array).deep_size_of_children(cx)
             + self
                 .positions
                 .as_ref()
-                .map(Array::get_buffer_memory_size)
-                .unwrap_or(0)
+                .map(|arr| (arr as &dyn Array).deep_size_of_children(cx))
+                .unwrap_or_default()
     }
 }
 

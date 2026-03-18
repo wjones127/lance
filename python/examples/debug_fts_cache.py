@@ -136,7 +136,7 @@ def main():
         print_step("1. After creating dataset", session)
 
         # Step 2: Create FTS index
-        ds.create_scalar_index("text", index_type="FTS")
+        ds.create_scalar_index("text", index_type="FTS", with_positions=True)
         ds = lance.dataset(uri, session=session)
         print_step("2. After creating FTS index", session)
 
