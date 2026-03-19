@@ -196,18 +196,26 @@ impl DeepSizeOf for LanceCache {
     }
 }
 
-/// Returns a stable 8-byte discriminator for type `T`.
+/// Returns the type_id for type `T`, derived from the pointer of its
+/// [`std::any::type_name`]. Stable within a single process lifetime.
+pub fn type_id_of<T: 'static>() -> u64 {
+    std::any::type_name::<T>().as_ptr() as u64
+}
+
+/// Cache keys are structured as `user_key\0<8-byte type_id>`.
 ///
-/// Uses the pointer of `std::any::type_name::<T>()`, which is a `&'static str`
-/// with a process-lifetime-stable address. This is unique per monomorphized type
-/// and avoids `transmute` on `TypeId`.
-fn type_tag<T: 'static>() -> [u8; 8] {
-    (std::any::type_name::<T>().as_ptr() as u64).to_le_bytes()
+/// This function splits an opaque cache key into the user-visible portion
+/// and the type_id. Backend implementations can use this to inspect keys.
+pub fn parse_cache_key(key: &[u8]) -> (&[u8], u64) {
+    let type_id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+    // Everything before the trailing \0 + 8-byte tag.
+    let user_key = &key[..key.len() - 9];
+    (user_key, u64::from_le_bytes(type_id_bytes))
 }
 
 impl LanceCache {
-    /// Build a key: `prefix/user_key\0<8-byte type tag>`.
-    fn make_key<T: 'static>(&self, key: &str) -> Vec<u8> {
+    /// Build a key: `prefix/user_key\0<8-byte type_id>`.
+    fn make_key_with_id(&self, key: &str, type_id: u64) -> Vec<u8> {
         let full_key = if self.prefix.is_empty() {
             key.to_string()
         } else {
@@ -215,7 +223,7 @@ impl LanceCache {
         };
         let mut bytes = full_key.into_bytes();
         bytes.push(0);
-        bytes.extend_from_slice(&type_tag::<T>());
+        bytes.extend_from_slice(&type_id.to_le_bytes());
         bytes
     }
 
@@ -304,9 +312,14 @@ impl LanceCache {
         self.cache.approx_size_bytes()
     }
 
-    async fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
+    async fn insert_with_id<T: DeepSizeOf + Send + Sync + 'static>(
+        &self,
+        key: &str,
+        type_id: u64,
+        metadata: Arc<T>,
+    ) {
         let size = metadata.deep_size_of() + 8; // +8 for the Arc pointer
-        let cache_key = self.make_key::<T>(key);
+        let cache_key = self.make_key_with_id(key, type_id);
         tracing::trace!(
             target: "lance_cache::insert",
             key = key,
@@ -316,17 +329,35 @@ impl LanceCache {
         self.cache.insert(&cache_key, metadata, size).await;
     }
 
+    #[cfg(test)]
+    async fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
+        self.insert_with_id(key, type_id_of::<T>(), metadata).await
+    }
+
+    async fn insert_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
+        &self,
+        key: &str,
+        type_id: u64,
+        metadata: Arc<T>,
+    ) {
+        self.insert_with_id(key, type_id, Arc::new(metadata)).await
+    }
+
     pub async fn insert_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
         key: &str,
         metadata: Arc<T>,
     ) {
-        // Wrap in another Arc to make the data Sized.
-        self.insert(key, Arc::new(metadata)).await
+        self.insert_unsized_with_id(key, type_id_of::<Arc<T>>(), metadata)
+            .await
     }
 
-    async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
-        let cache_key = self.make_key::<T>(key);
+    async fn get_with_id<T: Send + Sync + 'static>(
+        &self,
+        key: &str,
+        type_id: u64,
+    ) -> Option<Arc<T>> {
+        let cache_key = self.make_key_with_id(key, type_id);
         if let Some(entry) = self.cache.get(&cache_key).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.downcast::<T>().unwrap())
@@ -336,28 +367,42 @@ impl LanceCache {
         }
     }
 
+    #[cfg(test)]
+    async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
+        self.get_with_id(key, type_id_of::<T>()).await
+    }
+
+    async fn get_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
+        &self,
+        key: &str,
+        type_id: u64,
+    ) -> Option<Arc<T>> {
+        let outer = self.get_with_id::<Arc<T>>(key, type_id).await?;
+        Some(outer.as_ref().clone())
+    }
+
     pub async fn get_unsized<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
         key: &str,
     ) -> Option<Arc<T>> {
-        let outer = self.get::<Arc<T>>(key).await?;
-        Some(outer.as_ref().clone())
+        self.get_unsized_with_id(key, type_id_of::<Arc<T>>()).await
     }
 
     /// Get an item, or load it if not cached.
     ///
     /// Concurrent calls for the same key are deduplicated: only the first
     /// caller runs the loader; subsequent callers wait for the result.
-    async fn get_or_insert<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
+    async fn get_or_insert_with_id<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
         &self,
         key: String,
+        type_id: u64,
         loader: F,
     ) -> Result<Arc<T>>
     where
         F: FnOnce(&str) -> Fut,
         Fut: Future<Output = Result<T>> + Send,
     {
-        let cache_key = self.make_key::<T>(&key);
+        let cache_key = self.make_key_with_id(&key, type_id);
 
         // Fast path: already cached.
         if let Some(entry) = self.cache.get(&cache_key).await {
@@ -429,6 +474,20 @@ impl LanceCache {
         }
     }
 
+    #[cfg(test)]
+    async fn get_or_insert<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
+        &self,
+        key: String,
+        loader: F,
+    ) -> Result<Arc<T>>
+    where
+        F: FnOnce(&str) -> Fut,
+        Fut: Future<Output = Result<T>> + Send,
+    {
+        self.get_or_insert_with_id(key, type_id_of::<T>(), loader)
+            .await
+    }
+
     pub async fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -450,7 +509,9 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert(&cache_key.key(), metadata).boxed().await
+        self.insert_with_id(&cache_key.key(), cache_key.type_id(), metadata)
+            .boxed()
+            .await
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -458,7 +519,9 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get::<K::ValueType>(&cache_key.key()).boxed().await
+        self.get_with_id::<K::ValueType>(&cache_key.key(), cache_key.type_id())
+            .boxed()
+            .await
     }
 
     pub async fn get_or_insert_with_key<K, F, Fut>(
@@ -472,8 +535,9 @@ impl LanceCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
+        let type_id = cache_key.type_id();
         let key_str = cache_key.key().into_owned();
-        Box::pin(self.get_or_insert(key_str, |_| loader())).await
+        Box::pin(self.get_or_insert_with_id(key_str, type_id, |_| loader())).await
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -481,7 +545,7 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_unsized(&cache_key.key(), metadata)
+        self.insert_unsized_with_id(&cache_key.key(), cache_key.type_id(), metadata)
             .boxed()
             .await
     }
@@ -491,7 +555,7 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_unsized::<K::ValueType>(&cache_key.key())
+        self.get_unsized_with_id::<K::ValueType>(&cache_key.key(), cache_key.type_id())
             .boxed()
             .await
     }
@@ -532,8 +596,11 @@ impl WeakLanceCache {
         }
     }
 
-    /// Build a key: `prefix/user_key\0<8-byte type tag>`.
     fn make_key<T: 'static>(&self, key: &str) -> Vec<u8> {
+        self.make_key_with_id(key, type_id_of::<T>())
+    }
+
+    fn make_key_with_id(&self, key: &str, type_id: u64) -> Vec<u8> {
         let full_key = if self.prefix.is_empty() {
             key.to_string()
         } else {
@@ -541,7 +608,7 @@ impl WeakLanceCache {
         };
         let mut bytes = full_key.into_bytes();
         bytes.push(0);
-        bytes.extend_from_slice(&type_tag::<T>());
+        bytes.extend_from_slice(&type_id.to_le_bytes());
         bytes
     }
 
@@ -702,12 +769,28 @@ pub trait CacheKey {
     type ValueType;
 
     fn key(&self) -> Cow<'_, str>;
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self::ValueType>()
+    }
+
+    fn type_id(&self) -> u64 {
+        self.type_name().as_ptr() as u64
+    }
 }
 
 pub trait UnsizedCacheKey {
     type ValueType: ?Sized;
 
     fn key(&self) -> Cow<'_, str>;
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self::ValueType>()
+    }
+
+    fn type_id(&self) -> u64 {
+        self.type_name().as_ptr() as u64
+    }
 }
 
 // ---------------------------------------------------------------------------
