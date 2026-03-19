@@ -17,7 +17,7 @@ use crate::session::index_caches::GlobalIndexCache;
 use self::index_extension::IndexExtension;
 
 pub(crate) mod caches;
-pub(crate) mod index_caches;
+pub mod index_caches;
 pub(crate) mod index_extension;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
