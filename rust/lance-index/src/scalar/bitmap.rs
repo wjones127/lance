@@ -128,6 +128,10 @@ impl CacheKey for BitmapKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("{}", self.value.0).into()
     }
+
+    fn type_id(&self) -> &'static str {
+        "Bitmap"
+    }
 }
 
 impl BitmapIndex {

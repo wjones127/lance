@@ -110,6 +110,10 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_id(&self) -> &'static str {
+        "ScalarIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +137,10 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         } else {
             self.uuid.into()
         }
+    }
+
+    fn type_id(&self) -> &'static str {
+        "VectorIndex"
     }
 }
 
@@ -158,6 +166,10 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
+
+    fn type_id(&self) -> &'static str {
+        "FragReuseIndex"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +193,10 @@ impl CacheKey for MemWalCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
+    }
+
+    fn type_id(&self) -> &'static str {
+        "MemWalIndex"
     }
 }
 

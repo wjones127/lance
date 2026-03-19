@@ -207,22 +207,23 @@ impl CacheBackend for MokaCacheBackend {
 // Type identity helpers
 // ---------------------------------------------------------------------------
 
-/// Cache keys are structured as `user_key\0<8-byte type_id>`.
+/// Cache keys are structured as `user_key\0type_id`.
 ///
 /// This function splits an opaque cache key into the user-visible portion
-/// and the type_id. Backend implementations can use this to inspect keys.
-/// Returns `(empty slice, 0)` if the key is too short to parse.
-pub fn parse_cache_key(key: &[u8]) -> (&[u8], u64) {
-    if key.len() < 9 {
-        return (&[], 0);
+/// and the type_id string. Backend implementations can use this to inspect keys.
+/// Returns `(empty slice, "")` if no separator is found.
+pub fn parse_cache_key(key: &[u8]) -> (&[u8], &str) {
+    if let Some(sep) = key.iter().position(|&b| b == 0) {
+        let user_key = &key[..sep];
+        let type_id = std::str::from_utf8(&key[sep + 1..]).unwrap_or("");
+        (user_key, type_id)
+    } else {
+        (key, "")
     }
-    let type_id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-    let user_key = &key[..key.len() - 9];
-    (user_key, u64::from_le_bytes(type_id_bytes))
 }
 
-/// Build a key: `prefix/user_key\0<8-byte type_id>`.
-fn make_cache_key(prefix: &str, key: &str, type_id: u64) -> Vec<u8> {
+/// Build a key: `prefix/user_key\0type_id`.
+fn make_cache_key(prefix: &str, key: &str, type_id: &str) -> Vec<u8> {
     let full_key = if prefix.is_empty() {
         key.to_string()
     } else {
@@ -230,7 +231,7 @@ fn make_cache_key(prefix: &str, key: &str, type_id: u64) -> Vec<u8> {
     };
     let mut bytes = full_key.into_bytes();
     bytes.push(0);
-    bytes.extend_from_slice(&type_id.to_le_bytes());
+    bytes.extend_from_slice(type_id.as_bytes());
     bytes
 }
 
@@ -326,7 +327,7 @@ impl LanceCache {
     async fn insert_with_id<T: DeepSizeOf + Send + Sync + 'static>(
         &self,
         key: &str,
-        type_id: u64,
+        type_id: &str,
         metadata: Arc<T>,
     ) {
         let size = metadata.deep_size_of() + 8;
@@ -337,7 +338,7 @@ impl LanceCache {
     async fn get_with_id<T: Send + Sync + 'static>(
         &self,
         key: &str,
-        type_id: u64,
+        type_id: &str,
     ) -> Option<Arc<T>> {
         let cache_key = make_cache_key(&self.prefix, key, type_id);
         if let Some(entry) = self.cache.get(&cache_key).await {
@@ -352,7 +353,7 @@ impl LanceCache {
     async fn get_or_insert_with_id<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
         &self,
         key: &str,
-        type_id: u64,
+        type_id: &str,
         loader: F,
     ) -> Result<Arc<T>>
     where
@@ -384,7 +385,7 @@ impl LanceCache {
     async fn insert_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
         key: &str,
-        type_id: u64,
+        type_id: &str,
         metadata: Arc<T>,
     ) {
         self.insert_with_id(key, type_id, Arc::new(metadata)).await
@@ -393,7 +394,7 @@ impl LanceCache {
     async fn get_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
         key: &str,
-        type_id: u64,
+        type_id: &str,
     ) -> Option<Arc<T>> {
         let outer = self.get_with_id::<Arc<T>>(key, type_id).await?;
         Some(outer.as_ref().clone())
@@ -613,16 +614,11 @@ pub trait CacheKey {
 
     fn key(&self) -> Cow<'_, str>;
 
-    /// Human-readable type name, for debugging and diagnostics.
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self::ValueType>()
-    }
-
-    /// Stable numeric identifier for key discrimination in the cache.
-    /// Derived from the pointer of [`Self::type_name`] by default.
-    fn type_id(&self) -> u64 {
-        self.type_name().as_ptr() as u64
-    }
+    /// Short, stable string that distinguishes this value type from others in
+    /// the cache. Used as the suffix in the encoded cache key (`user_key\0type_id`).
+    /// Must be consistent across crate boundaries — use a short literal, not
+    /// `type_name` pointers.
+    fn type_id(&self) -> &'static str;
 }
 
 pub trait UnsizedCacheKey {
@@ -630,13 +626,7 @@ pub trait UnsizedCacheKey {
 
     fn key(&self) -> Cow<'_, str>;
 
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<Self::ValueType>()
-    }
-
-    fn type_id(&self) -> u64 {
-        self.type_name().as_ptr() as u64
-    }
+    fn type_id(&self) -> &'static str;
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +688,9 @@ mod tests {
         fn key(&self) -> Cow<'_, str> {
             Cow::Borrowed(&self.key)
         }
+        fn type_id(&self) -> &'static str {
+            std::any::type_name::<T>()
+        }
     }
 
     /// Test helper: an UnsizedCacheKey for trait object values.
@@ -719,6 +712,9 @@ mod tests {
         type ValueType = T;
         fn key(&self) -> Cow<'_, str> {
             Cow::Borrowed(&self.key)
+        }
+        fn type_id(&self) -> &'static str {
+            std::any::type_name::<T>()
         }
     }
 

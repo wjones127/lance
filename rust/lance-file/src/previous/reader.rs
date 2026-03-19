@@ -89,6 +89,10 @@ impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
     fn key(&self) -> Cow<'_, str> {
         self.key.into()
     }
+
+    fn type_id(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
 }
 
 impl FileReader {

@@ -229,6 +229,10 @@ mod tests {
         fn key(&self) -> Cow<'_, str> {
             Cow::Borrowed(self.0)
         }
+
+        fn type_id(&self) -> &'static str {
+            "TestUnsized"
+        }
     }
 
     #[tokio::test]

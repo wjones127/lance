@@ -989,6 +989,10 @@ impl CacheKey for BTreePageKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("page-{}", self.page_number).into()
     }
+
+    fn type_id(&self) -> &'static str {
+        "BTreePage"
+    }
 }
 
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
