@@ -219,7 +219,17 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::cache::UnsizedCacheKey;
     use lance_index::vector::VectorIndex;
+    use std::borrow::Cow;
+
+    struct TestUnsizedKey(&'static str);
+    impl UnsizedCacheKey for TestUnsizedKey {
+        type ValueType = dyn VectorIndex;
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+    }
 
     #[tokio::test]
     async fn test_disable_index_cache() {
@@ -227,7 +237,7 @@ mod tests {
         assert!(
             no_cache
                 .index_cache
-                .get_unsized::<dyn VectorIndex>("abc")
+                .get_unsized_with_key(&TestUnsizedKey("abc"))
                 .await
                 .is_none()
         );
