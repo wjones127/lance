@@ -76,6 +76,13 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     fn approx_num_entries(&self) -> usize {
         0
     }
+
+    /// Approximate weighted size in bytes, callable from synchronous contexts.
+    /// Used by `DeepSizeOf` to report cache memory usage.
+    /// Backends that cannot provide this cheaply should return 0.
+    fn approx_size_bytes(&self) -> usize {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +197,10 @@ impl CacheBackend for MokaCacheBackend {
     fn approx_num_entries(&self) -> usize {
         self.cache.entry_count() as usize
     }
+
+    fn approx_size_bytes(&self) -> usize {
+        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +260,7 @@ impl std::fmt::Debug for LanceCache {
 
 impl DeepSizeOf for LanceCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        // Can't iterate a dyn CacheBackend; use stats().size_bytes for accurate numbers.
-        0
+        self.cache.approx_size_bytes()
     }
 }
 
