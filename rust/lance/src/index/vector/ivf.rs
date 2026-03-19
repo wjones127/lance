@@ -102,6 +102,7 @@ use uuid::Uuid;
 
 pub mod builder;
 pub mod io;
+pub mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
@@ -2671,6 +2672,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -2709,6 +2711,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: None, // Test index, not setting timestamp
             base_id: None,
+            files: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2774,6 +2777,7 @@ mod tests {
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
+            files: None,
         };
 
         // We need to commit this new index to the dataset so it can be found
