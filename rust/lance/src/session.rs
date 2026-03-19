@@ -77,11 +77,7 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "file_metadata_cache",
-                &format!(
-                    "LanceCache(items={}, size_bytes={})",
-                    self.metadata_cache.0.approx_size(),
-                    self.metadata_cache.0.approx_size_bytes(),
-                ),
+                &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
             )
             .field(
                 "index_extensions",

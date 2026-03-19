@@ -238,7 +238,7 @@ impl FileReader {
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&str) -> Fut,
+        F: Fn(&str) -> Fut + Send + Sync,
         Fut: Future<Output = Result<T>> + Send,
     {
         if let Some(cache) = cache {
