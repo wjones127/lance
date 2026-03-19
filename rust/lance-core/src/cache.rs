@@ -48,8 +48,7 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Get an existing entry or compute it from `loader`.
     ///
     /// Implementations should deduplicate concurrent loads for the same key
-    /// so the loader runs at most once. The default implementation does a
-    /// simple get-then-insert without deduplication.
+    /// so the loader runs at most once.
     ///
     /// The loader is a pinned future that produces `(entry, size_bytes)`.
     /// It borrows from the caller's scope and will be `.await`ed within
@@ -58,14 +57,7 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         &self,
         key: &[u8],
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-    ) -> Result<CacheEntry> {
-        if let Some(entry) = self.get(key).await {
-            return Ok(entry);
-        }
-        let (entry, size) = loader.await?;
-        self.insert(key, entry.clone(), size).await;
-        Ok(entry)
-    }
+    ) -> Result<CacheEntry>;
 
     /// Remove all entries whose key starts with `prefix`.
     async fn invalidate_prefix(&self, prefix: &[u8]);
@@ -878,6 +870,22 @@ mod tests {
                     .lock()
                     .await
                     .insert(key.to_vec(), (entry, size_bytes));
+            }
+            async fn get_or_insert<'a>(
+                &self,
+                key: &[u8],
+                loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            ) -> Result<CacheEntry> {
+                if let Some((entry, _)) = self.map.lock().await.get(key) {
+                    Ok(entry.clone())
+                } else {
+                    let (entry, size) = loader.await?;
+                    self.map
+                        .lock()
+                        .await
+                        .insert(key.to_vec(), (entry.clone(), size));
+                    Ok(entry)
+                }
             }
             async fn invalidate_prefix(&self, prefix: &[u8]) {
                 self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
