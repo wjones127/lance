@@ -13,6 +13,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -89,7 +90,7 @@ struct MokaCacheEntry {
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
 ///
-/// Provides weighted-capacity eviction and concurrent-load deduplication.
+/// Provides weighted-capacity eviction.
 pub struct MokaCacheBackend {
     cache: moka::future::Cache<Vec<u8>, MokaCacheEntry>,
 }
@@ -163,6 +164,35 @@ impl CacheBackend for MokaCacheBackend {
 }
 
 // ---------------------------------------------------------------------------
+// Type identity helpers
+// ---------------------------------------------------------------------------
+
+/// Returns a stable u64 identifier for type `T`, derived from hashing its
+/// [`std::any::TypeId`]. This is guaranteed unique per type within a compilation
+/// unit and stable within a single process lifetime.
+pub fn type_id_of<T: 'static + ?Sized>() -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::any::TypeId::of::<T>().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Cache keys are structured as `user_key\0<8-byte type_id>`.
+///
+/// This function splits an opaque cache key into the user-visible portion
+/// and the type_id. Backend implementations can use this to inspect keys.
+///
+/// # Panics
+///
+/// Panics if `key` is shorter than 9 bytes.
+pub fn parse_cache_key(key: &[u8]) -> (&[u8], u64) {
+    assert!(key.len() >= 9, "cache key too short to parse");
+    let type_id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+    // Everything before the trailing \0 + 8-byte tag.
+    let user_key = &key[..key.len() - 9];
+    (user_key, u64::from_le_bytes(type_id_bytes))
+}
+
+// ---------------------------------------------------------------------------
 // LanceCache — typed wrapper around dyn CacheBackend
 // ---------------------------------------------------------------------------
 
@@ -190,27 +220,9 @@ impl std::fmt::Debug for LanceCache {
 
 impl DeepSizeOf for LanceCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        // This is a best-effort estimate; we can't iterate a dyn CacheBackend.
-        // Callers should use stats().size_bytes for accurate numbers.
+        // Can't iterate a dyn CacheBackend; use stats().size_bytes for accurate numbers.
         0
     }
-}
-
-/// Returns the type_id for type `T`, derived from the pointer of its
-/// [`std::any::type_name`]. Stable within a single process lifetime.
-pub fn type_id_of<T: 'static>() -> u64 {
-    std::any::type_name::<T>().as_ptr() as u64
-}
-
-/// Cache keys are structured as `user_key\0<8-byte type_id>`.
-///
-/// This function splits an opaque cache key into the user-visible portion
-/// and the type_id. Backend implementations can use this to inspect keys.
-pub fn parse_cache_key(key: &[u8]) -> (&[u8], u64) {
-    let type_id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-    // Everything before the trailing \0 + 8-byte tag.
-    let user_key = &key[..key.len() - 9];
-    (user_key, u64::from_le_bytes(type_id_bytes))
 }
 
 impl LanceCache {
@@ -282,18 +294,13 @@ impl LanceCache {
         }
     }
 
-    /// Invalidate all entries in the cache that start with the given prefix
+    /// Invalidate all entries in the cache that start with the given prefix.
     ///
     /// The given prefix is appended to the existing prefix of the cache. If you
     /// want to invalidate all at the current prefix, pass an empty string.
-    pub fn invalidate_prefix(&self, prefix: &str) {
+    pub async fn invalidate_prefix(&self, prefix: &str) {
         let prefix_bytes = self.make_prefix(prefix);
-        let cache = self.cache.clone();
-        // Fire-and-forget; moka's invalidate_entries_if is synchronous under the hood
-        // but our trait is async, so we spawn.
-        tokio::spawn(async move {
-            cache.invalidate_prefix(&prefix_bytes).await;
-        });
+        self.cache.invalidate_prefix(&prefix_bytes).await;
     }
 
     pub async fn size(&self) -> usize {
@@ -329,11 +336,6 @@ impl LanceCache {
         self.cache.insert(&cache_key, metadata, size).await;
     }
 
-    #[cfg(test)]
-    async fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str, metadata: Arc<T>) {
-        self.insert_with_id(key, type_id_of::<T>(), metadata).await
-    }
-
     async fn insert_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
         key: &str,
@@ -365,11 +367,6 @@ impl LanceCache {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
-    }
-
-    #[cfg(test)]
-    async fn get<T: DeepSizeOf + Send + Sync + 'static>(&self, key: &str) -> Option<Arc<T>> {
-        self.get_with_id(key, type_id_of::<T>()).await
     }
 
     async fn get_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
@@ -410,41 +407,48 @@ impl LanceCache {
             return Ok(entry.downcast::<T>().unwrap());
         }
 
+        // Lock the in-flight map. While holding the lock, re-check the cache
+        // to close the race between the fast-path check and registration.
+        let mut map = self.in_flight.lock().await;
+
+        // Another task may have completed the load between our fast-path check
+        // and acquiring this lock.
+        if let Some(entry) = self.cache.get(&cache_key).await {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(entry.downcast::<T>().unwrap());
+        }
+
         // Check for an in-flight load for this key.
-        {
-            let map = self.in_flight.lock().await;
-            if let Some(rx) = map.get(&cache_key) {
-                let mut rx = rx.clone();
-                drop(map);
-                // Wait until the leader finishes.
-                let result = rx
-                    .wait_for(|v| v.is_some())
-                    .await
-                    .map_err(|_| crate::Error::internal("In-flight cache loader was dropped"))?
-                    .as_ref()
-                    .unwrap()
-                    .clone();
-                match result {
-                    Ok(entry) => {
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(entry.downcast::<T>().unwrap());
-                    }
-                    Err(err) => {
-                        self.misses.fetch_add(1, Ordering::Relaxed);
-                        return Err(crate::Error::internal(format!(
-                            "Cache loader failed: {err}"
-                        )));
-                    }
+        if let Some(rx) = map.get(&cache_key) {
+            let mut rx = rx.clone();
+            drop(map);
+            // Wait until the leader finishes.
+            let result = rx
+                .wait_for(|v| v.is_some())
+                .await
+                .map_err(|_| crate::Error::internal("In-flight cache loader was dropped"))?
+                .as_ref()
+                .unwrap()
+                .clone();
+            match result {
+                Ok(entry) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(entry.downcast::<T>().unwrap());
+                }
+                Err(err) => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return Err(crate::Error::internal(format!(
+                        "Cache loader failed: {err}"
+                    )));
                 }
             }
         }
 
-        // We are the leader. Register our in-flight entry.
+        // We are the leader. Register our in-flight entry while still holding
+        // the lock, so no other task can slip in between check and register.
         let (tx, rx) = tokio::sync::watch::channel(None);
-        {
-            let mut map = self.in_flight.lock().await;
-            map.insert(cache_key.clone(), rx);
-        }
+        map.insert(cache_key.clone(), rx);
+        drop(map);
 
         self.misses.fetch_add(1, Ordering::Relaxed);
         let result = loader(&key).await;
@@ -467,25 +471,12 @@ impl LanceCache {
             Err(err) => {
                 let shared_err = Arc::new(err);
                 let _ = tx.send(Some(Err(shared_err.clone())));
-                Err(crate::Error::internal(format!(
-                    "Cache loader failed: {shared_err}"
-                )))
+                // Try to recover the original error if we're the sole owner.
+                Err(Arc::try_unwrap(shared_err).unwrap_or_else(|arc| {
+                    crate::Error::internal(format!("Cache loader failed: {arc}"))
+                }))
             }
         }
-    }
-
-    #[cfg(test)]
-    async fn get_or_insert<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
-        &self,
-        key: String,
-        loader: F,
-    ) -> Result<Arc<T>>
-    where
-        F: FnOnce(&str) -> Fut,
-        Fut: Future<Output = Result<T>> + Send,
-    {
-        self.get_or_insert_with_id(key, type_id_of::<T>(), loader)
-            .await
     }
 
     pub async fn stats(&self) -> CacheStats {
@@ -573,6 +564,7 @@ pub struct WeakLanceCache {
     prefix: String,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
+    in_flight: Arc<InFlightMap>,
 }
 
 impl WeakLanceCache {
@@ -583,6 +575,7 @@ impl WeakLanceCache {
             prefix: cache.prefix.clone(),
             hits: cache.hits.clone(),
             misses: cache.misses.clone(),
+            in_flight: cache.in_flight.clone(),
         }
     }
 
@@ -593,6 +586,7 @@ impl WeakLanceCache {
             prefix: format!("{}{}/", self.prefix, prefix),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
+            in_flight: self.in_flight.clone(),
         }
     }
 
@@ -643,7 +637,9 @@ impl WeakLanceCache {
         }
     }
 
-    /// Get or insert an item, computing it if necessary
+    /// Get or insert an item, computing it if necessary.
+    ///
+    /// Concurrent calls for the same key are deduplicated.
     pub async fn get_or_insert<T, F, Fut>(&self, key: &str, f: F) -> Result<Arc<T>>
     where
         T: DeepSizeOf + Send + Sync + 'static,
@@ -653,17 +649,73 @@ impl WeakLanceCache {
         if let Some(cache) = self.inner.upgrade() {
             let cache_key = self.make_key::<T>(key);
 
+            // Fast path: already cached.
             if let Some(entry) = cache.get(&cache_key).await {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(entry.downcast::<T>().unwrap());
             }
 
+            // Lock in-flight map. Re-check cache under lock to close the race.
+            let mut map = self.in_flight.lock().await;
+
+            if let Some(entry) = cache.get(&cache_key).await {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(entry.downcast::<T>().unwrap());
+            }
+
+            if let Some(rx) = map.get(&cache_key) {
+                let mut rx = rx.clone();
+                drop(map);
+                let result = rx
+                    .wait_for(|v| v.is_some())
+                    .await
+                    .map_err(|_| crate::Error::internal("In-flight cache loader was dropped"))?
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                match result {
+                    Ok(entry) => {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(entry.downcast::<T>().unwrap());
+                    }
+                    Err(err) => {
+                        self.misses.fetch_add(1, Ordering::Relaxed);
+                        return Err(crate::Error::internal(format!(
+                            "Cache loader failed: {err}"
+                        )));
+                    }
+                }
+            }
+
+            // We are the leader.
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            map.insert(cache_key.clone(), rx);
+            drop(map);
+
             self.misses.fetch_add(1, Ordering::Relaxed);
-            let value = f().await?;
-            let arc = Arc::new(value);
-            let size = arc.deep_size_of() + 8;
-            cache.insert(&cache_key, arc.clone(), size).await;
-            Ok(arc)
+            let result = f().await;
+
+            {
+                let mut map = self.in_flight.lock().await;
+                map.remove(&cache_key);
+            }
+
+            match result {
+                Ok(value) => {
+                    let arc = Arc::new(value);
+                    let size = arc.deep_size_of() + 8;
+                    cache.insert(&cache_key, arc.clone(), size).await;
+                    let _ = tx.send(Some(Ok(arc.clone() as CacheEntry)));
+                    Ok(arc)
+                }
+                Err(err) => {
+                    let shared_err = Arc::new(err);
+                    let _ = tx.send(Some(Err(shared_err.clone())));
+                    Err(Arc::try_unwrap(shared_err).unwrap_or_else(|arc| {
+                        crate::Error::internal(format!("Cache loader failed: {arc}"))
+                    }))
+                }
+            }
         } else {
             log::warn!("WeakLanceCache: cache no longer available, computing without caching");
             f().await.map(Arc::new)
@@ -766,21 +818,24 @@ impl WeakLanceCache {
 // ---------------------------------------------------------------------------
 
 pub trait CacheKey {
-    type ValueType;
+    type ValueType: 'static;
 
     fn key(&self) -> Cow<'_, str>;
 
+    /// Human-readable type name, for debugging and diagnostics.
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self::ValueType>()
     }
 
+    /// Stable numeric identifier used for key discrimination in the cache.
+    /// Derived from [`type_id_of`] by default.
     fn type_id(&self) -> u64 {
-        self.type_name().as_ptr() as u64
+        type_id_of::<Self::ValueType>()
     }
 }
 
 pub trait UnsizedCacheKey {
-    type ValueType: ?Sized;
+    type ValueType: 'static + ?Sized;
 
     fn key(&self) -> Cow<'_, str>;
 
@@ -789,7 +844,7 @@ pub trait UnsizedCacheKey {
     }
 
     fn type_id(&self) -> u64 {
-        self.type_name().as_ptr() as u64
+        type_id_of::<Self::ValueType>()
     }
 }
 
@@ -834,30 +889,59 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::marker::PhantomData;
+
+    /// Test helper: a simple CacheKey for bare string keys.
+    struct TestKey<T: 'static> {
+        key: String,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T: 'static> TestKey<T> {
+        fn new(key: &str) -> Self {
+            Self {
+                key: key.to_string(),
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T: 'static> CacheKey for TestKey<T> {
+        type ValueType = T;
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(&self.key)
+        }
+    }
 
     #[tokio::test]
     async fn test_cache_bytes() {
         let item = Arc::new(vec![1, 2, 3]);
-        let item_size = item.deep_size_of(); // Size of Arc<Vec<i32>>
+        let item_size = item.deep_size_of();
         let capacity = 10 * item_size;
 
         let cache = LanceCache::with_capacity(capacity);
 
         let item = Arc::new(vec![1, 2, 3]);
-        cache.insert("key", item.clone()).await;
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("key"), item.clone())
+            .await;
         assert_eq!(cache.size().await, 1);
 
-        let retrieved = cache.get::<Vec<i32>>("key").await.unwrap();
+        let retrieved = cache
+            .get_with_key(&TestKey::<Vec<i32>>::new("key"))
+            .await
+            .unwrap();
         assert_eq!(*retrieved, *item);
 
         // Test eviction based on size
         for i in 0..20 {
             cache
-                .insert(&format!("key_{}", i), Arc::new(vec![i, i, i]))
+                .insert_with_key(
+                    &TestKey::<Vec<i32>>::new(&format!("key_{}", i)),
+                    Arc::new(vec![i, i, i]),
+                )
                 .await;
         }
-        // Moka evicts based on weighted size; after run_pending_tasks, the size
-        // should be bounded by capacity.
         assert!(cache.size_bytes().await <= capacity);
     }
 
@@ -891,39 +975,52 @@ mod tests {
     async fn test_cache_stats_basic() {
         let cache = LanceCache::with_capacity(1000);
 
-        // Initially no hits or misses
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 0);
 
-        // Miss on first get
-        let result = cache.get::<Vec<i32>>("nonexistent");
-        assert!(result.await.is_none());
+        // Miss
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("nonexistent"))
+                .await
+                .is_none()
+        );
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 1);
 
-        // Insert and then hit
-        cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
-        let result = cache.get::<Vec<i32>>("key1");
-        assert!(result.await.is_some());
+        // Insert then hit
+        cache
+            .insert_with_key(&TestKey::new("key1"), Arc::new(vec![1, 2, 3]))
+            .await;
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("key1"))
+                .await
+                .is_some()
+        );
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
 
         // Another hit
-        let result = cache.get::<Vec<i32>>("key1");
-        assert!(result.await.is_some());
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 2);
-        assert_eq!(stats.misses, 1);
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("key1"))
+                .await
+                .is_some()
+        );
+        assert_eq!(cache.stats().await.hits, 2);
 
         // Another miss
-        let result = cache.get::<Vec<i32>>("nonexistent2");
-        assert!(result.await.is_none());
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 2);
-        assert_eq!(stats.misses, 2);
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("nonexistent2"))
+                .await
+                .is_none()
+        );
+        assert_eq!(cache.stats().await.misses, 2);
     }
 
     #[tokio::test]
@@ -931,41 +1028,30 @@ mod tests {
         let base_cache = LanceCache::with_capacity(1000);
         let prefixed_cache = base_cache.with_key_prefix("test");
 
-        // Stats should be shared between base and prefixed cache
-        let stats = base_cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 0);
-
-        let stats = prefixed_cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 0);
+        assert_eq!(base_cache.stats().await.hits, 0);
+        assert_eq!(prefixed_cache.stats().await.misses, 0);
 
         // Miss on prefixed cache
-        let result = prefixed_cache.get::<Vec<i32>>("key1");
-        assert!(result.await.is_none());
-
-        // Both should show the miss
-        let stats = base_cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 1);
-
-        let stats = prefixed_cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 1);
+        assert!(
+            prefixed_cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("key1"))
+                .await
+                .is_none()
+        );
+        assert_eq!(base_cache.stats().await.misses, 1);
+        assert_eq!(prefixed_cache.stats().await.misses, 1);
 
         // Insert through prefixed cache and hit
-        prefixed_cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
-        let result = prefixed_cache.get::<Vec<i32>>("key1");
-        assert!(result.await.is_some());
-
-        // Both should show the hit
-        let stats = base_cache.stats().await;
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
-
-        let stats = prefixed_cache.stats().await;
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
+        prefixed_cache
+            .insert_with_key(&TestKey::new("key1"), Arc::new(vec![1, 2, 3]))
+            .await;
+        assert!(
+            prefixed_cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("key1"))
+                .await
+                .is_some()
+        );
+        assert_eq!(base_cache.stats().await.hits, 1);
     }
 
     #[tokio::test]
@@ -979,71 +1065,55 @@ mod tests {
 
         let cache = LanceCache::with_capacity(1000);
 
-        // Miss on unsized get
-        let result = cache.get_unsized::<dyn MyTrait>("test");
-        assert!(result.await.is_none());
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 1);
+        assert!(cache.get_unsized::<dyn MyTrait>("test").await.is_none());
+        assert_eq!(cache.stats().await.misses, 1);
 
-        // Insert and hit on unsized
-        let item = Arc::new(MyType(42));
-        let item_dyn: Arc<dyn MyTrait> = item;
-        cache.insert_unsized("test", item_dyn).await;
+        let item: Arc<dyn MyTrait> = Arc::new(MyType(42));
+        cache.insert_unsized("test", item).await;
 
-        let result = cache.get_unsized::<dyn MyTrait>("test");
-        assert!(result.await.is_some());
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
+        assert!(cache.get_unsized::<dyn MyTrait>("test").await.is_some());
+        assert_eq!(cache.stats().await.hits, 1);
     }
 
     #[tokio::test]
     async fn test_cache_stats_get_or_insert() {
         let cache = LanceCache::with_capacity(1000);
 
-        // First call should be a miss and load the value
+        // First call: miss
         let result: Arc<Vec<i32>> = cache
-            .get_or_insert("key1".to_string(), |_key| async { Ok(vec![1, 2, 3]) })
+            .get_or_insert_with_key(TestKey::<Vec<i32>>::new("key1"), || async {
+                Ok(vec![1, 2, 3])
+            })
             .await
             .unwrap();
         assert_eq!(*result, vec![1, 2, 3]);
+        assert_eq!(cache.stats().await.misses, 1);
 
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 0);
-        assert_eq!(stats.misses, 1);
-
-        // Second call should be a hit
+        // Second call: hit
         let result: Arc<Vec<i32>> = cache
-            .get_or_insert("key1".to_string(), |_key| async {
+            .get_or_insert_with_key(TestKey::<Vec<i32>>::new("key1"), || async {
                 panic!("Should not be called")
             })
             .await
             .unwrap();
         assert_eq!(*result, vec![1, 2, 3]);
+        assert_eq!(cache.stats().await.hits, 1);
 
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
-
-        // Different key should be another miss
+        // Different key: miss
         let result: Arc<Vec<i32>> = cache
-            .get_or_insert("key2".to_string(), |_key| async { Ok(vec![4, 5, 6]) })
+            .get_or_insert_with_key(TestKey::<Vec<i32>>::new("key2"), || async {
+                Ok(vec![4, 5, 6])
+            })
             .await
             .unwrap();
         assert_eq!(*result, vec![4, 5, 6]);
-
-        let stats = cache.stats().await;
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 2);
+        assert_eq!(cache.stats().await.misses, 2);
     }
 
     #[tokio::test]
     async fn test_custom_backend() {
-        use std::collections::HashMap;
         use tokio::sync::Mutex;
 
-        /// A simple HashMap-based cache backend for testing.
         #[derive(Debug)]
         struct HashMapBackend {
             map: Mutex<HashMap<Vec<u8>, (CacheEntry, usize)>>,
@@ -1090,16 +1160,23 @@ mod tests {
         let backend = Arc::new(HashMapBackend::new());
         let cache = LanceCache::with_backend(backend);
 
-        // Insert and retrieve
-        cache.insert("key1", Arc::new(vec![1, 2, 3])).await;
-        let retrieved = cache.get::<Vec<i32>>("key1").await.unwrap();
+        cache
+            .insert_with_key(&TestKey::new("key1"), Arc::new(vec![1, 2, 3]))
+            .await;
+        let retrieved = cache
+            .get_with_key(&TestKey::<Vec<i32>>::new("key1"))
+            .await
+            .unwrap();
         assert_eq!(*retrieved, vec![1, 2, 3]);
 
         // Miss for different type at same key
-        let miss = cache.get::<Vec<u8>>("key1").await;
-        assert!(miss.is_none());
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<u8>>::new("key1"))
+                .await
+                .is_none()
+        );
 
-        // Stats tracking works
         let stats = cache.stats().await;
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
@@ -1113,7 +1190,6 @@ mod tests {
         let load_count = Arc::new(AtomicUsize::new(0));
         let cache = LanceCache::with_capacity(10000);
 
-        // Launch several concurrent get_or_insert calls for the same key.
         let (barrier_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         let mut handles = Vec::new();
         for _ in 0..5 {
@@ -1123,11 +1199,10 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 barrier_rx.recv().await.ok();
                 cache
-                    .get_or_insert("key".to_string(), |_key| {
+                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("key"), || {
                         let load_count = load_count.clone();
                         async move {
                             load_count.fetch_add(1, Ordering::SeqCst);
-                            // Simulate slow load so other tasks can pile up.
                             tokio::task::yield_now().await;
                             Ok(vec![1, 2, 3])
                         }
@@ -1135,14 +1210,12 @@ mod tests {
                     .await
             }));
         }
-        // Release all tasks at once.
         barrier_tx.send(()).unwrap();
         for h in handles {
             let result: Arc<Vec<i32>> = h.await.unwrap().unwrap();
             assert_eq!(*result, vec![1, 2, 3]);
         }
 
-        // The loader should have run exactly once.
         assert_eq!(load_count.load(Ordering::SeqCst), 1);
     }
 }

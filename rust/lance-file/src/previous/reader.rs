@@ -83,7 +83,7 @@ impl<'a, T> StringCacheKey<'a, T> {
     }
 }
 
-impl<T> CacheKey for StringCacheKey<'_, T> {
+impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
     type ValueType = T;
 
     fn key(&self) -> Cow<'_, str> {
