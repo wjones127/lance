@@ -102,7 +102,6 @@ use uuid::Uuid;
 
 pub mod builder;
 pub mod io;
-pub mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects

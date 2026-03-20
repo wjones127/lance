@@ -42,7 +42,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
@@ -130,7 +129,7 @@ impl<'a> VectorIndexCacheKey<'a> {
 }
 
 impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
-    type ValueType = dyn VectorIndexData;
+    type ValueType = dyn VectorIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -1338,10 +1337,7 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Quick cache checks for scalar and frag-reuse indices. VectorIndex
-        // is not checked here because the cache stores VectorIndexData (serializable
-        // state), not a live VectorIndex — reconstruction is handled by
-        // open_vector_index.
+        // Quick cache checks for scalar and frag-reuse indices.
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
@@ -1422,22 +1418,9 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        // Check cache for serialized VectorIndexData and reconstruct if found.
-        if let Some(data) = self.index_cache.get_unsized_with_key(&cache_key).await
-            && let Some(state) = data.as_any().downcast_ref::<IvfIndexState>()
-        {
-            log::debug!(
-                "Reconstructing vector index from cached state uuid: {}",
-                uuid
-            );
-            let partition_cache = self.index_cache.with_key_prefix(&cache_key.key());
-            return vector::ivf::v2::reconstruct_vector_index(
-                state.clone(),
-                self.object_store.clone(),
-                &self.metadata_cache,
-                partition_cache,
-            )
-            .await;
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
+            return Ok(index);
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
@@ -1501,12 +1484,9 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file_sizes = index_meta.file_size_map();
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
+                let file = scheduler
+                    .open_file(&index_file, &CachedFileSize::unknown())
+                    .await?;
                 let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
@@ -1540,7 +1520,6 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1553,7 +1532,6 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1572,7 +1550,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1586,7 +1563,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1600,7 +1576,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1617,7 +1592,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             &file_metadata_cache,
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1631,7 +1605,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1645,7 +1618,6 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1664,14 +1636,9 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        // Cache the serializable state, not the live index. The live index
-        // holds FileReader handles that can't survive serialization; the
-        // state can be cheaply reconstructed on the next cache hit.
-        if let Some(state) = index.cacheable_state() {
-            self.index_cache
-                .insert_unsized_with_key(&cache_key, Arc::from(state))
-                .await;
-        }
+        self.index_cache
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
