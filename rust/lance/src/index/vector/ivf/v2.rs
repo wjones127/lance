@@ -234,6 +234,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Reconstruct from cached state, skipping global buffer reads.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_cached_state(
         uri: String,
         uuid: String,
