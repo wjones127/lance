@@ -294,6 +294,17 @@ impl LanceCache {
         }
     }
 
+    /// Create a cache with the given backend and an exact prefix string.
+    /// Unlike `with_key_prefix`, this sets the prefix verbatim (no trailing slash added).
+    pub fn with_backend_and_prefix(backend: Arc<dyn CacheBackend>, prefix: String) -> Self {
+        Self {
+            cache: backend,
+            prefix,
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     /// Appends a prefix to the cache key.
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
@@ -507,6 +518,11 @@ impl WeakLanceCache {
             hits: self.hits.clone(),
             misses: self.misses.clone(),
         }
+    }
+
+    /// The key prefix used for all entries in this cache.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>

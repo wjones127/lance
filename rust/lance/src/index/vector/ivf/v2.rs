@@ -641,6 +641,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             quantizer_extra_data: extra_data.map(|b| b.to_vec()),
             sub_index_type,
             quantization_type,
+            cache_key_prefix: self.index_cache.prefix().to_string(),
         })
     }
 }

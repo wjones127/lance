@@ -160,6 +160,9 @@ pub struct IvfIndexState {
     pub quantizer_extra_data: Option<Vec<u8>>,
     pub sub_index_type: SubIndexType,
     pub quantization_type: QuantizationType,
+    /// The cache key prefix used by the original index's WeakLanceCache.
+    /// Needed to reconnect the reconstructed index to the shared cache backend.
+    pub cache_key_prefix: String,
 }
 
 /// Serialization header for [`IvfIndexState`].
@@ -172,6 +175,8 @@ struct IvfIndexStateHeader {
     sub_index_type: String,
     quantization_type: String,
     quantizer_metadata_json: String,
+    #[serde(default)]
+    cache_key_prefix: String,
 }
 
 impl IvfIndexState {
@@ -187,6 +192,7 @@ impl IvfIndexState {
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json: self.quantizer_metadata_json.clone(),
+            cache_key_prefix: self.cache_key_prefix.clone(),
         };
         let header_json = serde_json::to_vec(&header)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
@@ -261,6 +267,7 @@ impl IvfIndexState {
             quantizer_extra_data,
             sub_index_type,
             quantization_type,
+            cache_key_prefix: header.cache_key_prefix,
         })
     }
 }
