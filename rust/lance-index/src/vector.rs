@@ -142,11 +142,41 @@ impl From<DistanceType> for pb::VectorMetricType {
     }
 }
 
+/// Serializable snapshot of a vector index, suitable for disk caching.
+///
+/// Implementations must be cheaply reconstructable into a live
+/// [`VectorIndex`] given an ObjectStore, file metadata cache, and partition
+/// cache. The reconstruction cost should be dominated by re-opening
+/// `FileReader`s, which is cheap when the file metadata cache is warm.
+pub trait VectorIndexData: Send + Sync + DeepSizeOf + std::fmt::Debug {
+    /// Serialize this state into `writer`. Called on a blocking thread by
+    /// the disk cache codec.
+    fn write_to(&self, writer: &mut dyn std::io::Write) -> Result<()>;
+
+    /// Tag used to dispatch deserialization to the correct concrete type.
+    fn index_type_tag(&self) -> &'static str;
+
+    /// Downcast to `&dyn Any` for concrete type access during reconstruction.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Deserialize a [`VectorIndexData`] from bytes previously written by
+/// [`VectorIndexData::write_to`].
+pub fn deserialize_vector_index_data(data: Bytes) -> Result<Arc<dyn VectorIndexData>> {
+    // Currently only IVF indices support disk caching. The serialization
+    // format is self-describing (IvfIndexState header), so no external tag
+    // is needed yet. When additional index types are added, prepend a
+    // version/tag byte to the wire format.
+    let state = IvfIndexState::deserialize(data)?;
+    Ok(Arc::new(state))
+}
+
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.
 ///
 /// Produced by [`VectorIndex::cacheable_state`] and consumed by a
 /// reconstruction function that re-opens FileReaders using cached file metadata.
+#[derive(Debug, Clone)]
 pub struct IvfIndexState {
     /// Object-store path to the index file (before `to_local_path` conversion).
     pub index_file_path: String,
@@ -269,6 +299,38 @@ impl IvfIndexState {
             quantization_type,
             cache_key_prefix: header.cache_key_prefix,
         })
+    }
+}
+
+impl DeepSizeOf for IvfIndexState {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.index_file_path.deep_size_of_children(context)
+            + self.uuid.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+            + self.sub_index_metadata.deep_size_of_children(context)
+            + self.quantizer_metadata_json.deep_size_of_children(context)
+            + self
+                .quantizer_extra_data
+                .as_ref()
+                .map(|v| v.deep_size_of_children(context))
+                .unwrap_or(0)
+            + self.cache_key_prefix.deep_size_of_children(context)
+    }
+}
+
+impl VectorIndexData for IvfIndexState {
+    fn write_to(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        let bytes = self.serialize()?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
+    fn index_type_tag(&self) -> &'static str {
+        "IVF"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -399,7 +461,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// Export the index state needed for reconstruction from a disk cache.
     /// Returns `None` if this index type doesn't support persistent caching.
-    fn cacheable_state(&self) -> Option<IvfIndexState> {
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
         None
     }
 }

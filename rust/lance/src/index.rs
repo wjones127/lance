@@ -42,6 +42,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
@@ -129,7 +130,7 @@ impl<'a> VectorIndexCacheKey<'a> {
 }
 
 impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
-    type ValueType = dyn VectorIndex;
+    type ValueType = dyn VectorIndexData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -1296,19 +1297,13 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Checking for cache existence is cheap so we just check both scalar and vector caches
+        // Quick cache checks for scalar and frag-reuse indices. VectorIndex
+        // is not checked here because the cache stores VectorIndexData (serializable
+        // state), not a live VectorIndex — reconstruction is handled by
+        // open_vector_index.
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            return Ok(index.as_index());
-        }
-
-        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self
-            .index_cache
-            .get_unsized_with_key(&vector_cache_key)
-            .await
-        {
             return Ok(index.as_index());
         }
 
@@ -1378,9 +1373,26 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            log::debug!("Found vector index in cache uuid: {}", uuid);
-            return Ok(index);
+        // Check cache for serialized VectorIndexData and reconstruct if found.
+        if let Some(data) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            if let Some(state) = data.as_any().downcast_ref::<IvfIndexState>() {
+                log::debug!(
+                    "Reconstructing vector index from cached state uuid: {}",
+                    uuid
+                );
+                let partition_cache = self.index_cache.with_key_prefix(&cache_key.key());
+                // Namespace the file metadata cache by the index file path,
+                // matching what the full-load path does.
+                let index_path = object_store::path::Path::from(state.index_file_path.as_str());
+                let fmc = self.metadata_cache.file_metadata_cache(&index_path);
+                return vector::ivf::v2::reconstruct_vector_index(
+                    state.clone(),
+                    self.object_store.clone(),
+                    &fmc,
+                    partition_cache,
+                )
+                .await;
+            }
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
@@ -1596,9 +1608,14 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone())
-            .await;
+        // Cache the serializable state, not the live index. The live index
+        // holds FileReader handles that can't survive serialization; the
+        // state can be cheaply reconstructed on the next cache hit.
+        if let Some(state) = index.cacheable_state() {
+            self.index_cache
+                .insert_unsized_with_key(&cache_key, Arc::from(state))
+                .await;
+        }
         Ok(index)
     }
 

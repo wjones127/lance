@@ -38,7 +38,7 @@ use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::{IvfIndexState, VectorIndexCacheEntry};
+use lance_index::vector::{IvfIndexState, VectorIndexCacheEntry, VectorIndexData};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
@@ -625,13 +625,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.distance_type
     }
 
-    fn cacheable_state(&self) -> Option<IvfIndexState> {
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
         let extra_data = self.storage.metadata().extra_metadata().ok().flatten();
         let metadata_json = serde_json::to_string(self.storage.metadata()).ok()?;
         let (sub_index_type, quantization_type) = self.sub_index_type();
         // Convert local path back to object_store Path (undo to_local_path's "/" prefix)
         let index_file_path = self.uri.trim_start_matches('/').to_string();
-        Some(IvfIndexState {
+        Some(Box::new(IvfIndexState {
             index_file_path,
             uuid: self.uuid.clone(),
             ivf: self.ivf.clone(),
@@ -642,7 +642,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             sub_index_type,
             quantization_type,
             cache_key_prefix: self.index_cache.prefix().to_string(),
-        })
+        }))
     }
 }
 
