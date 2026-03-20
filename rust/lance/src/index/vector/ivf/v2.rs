@@ -149,16 +149,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
+        file_sizes: HashMap<String, u64>,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let index_reader = FileReader::try_open(
-            scheduler
-                .open_file(&uri, &CachedFileSize::unknown())
-                .await?,
+            scheduler.open_file(&uri, &cached_size).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             file_metadata_cache,
@@ -192,13 +195,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
+        let aux_cached_size = file_sizes
+            .get(INDEX_AUXILIARY_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
         let storage_reader = FileReader::try_open(
             scheduler
                 .open_file(
                     &index_dir
                         .child(uuid.as_str())
                         .child(INDEX_AUXILIARY_FILE_NAME),
-                    &CachedFileSize::unknown(),
+                    &aux_cached_size,
                 )
                 .await?,
             None,
@@ -872,7 +879,7 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -1686,7 +1693,16 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index(index_name, "vector", shared_uuid)
+            .commit_existing_index_segments(
+                index_name,
+                "vector",
+                vec![IndexSegment::new(
+                    shared_uuid,
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    Arc::new(crate::index::vector_index_details()),
+                    IndexType::IvfPq.version(),
+                )],
+            )
             .await
             .unwrap();
     }
