@@ -353,8 +353,19 @@ impl LanceCache {
     ) -> Option<Arc<T>> {
         let cache_key = make_cache_key(&self.prefix, key, type_id);
         if let Some(entry) = self.cache.get(&cache_key).await {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.downcast::<T>().unwrap())
+            match entry.downcast::<T>() {
+                Ok(val) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(val)
+                }
+                Err(_) => {
+                    // Type mismatch: the backend returned a different concrete
+                    // type than expected (e.g. a disk cache may store
+                    // intermediate state). Treat as a miss.
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            }
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
