@@ -125,7 +125,7 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
         format!("ivf-{}", self.partition_id).into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "LegacyIVFPartition"
     }
 }

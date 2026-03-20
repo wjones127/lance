@@ -17,6 +17,7 @@
 //! sections are read zero-copy using [`FileDecoder`] so that Arrow arrays
 //! reference the original buffer directly.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, RecordBatch};
@@ -43,6 +44,17 @@ use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use super::v2::PartitionEntry;
+
+/// Serialization interface for spilling cache entries to an external store.
+///
+/// `serialize` writes the entry into the provided writer and returns the
+/// number of bytes written.  `deserialize` reconstructs the entry from a
+/// contiguous `Bytes` buffer (typically obtained by reading back whatever
+/// was written).
+pub trait Spillable: Sized {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize>;
+    fn deserialize(data: Bytes) -> Result<Self>;
+}
 
 // ---------------------------------------------------------------------------
 // Common helpers
@@ -224,13 +236,13 @@ struct PqPartitionHeader {
     storage_len: u64,
 }
 
-impl<S: IvfSubIndex> PartitionEntry<S, ProductQuantizer> {
+impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
     /// Serialize this partition entry to bytes.
     ///
     /// The sub-index, PQ codebook, and storage batch are each written as Arrow
     /// IPC file sections, preceded by a small JSON header containing scalar
     /// metadata and section lengths.
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -261,24 +273,23 @@ impl<S: IvfSubIndex> PartitionEntry<S, ProductQuantizer> {
         };
 
         let header_json = serde_json::to_vec(&header)?;
-
         let total_len =
             8 + header_json.len() + sub_index_ipc.len() + codebook_ipc.len() + storage_ipc.len();
-        let mut out = Vec::with_capacity(total_len);
-        out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-        out.extend_from_slice(&header_json);
-        out.extend_from_slice(&sub_index_ipc);
-        out.extend_from_slice(&codebook_ipc);
-        out.extend_from_slice(&storage_ipc);
 
-        Ok(out)
+        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_json)?;
+        writer.write_all(&sub_index_ipc)?;
+        writer.write_all(&codebook_ipc)?;
+        writer.write_all(&storage_ipc)?;
+
+        Ok(total_len)
     }
 
     /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
     ///
     /// The Arrow IPC sections are decoded using [`FileDecoder`] so that the
     /// resulting arrays reference slices of the provided `Bytes` buffer directly.
-    pub fn deserialize(data: Bytes) -> Result<Self> {
+    fn deserialize(data: Bytes) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::io("partition data too small".to_string()));
         }
@@ -352,9 +363,9 @@ struct FlatPartitionHeader {
     storage_len: u64,
 }
 
-impl<S: IvfSubIndex> PartitionEntry<S, FlatQuantizer> {
+impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatQuantizer> {
     /// Serialize this partition entry to bytes.
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -377,16 +388,17 @@ impl<S: IvfSubIndex> PartitionEntry<S, FlatQuantizer> {
 
         let header_json = serde_json::to_vec(&header)?;
         let total_len = 8 + header_json.len() + sub_index_ipc.len() + storage_ipc.len();
-        let mut out = Vec::with_capacity(total_len);
-        out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-        out.extend_from_slice(&header_json);
-        out.extend_from_slice(&sub_index_ipc);
-        out.extend_from_slice(&storage_ipc);
-        Ok(out)
+
+        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_json)?;
+        writer.write_all(&sub_index_ipc)?;
+        writer.write_all(&storage_ipc)?;
+
+        Ok(total_len)
     }
 
     /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    pub fn deserialize(data: Bytes) -> Result<Self> {
+    fn deserialize(data: Bytes) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::io("partition data too small".to_string()));
         }
@@ -446,11 +458,11 @@ struct SqPartitionHeader {
     storage_len: u64,
 }
 
-impl<S: IvfSubIndex> PartitionEntry<S, ScalarQuantizer> {
+impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ScalarQuantizer> {
     /// Serialize this partition entry to bytes.
     ///
     /// Multiple SQ storage chunks are concatenated into a single IPC section.
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -475,16 +487,17 @@ impl<S: IvfSubIndex> PartitionEntry<S, ScalarQuantizer> {
 
         let header_json = serde_json::to_vec(&header)?;
         let total_len = 8 + header_json.len() + sub_index_ipc.len() + storage_ipc.len();
-        let mut out = Vec::with_capacity(total_len);
-        out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-        out.extend_from_slice(&header_json);
-        out.extend_from_slice(&sub_index_ipc);
-        out.extend_from_slice(&storage_ipc);
-        Ok(out)
+
+        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_json)?;
+        writer.write_all(&sub_index_ipc)?;
+        writer.write_all(&storage_ipc)?;
+
+        Ok(total_len)
     }
 
     /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    pub fn deserialize(data: Bytes) -> Result<Self> {
+    fn deserialize(data: Bytes) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::io("partition data too small".to_string()));
         }
@@ -553,7 +566,7 @@ struct RabitPartitionHeader {
     storage_len: u64,
 }
 
-impl<S: IvfSubIndex> PartitionEntry<S, RabitQuantizer> {
+impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
     /// Serialize this partition entry to bytes.
     ///
     /// For Matrix rotation the rotation matrix is stored as an Arrow IPC section.
@@ -561,7 +574,7 @@ impl<S: IvfSubIndex> PartitionEntry<S, RabitQuantizer> {
     ///
     /// The storage batch is stored with already-packed codes so deserialization
     /// can skip re-packing.
-    pub fn serialize(&self) -> Result<Vec<u8>> {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
@@ -603,17 +616,18 @@ impl<S: IvfSubIndex> PartitionEntry<S, RabitQuantizer> {
         let header_json = serde_json::to_vec(&header)?;
         let total_len =
             8 + header_json.len() + sub_index_ipc.len() + rotate_mat_ipc.len() + storage_ipc.len();
-        let mut out = Vec::with_capacity(total_len);
-        out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-        out.extend_from_slice(&header_json);
-        out.extend_from_slice(&sub_index_ipc);
-        out.extend_from_slice(&rotate_mat_ipc);
-        out.extend_from_slice(&storage_ipc);
-        Ok(out)
+
+        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_json)?;
+        writer.write_all(&sub_index_ipc)?;
+        writer.write_all(&rotate_mat_ipc)?;
+        writer.write_all(&storage_ipc)?;
+
+        Ok(total_len)
     }
 
     /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    pub fn deserialize(data: Bytes) -> Result<Self> {
+    fn deserialize(data: Bytes) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::io("partition data too small".to_string()));
         }
@@ -769,7 +783,8 @@ mod tests {
             storage,
         };
 
-        let serialized = entry.serialize().unwrap();
+        let mut serialized = Vec::new();
+        entry.serialize(&mut serialized).unwrap();
         let deserialized =
             PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(serialized.into()).unwrap();
 
@@ -819,7 +834,8 @@ mod tests {
                 storage,
             };
 
-            let bytes = entry.serialize().unwrap();
+            let mut bytes = Vec::new();
+            entry.serialize(&mut bytes).unwrap();
             let restored =
                 PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(bytes.into()).unwrap();
             assert_eq!(
@@ -839,7 +855,8 @@ mod tests {
             storage,
         };
 
-        let serialized = entry.serialize().unwrap();
+        let mut serialized = Vec::new();
+        entry.serialize(&mut serialized).unwrap();
         let deserialized =
             PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(serialized.into()).unwrap();
         assert_eq!(entry.storage, deserialized.storage);
@@ -874,7 +891,8 @@ mod tests {
             storage,
         };
 
-        let bytes = entry.serialize().unwrap();
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
         let restored =
             PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(bytes.into()).unwrap();
 
@@ -902,7 +920,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let bytes = entry.serialize().unwrap();
+            let mut bytes = Vec::new();
+            entry.serialize(&mut bytes).unwrap();
             let restored =
                 PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(bytes.into()).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
@@ -948,7 +967,8 @@ mod tests {
             storage,
         };
 
-        let bytes = entry.serialize().unwrap();
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
         let restored =
             PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
 
@@ -977,7 +997,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let bytes = entry.serialize().unwrap();
+            let mut bytes = Vec::new();
+            entry.serialize(&mut bytes).unwrap();
             let restored =
                 PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
@@ -1020,7 +1041,8 @@ mod tests {
             index: FlatIndex::default(),
             storage,
         };
-        let bytes = entry.serialize().unwrap();
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
         let restored =
             PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
 
@@ -1103,7 +1125,8 @@ mod tests {
             storage,
         };
 
-        let bytes = entry.serialize().unwrap();
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
         let restored =
             PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(bytes.into()).unwrap();
 
@@ -1144,7 +1167,8 @@ mod tests {
                 index: FlatIndex::default(),
                 storage,
             };
-            let bytes = entry.serialize().unwrap();
+            let mut bytes = Vec::new();
+            entry.serialize(&mut bytes).unwrap();
             let restored =
                 PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(bytes.into()).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);

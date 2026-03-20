@@ -112,7 +112,7 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
         }
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "ScalarIndex"
     }
 }
@@ -140,7 +140,7 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         }
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "VectorIndex"
     }
 }
@@ -168,7 +168,7 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
         }
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "FragReuseIndex"
     }
 }
@@ -196,7 +196,7 @@ impl CacheKey for MemWalCacheKey<'_> {
         }
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "MemWalIndex"
     }
 }
@@ -1431,14 +1431,10 @@ impl DatasetIndexInternalExt for Dataset {
                 uuid
             );
             let partition_cache = self.index_cache.with_key_prefix(&cache_key.key());
-            // Namespace the file metadata cache by the index file path,
-            // matching what the full-load path does.
-            let index_path = object_store::path::Path::from(state.index_file_path.as_str());
-            let fmc = self.metadata_cache.file_metadata_cache(&index_path);
             return vector::ivf::v2::reconstruct_vector_index(
                 state.clone(),
                 self.object_store.clone(),
-                &fmc,
+                &self.metadata_cache,
                 partition_cache,
             )
             .await;

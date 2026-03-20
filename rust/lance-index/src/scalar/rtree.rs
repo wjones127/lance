@@ -250,7 +250,7 @@ impl CacheKey for RTreeCacheKey {
         }
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "RTree"
     }
 }

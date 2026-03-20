@@ -990,7 +990,7 @@ impl CacheKey for BTreePageKey {
         format!("page-{}", self.page_number).into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "BTreePage"
     }
 }

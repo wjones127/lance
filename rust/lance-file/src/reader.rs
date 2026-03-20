@@ -105,6 +105,16 @@ pub struct CachedFileMetadata {
     pub minor_version: u16,
 }
 
+impl CachedFileMetadata {
+    /// Total file size in bytes.
+    pub fn file_size(&self) -> u64 {
+        self.num_data_bytes
+            + self.num_global_buffer_bytes
+            + self.num_column_metadata_bytes
+            + self.num_footer_bytes
+    }
+}
+
 impl DeepSizeOf for CachedFileMetadata {
     // TODO: include size for `column_metadatas` and `column_infos`.
     fn deep_size_of_children(&self, context: &mut Context) -> usize {

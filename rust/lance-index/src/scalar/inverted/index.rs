@@ -1889,7 +1889,7 @@ impl CacheKey for PostingListKey {
         format!("postings-{}", self.token_id).into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "PostingList"
     }
 }
@@ -1906,7 +1906,7 @@ impl CacheKey for PositionKey {
         format!("positions-{}", self.token_id).into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "Position"
     }
 }

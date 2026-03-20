@@ -235,7 +235,7 @@ mod tests {
             Cow::Borrowed(self.0)
         }
 
-        fn type_id(&self) -> &'static str {
+        fn type_name(&self) -> &'static str {
             "TestUnsized"
         }
     }

@@ -26,7 +26,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -98,7 +98,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
         format!("ivf-{}", self.partition_id).into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         // Using type_name is safe here: the impl is in the same crate as the
         // types, so the monomorphized pointer is consistent.
         std::any::type_name::<PartitionEntry<S, Q>>()
@@ -153,7 +153,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler = Arc::new(ScanScheduler::new(object_store, scheduler_config));
 
         let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let cached_size = file_sizes
@@ -168,6 +168,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
+        // Cache file metadata so reconstruct_typed can skip the metadata read.
+        file_metadata_cache
+            .with_key_prefix(uri.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
+            .await;
         let index_metadata: IndexMetadata = serde_json::from_str(
             index_reader
                 .schema()
@@ -199,21 +204,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .get(INDEX_AUXILIARY_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
+        let aux_path = index_dir
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
         let storage_reader = FileReader::try_open(
-            scheduler
-                .open_file(
-                    &index_dir
-                        .child(uuid.as_str())
-                        .child(INDEX_AUXILIARY_FILE_NAME),
-                    &aux_cached_size,
-                )
-                .await?,
+            scheduler.open_file(&aux_path, &aux_cached_size).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             file_metadata_cache,
             FileReaderOptions::default(),
         )
         .await?;
+        // Cache aux file metadata for reconstruction.
+        file_metadata_cache
+            .with_key_prefix(aux_path.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, storage_reader.metadata().clone())
+            .await;
         let storage =
             IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
 
@@ -639,6 +645,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let (sub_index_type, quantization_type) = self.sub_index_type();
         // Convert local path back to object_store Path (undo to_local_path's "/" prefix)
         let index_file_path = self.uri.trim_start_matches('/').to_string();
+        let index_meta = self.reader.metadata();
+        let aux_meta = self.storage.reader().metadata();
         Some(Box::new(IvfIndexState {
             index_file_path,
             uuid: self.uuid.clone(),
@@ -650,6 +658,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             sub_index_type,
             quantization_type,
             cache_key_prefix: self.index_cache.prefix().to_string(),
+            index_file_size: index_meta.file_size(),
+            aux_file_size: aux_meta.file_size(),
         }))
     }
 }
@@ -658,6 +668,60 @@ pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+
+/// CacheKey for file metadata, matching the key used by fragment reads.
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
+    }
+
+    fn type_name(&self) -> &'static str {
+        "FileMetadata"
+    }
+}
+
+/// Open a FileReader, using cached file metadata when available to avoid IO.
+async fn open_reader_cached(
+    scheduler: &Arc<ScanScheduler>,
+    path: &Path,
+    cache: &LanceCache,
+    known_file_size: u64,
+) -> Result<FileReader> {
+    let file_cache = cache.with_key_prefix(path.as_ref());
+    let cached_size = if known_file_size > 0 {
+        CachedFileSize::new(known_file_size)
+    } else {
+        CachedFileSize::unknown()
+    };
+    let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+
+    if let Some(cached_meta) = file_cache.get_with_key(&FileMetadataCacheKey).await {
+        let encodings_io = Arc::new(lance_file::LanceEncodingsIo::new(file_scheduler));
+        FileReader::try_open_with_file_metadata(
+            encodings_io,
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cached_meta,
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    } else {
+        FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    }
+}
 
 /// Reconstruct a concrete `IVFIndex<S, Q>` from cached state.
 async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
@@ -671,20 +735,16 @@ where
 {
     let io_parallelism = object_store.io_parallelism();
     let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+    let scheduler = Arc::new(ScanScheduler::new(object_store, scheduler_config));
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
 
-    // Re-open index FileReader (cheap if file metadata cache is warm)
-    let index_reader = FileReader::try_open(
-        scheduler
-            .open_file(&index_path, &CachedFileSize::unknown())
-            .await?,
-        None,
-        Arc::<DecoderPlugins>::default(),
+    let index_reader = open_reader_cached(
+        &scheduler,
+        &index_path,
         file_metadata_cache,
-        FileReaderOptions::default(),
+        state.index_file_size,
     )
     .await?;
 
@@ -697,14 +757,11 @@ where
         .unwrap_or("");
     let aux_path = Path::parse(format!("{}/{}", parent_str, INDEX_AUXILIARY_FILE_NAME))
         .map_err(|e| Error::io(format!("invalid aux path: {e}")))?;
-    let storage_reader = FileReader::try_open(
-        scheduler
-            .open_file(&aux_path, &CachedFileSize::unknown())
-            .await?,
-        None,
-        Arc::<DecoderPlugins>::default(),
+    let storage_reader = open_reader_cached(
+        &scheduler,
+        &aux_path,
         file_metadata_cache,
-        FileReaderOptions::default(),
+        state.aux_file_size,
     )
     .await?;
 
@@ -3868,5 +3925,54 @@ mod tests {
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_from_cache_zero_io() {
+        use lance_io::assert_io_eq;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("my_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // First open: populates file metadata cache and VectorIndexData cache.
+        let indices = dataset.load_indices_by_name("my_idx").await.unwrap();
+        let uuid = indices[0].uuid.to_string();
+        dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Reset IO stats, then open again — should reconstruct from cache.
+        dataset.object_store().io_stats_incremental();
+
+        dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let stats = dataset.object_store().io_stats_incremental();
+        assert_io_eq!(
+            stats,
+            read_iops,
+            0,
+            "reconstructing from cached state should not perform IO"
+        );
     }
 }

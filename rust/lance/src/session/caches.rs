@@ -82,7 +82,7 @@ impl CacheKey for ManifestKey<'_> {
             Cow::Owned(format!("manifest/{}", self.version))
         }
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "Manifest"
     }
 }
@@ -97,7 +97,7 @@ impl CacheKey for TransactionKey {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("txn/{}", self.version))
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "Transaction"
     }
 }
@@ -119,7 +119,7 @@ impl CacheKey for DeletionFileKey<'_> {
             self.deletion_file.file_type.suffix()
         ))
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "DeletionVector"
     }
 }
@@ -134,7 +134,7 @@ impl CacheKey for RowAddrMaskKey {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_addr_mask/{}", self.version))
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "RowAddrMask"
     }
 }
@@ -149,7 +149,7 @@ impl CacheKey for RowIdIndexKey {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_index/{}", self.version))
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "RowIdIndex"
     }
 }
@@ -164,7 +164,7 @@ impl CacheKey for RowIdSequenceKey {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
     }
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         "RowIdSequence"
     }
 }

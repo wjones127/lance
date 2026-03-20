@@ -90,7 +90,7 @@ impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
         self.key.into()
     }
 
-    fn type_id(&self) -> &'static str {
+    fn type_name(&self) -> &'static str {
         std::any::type_name::<T>()
     }
 }

@@ -257,6 +257,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
     }
 
+    pub fn reader(&self) -> &FileReader {
+        &self.reader
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.reader.num_rows()
     }
