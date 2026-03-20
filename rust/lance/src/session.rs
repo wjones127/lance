@@ -195,6 +195,11 @@ impl Session {
         self.store_registry.clone()
     }
 
+    /// Get a reference to the raw metadata cache (for use in index reconstruction).
+    pub fn file_metadata_cache(&self) -> &LanceCache {
+        &self.metadata_cache.0
+    }
+
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats().await

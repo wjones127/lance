@@ -11,12 +11,14 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
+use prost::Message;
 use quantizer::{QuantizationType, Quantizer};
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
@@ -137,6 +139,129 @@ impl From<DistanceType> for pb::VectorMetricType {
             DistanceType::Dot => Self::Dot,
             DistanceType::Hamming => Self::Hamming,
         }
+    }
+}
+
+/// Serializable state of an IVF index, sufficient to reconstruct the index
+/// without re-reading global buffers from object storage.
+///
+/// Produced by [`VectorIndex::cacheable_state`] and consumed by a
+/// reconstruction function that re-opens FileReaders using cached file metadata.
+pub struct IvfIndexState {
+    /// Object-store path to the index file (before `to_local_path` conversion).
+    pub index_file_path: String,
+    pub uuid: String,
+    pub ivf: IvfModel,
+    pub distance_type: DistanceType,
+    pub sub_index_metadata: Vec<String>,
+    /// JSON serialization of `Q::Metadata` (quantizer-specific metadata).
+    pub quantizer_metadata_json: String,
+    /// Large quantizer data (PQ codebook, RQ rotation matrix) from `extra_metadata()`.
+    pub quantizer_extra_data: Option<Vec<u8>>,
+    pub sub_index_type: SubIndexType,
+    pub quantization_type: QuantizationType,
+}
+
+/// Serialization header for [`IvfIndexState`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IvfIndexStateHeader {
+    index_file_path: String,
+    uuid: String,
+    distance_type: String,
+    sub_index_metadata: Vec<String>,
+    sub_index_type: String,
+    quantization_type: String,
+    quantizer_metadata_json: String,
+}
+
+impl IvfIndexState {
+    /// Wire format:
+    /// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
+    ///  [extra_len: u64 LE][extra bytes]`
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        let header = IvfIndexStateHeader {
+            index_file_path: self.index_file_path.clone(),
+            uuid: self.uuid.clone(),
+            distance_type: self.distance_type.to_string(),
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_type: self.sub_index_type.to_string(),
+            quantization_type: self.quantization_type.to_string(),
+            quantizer_metadata_json: self.quantizer_metadata_json.clone(),
+        };
+        let header_json = serde_json::to_vec(&header)
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+
+        let ivf_pb = pb::Ivf::try_from(&self.ivf)?;
+        let ivf_bytes = ivf_pb.encode_to_vec();
+
+        let extra = self.quantizer_extra_data.as_deref().unwrap_or(&[]);
+
+        let total = 8 + header_json.len() + 8 + ivf_bytes.len() + 8 + extra.len();
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&header_json);
+        buf.extend_from_slice(&(ivf_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&ivf_bytes);
+        buf.extend_from_slice(&(extra.len() as u64).to_le_bytes());
+        buf.extend_from_slice(extra);
+        Ok(buf)
+    }
+
+    pub fn deserialize(data: Bytes) -> Result<Self> {
+        let mut offset = 0;
+
+        let read_u64 = |data: &[u8], off: &mut usize| -> Result<u64> {
+            if *off + 8 > data.len() {
+                return Err(lance_core::Error::io("IvfIndexState data truncated"));
+            }
+            let val = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+            *off += 8;
+            Ok(val)
+        };
+
+        let header_len = read_u64(&data, &mut offset)? as usize;
+        if offset + header_len > data.len() {
+            return Err(lance_core::Error::io("IvfIndexState header truncated"));
+        }
+        let header: IvfIndexStateHeader =
+            serde_json::from_slice(&data[offset..offset + header_len])
+                .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+        offset += header_len;
+
+        let ivf_len = read_u64(&data, &mut offset)? as usize;
+        if offset + ivf_len > data.len() {
+            return Err(lance_core::Error::io("IvfIndexState IVF data truncated"));
+        }
+        let ivf_pb = pb::Ivf::decode(&data[offset..offset + ivf_len])
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?;
+        let ivf = IvfModel::try_from(ivf_pb)?;
+        offset += ivf_len;
+
+        let extra_len = read_u64(&data, &mut offset)? as usize;
+        if offset + extra_len > data.len() {
+            return Err(lance_core::Error::io("IvfIndexState extra data truncated"));
+        }
+        let quantizer_extra_data = if extra_len > 0 {
+            Some(data[offset..offset + extra_len].to_vec())
+        } else {
+            None
+        };
+
+        let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
+        let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
+        let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
+
+        Ok(Self {
+            index_file_path: header.index_file_path,
+            uuid: header.uuid,
+            ivf,
+            distance_type,
+            sub_index_metadata: header.sub_index_metadata,
+            quantizer_metadata_json: header.quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+        })
     }
 }
 
@@ -264,6 +389,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+
+    /// Export the index state needed for reconstruction from a disk cache.
+    /// Returns `None` if this index type doesn't support persistent caching.
+    fn cacheable_state(&self) -> Option<IvfIndexState> {
+        None
+    }
 }
 
 // it can be an IVF index or a partition of IVF index

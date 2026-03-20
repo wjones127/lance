@@ -29,15 +29,16 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
-use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::quantizer::QuantizerMetadata;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::{IvfIndexState, VectorIndexCacheEntry};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
@@ -223,6 +224,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             _marker: PhantomData,
         })
+    }
+
+    /// Reconstruct from cached state, skipping global buffer reads.
+    pub(crate) fn from_cached_state(
+        uri: String,
+        uuid: String,
+        ivf: IvfModel,
+        reader: FileReader,
+        storage: IvfQuantizationStorage<Q>,
+        sub_index_metadata: Vec<String>,
+        distance_type: DistanceType,
+        index_cache: LanceCache,
+        io_parallelism: usize,
+    ) -> Self {
+        let num_partitions = ivf.num_partitions();
+        Self {
+            uri,
+            uuid,
+            ivf,
+            reader,
+            storage,
+            partition_locks: PartitionLoadLock::new(num_partitions),
+            sub_index_metadata,
+            distance_type,
+            index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
+            _marker: PhantomData,
+        }
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -595,12 +624,202 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
+
+    fn cacheable_state(&self) -> Option<IvfIndexState> {
+        let extra_data = self.storage.metadata().extra_metadata().ok().flatten();
+        let metadata_json = serde_json::to_string(self.storage.metadata()).ok()?;
+        let (sub_index_type, quantization_type) = self.sub_index_type();
+        // Convert local path back to object_store Path (undo to_local_path's "/" prefix)
+        let index_file_path = self.uri.trim_start_matches('/').to_string();
+        Some(IvfIndexState {
+            index_file_path,
+            uuid: self.uuid.clone(),
+            ivf: self.ivf.clone(),
+            distance_type: self.distance_type,
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            quantizer_metadata_json: metadata_json,
+            quantizer_extra_data: extra_data.map(|b| b.to_vec()),
+            sub_index_type,
+            quantization_type,
+        })
+    }
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+
+/// Reconstruct a concrete `IVFIndex<S, Q>` from cached state.
+async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>>
+where
+    Q::Metadata: serde::de::DeserializeOwned,
+{
+    let io_parallelism = object_store.io_parallelism();
+    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+
+    let index_path = Path::parse(&state.index_file_path)
+        .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
+
+    // Re-open index FileReader (cheap if file metadata cache is warm)
+    let index_reader = FileReader::try_open(
+        scheduler
+            .open_file(&index_path, &CachedFileSize::unknown())
+            .await?,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        file_metadata_cache,
+        FileReaderOptions::default(),
+    )
+    .await?;
+
+    // Derive aux file path: replace the filename with INDEX_AUXILIARY_FILE_NAME.
+    // index_path is like "path/to/{uuid}/index.lance", aux is "path/to/{uuid}/aux.lance".
+    let index_path_str = index_path.as_ref();
+    let parent_str = index_path_str
+        .rsplit_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or("");
+    let aux_path = Path::parse(format!("{}/{}", parent_str, INDEX_AUXILIARY_FILE_NAME))
+        .map_err(|e| Error::io(format!("invalid aux path: {e}")))?;
+    let storage_reader = FileReader::try_open(
+        scheduler
+            .open_file(&aux_path, &CachedFileSize::unknown())
+            .await?,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        file_metadata_cache,
+        FileReaderOptions::default(),
+    )
+    .await?;
+
+    // Parse quantizer metadata from cached JSON
+    let mut metadata: Q::Metadata = serde_json::from_str(&state.quantizer_metadata_json)?;
+    if let Some(extra) = state.quantizer_extra_data {
+        metadata.parse_buffer(extra.into())?;
+    }
+
+    let storage = IvfQuantizationStorage::from_cached(
+        storage_reader,
+        state.ivf.clone(),
+        metadata,
+        state.distance_type,
+        None, // frag_reuse_index not cached
+    );
+
+    let index = IVFIndex::<S, Q>::from_cached_state(
+        to_local_path(&index_path),
+        state.uuid,
+        state.ivf,
+        index_reader,
+        storage,
+        state.sub_index_metadata,
+        state.distance_type,
+        index_cache,
+        io_parallelism,
+    );
+
+    Ok(Arc::new(index))
+}
+
+/// Reconstruct a `dyn VectorIndex` from a cached [`IvfIndexState`], dispatching
+/// on the stored sub-index and quantization types.
+pub async fn reconstruct_vector_index(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>> {
+    use lance_index::vector::bq::builder::RabitQuantizer;
+
+    // Extract type tags before consuming state.
+    let sub_idx = state.sub_index_type.to_string();
+    let quant = state.quantization_type.to_string();
+
+    match (sub_idx.as_str(), quant.as_str()) {
+        ("FLAT", "FLAT") => {
+            reconstruct_typed::<FlatIndex, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("FLAT", "PQ") => {
+            reconstruct_typed::<FlatIndex, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("FLAT", "SQ") => {
+            reconstruct_typed::<FlatIndex, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("FLAT", "RQ") => {
+            reconstruct_typed::<FlatIndex, RabitQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("HNSW", "PQ") => {
+            reconstruct_typed::<HNSW, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("HNSW", "SQ") => {
+            reconstruct_typed::<HNSW, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("HNSW", "FLAT") => {
+            reconstruct_typed::<HNSW, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("HNSW", "RQ") => {
+            reconstruct_typed::<HNSW, RabitQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (s, q) => Err(Error::index(format!(
+            "unsupported index type for reconstruction: sub_index={s}, quantization={q}"
+        ))),
+    }
+}
 
 #[cfg(test)]
 mod tests {
