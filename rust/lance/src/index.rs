@@ -1337,10 +1337,19 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Quick cache checks for scalar and frag-reuse indices.
+        // Checking for cache existence is cheap so we just check both scalar and vector caches
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            return Ok(index.as_index());
+        }
+
+        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self
+            .index_cache
+            .get_unsized_with_key(&vector_cache_key)
+            .await
+        {
             return Ok(index.as_index());
         }
 
@@ -1484,9 +1493,12 @@ impl DatasetIndexInternalExt for Dataset {
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
-                let file = scheduler
-                    .open_file(&index_file, &CachedFileSize::unknown())
-                    .await?;
+                let file_sizes = index_meta.file_size_map();
+                let cached_size = file_sizes
+                    .get(INDEX_FILE_NAME)
+                    .map(|&size| CachedFileSize::new(size))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&index_file, &cached_size).await?;
                 let reader = lance_file::reader::FileReader::try_open(
                     file,
                     None,
@@ -1520,6 +1532,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1532,6 +1545,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
+                                file_sizes,
                             )
                             .await?;
                             Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1550,6 +1564,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1563,6 +1578,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1576,6 +1592,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1592,6 +1609,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             &file_metadata_cache,
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1605,6 +1623,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
@@ -1618,6 +1637,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
+                            file_sizes,
                         )
                         .await?;
                         Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
