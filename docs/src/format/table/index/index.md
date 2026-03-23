@@ -167,6 +167,70 @@ There are both part of the `table.proto` file in the Lance source code.
 
 </details>
 
+## Index Details
+
+Each index segment carries an `index_details` field — a protobuf `Any` message whose type
+URL identifies the index type and whose content describes that specific segment. When designing
+what goes into an `index_details` message, it helps to distinguish two categories of parameters:
+
+**Index specification** — parameters that define *what* was built. Two segments built from the
+same data with the same specification should be considered equivalent and interchangeable. These
+parameters determine the segment's behavior at query time: its recall characteristics, storage
+layout, and search semantics. Changing a specification parameter produces an index that a query
+engine must treat differently; the segment would need to be rebuilt from scratch.
+
+**Build strategy** — parameters that control *how* the segment was built. Two segments built from
+the same data and specification but with different strategy parameters should converge to
+approximately the same structure (within algorithmic tolerance). These are knobs an operator tunes
+based on hardware, time budget, or quality-versus-speed tradeoffs during construction, and they
+have no effect on how a query engine reads or searches the finished segment.
+
+### What belongs in IndexDetails
+
+`index_details` should contain **index specification parameters only**. A query engine reads
+`index_details` to understand how to interpret the stored data and execute searches correctly.
+
+A parameter belongs in the specification if:
+
+- Changing it would require the query engine to treat the index differently at query time
+- It affects recall, storage layout, distance semantics, or result interpretation
+- A query engine must know it to correctly read or search the segment
+- It is decoupled from the size of the dataset — a good specification parameter has the same
+  meaning whether the dataset has 100 rows or 1 billion
+
+The last point deserves emphasis: specification parameters should describe the *target structure*,
+not a concrete quantity derived from the current dataset size. For example, `target_partition_size`
+(the desired number of vectors per partition) is a better specification parameter than
+`num_partitions`, because the right value for `num_partitions` changes as the dataset grows while
+`target_partition_size` remains stable.
+
+Specification parameters must also be sufficient to fully describe the index even when it is
+empty. An empty index — one with no data yet — still has a well-defined structure and query
+behavior determined entirely by its specification. This is important because an index may be
+created before data is inserted, and the specification must stand on its own without reference
+to any rows.
+
+Examples for a vector index: target partition size, distance metric, quantization scheme, codebook
+data, number of subspaces.
+
+### What does not belong in IndexDetails
+
+Build strategy parameters should **not** be stored in `index_details`. They are irrelevant to
+query execution, and storing them risks engines incorrectly differentiating otherwise-equivalent
+segments.
+
+A parameter belongs in the build strategy if:
+
+- It affects build time, memory usage, or convergence speed but not the target structure
+- The ideal output of the build process is the same regardless of its value
+- A query engine does not need it to read or search the segment
+
+Examples: number of training iterations, sample size for centroid initialization, number of
+build threads, early-stopping thresholds.
+
+If build strategy parameters are worth preserving for auditability or reproducibility, store them
+separately — for example, in a sidecar file in the index directory — rather than in `index_details`.
+
 ## Handling deleted and invalidated rows
 
 Since index segments are immutable, they may contain references to rows that have been deleted
