@@ -65,6 +65,7 @@ impl From<&HnswBuildParams> for crate::pb::HnswParameters {
         Self {
             max_connections: params.m as u32,
             construction_ef: params.ef_construction as u32,
+            max_level: params.max_level as u32,
         }
     }
 }

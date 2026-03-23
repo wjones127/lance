@@ -236,6 +236,8 @@ message HnswParameters {
   // "construction exploration factor": The size of the dynamic list used during
   // index construction.
   uint32 construction_ef = 2;
+  // The maximum number of levels in the HNSW graph.
+  uint32 max_level = 3;
 }
 
 message JsonIndexDetails {

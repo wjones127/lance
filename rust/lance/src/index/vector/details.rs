@@ -49,6 +49,12 @@ struct VectorDetailsJson {
 struct HnswDetailsJson {
     max_connections: u32,
     construction_ef: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    max_level: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize)]
@@ -256,6 +262,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
     let hnsw = d.hnsw_index_config.map(|h| HnswDetailsJson {
         max_connections: h.max_connections,
         construction_ef: h.construction_ef,
+        max_level: h.max_level,
     });
 
     let compression = d.compression.and_then(|c| match c {
@@ -432,6 +439,7 @@ async fn convert_v3_metadata_to_details(
         partitions.first().map(|hnsw| HnswParameters {
             max_connections: hnsw.params.m as u32,
             construction_ef: hnsw.params.ef_construction as u32,
+            max_level: hnsw.params.max_level as u32,
         })
     } else {
         None
@@ -503,6 +511,7 @@ mod tests {
         let hnsw = Some(HnswParameters {
             max_connections: 20,
             construction_ef: 150,
+            max_level: 7,
         });
         assert_eq!(
             derive_vector_index_type(&make_details(VectorMetricType::L2, hnsw, None)),
@@ -561,12 +570,13 @@ mod tests {
             Some(HnswParameters {
                 max_connections: 30,
                 construction_ef: 200,
+                max_level: 8,
             }),
             Some(Compression::Sq(ScalarQuantization { num_bits: 4 })),
         );
         assert_eq!(
             vector_details_as_json(&details).unwrap(),
-            r#"{"metric_type":"COSINE","hnsw":{"max_connections":30,"construction_ef":200},"compression":{"type":"sq","num_bits":4}}"#
+            r#"{"metric_type":"COSINE","hnsw":{"max_connections":30,"construction_ef":200,"max_level":8},"compression":{"type":"sq","num_bits":4}}"#
         );
     }
 
