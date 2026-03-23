@@ -460,7 +460,7 @@ message ExternalFile {
   uint64 size = 3;
 }
 
-// VectorIndexDetails and HnswIndexDetails moved to index.proto
+// VectorIndexDetails and HnswParameters (formerly HnswIndexDetails) moved to index.proto
 
 message FragmentReuseIndexDetails {
 

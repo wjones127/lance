@@ -193,7 +193,7 @@ message VectorIndexDetails {
   uint64 target_partition_size = 2;
 
   // Optional HNSW index configuration. If set, the index has an HNSW layer.
-  optional HnswIndexDetails hnsw_index_config = 3;
+  optional HnswParameters hnsw_index_config = 3;
 
   message ProductQuantization {
     uint32 num_bits = 1;
@@ -211,16 +211,24 @@ message VectorIndexDetails {
     RotationType rotation_type = 2;
   }
 
-  // An unset compression oneof means flat / no quantization.
+  // No quantization; vectors are stored as-is.
+  message FlatCompression {}
+
   oneof compression {
     ProductQuantization pq = 4;
     ScalarQuantization sq = 5;
     RabitQuantization rq = 6;
+    FlatCompression flat = 8;
   }
+
+  // The version of the index file format. Useful for maintaining backwards
+  // compatibility when introducing breaking changes to the index format.
+  // 0 means unset (legacy index).
+  uint32 index_version = 7;
 }
 
-// Hierarchical Navigable Small World (HNSW) index details, used as an optional configuration for IVF indexes.
-message HnswIndexDetails {
+// Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
+message HnswParameters {
   // The maximum number of outgoing edges per node in the HNSW graph. Higher values
   // means more connections, better recall, but more memory and slower builds.
   // Referred to as "M" in the HNSW literature.

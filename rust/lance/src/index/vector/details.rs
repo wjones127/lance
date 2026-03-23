@@ -16,7 +16,7 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pb::VectorMetricType;
 use lance_index::pb::index::Implementation;
-use lance_index::pb::vector_index_details::{Compression, rabit_quantization};
+use lance_index::pb::vector_index_details::{Compression, FlatCompression, rabit_quantization};
 use lance_index::{INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, pb};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
@@ -102,11 +102,15 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         }
     }
 
+    let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
+    let index_version = params.index_type().version() as u32;
+
     let details = VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size,
         hnsw_index_config,
         compression,
+        index_version,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -223,7 +227,7 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
         index_type.push_str("HNSW_");
     }
     match d.compression {
-        None => index_type.push_str("FLAT"),
+        None | Some(Compression::Flat(_)) => index_type.push_str("FLAT"),
         Some(Compression::Pq(_)) => index_type.push_str("PQ"),
         Some(Compression::Sq(_)) => index_type.push_str("SQ"),
         Some(Compression::Rq(_)) => index_type.push_str("RQ"),
@@ -254,23 +258,24 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         construction_ef: h.construction_ef,
     });
 
-    let compression = d.compression.map(|c| match c {
-        Compression::Pq(pq) => CompressionDetailsJson::Pq {
+    let compression = d.compression.and_then(|c| match c {
+        Compression::Flat(_) => None,
+        Compression::Pq(pq) => Some(CompressionDetailsJson::Pq {
             num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
-        },
-        Compression::Sq(sq) => CompressionDetailsJson::Sq {
+        }),
+        Compression::Sq(sq) => Some(CompressionDetailsJson::Sq {
             num_bits: sq.num_bits,
-        },
+        }),
         Compression::Rq(rq) => {
             let rotation_type = match rabit_quantization::RotationType::try_from(rq.rotation_type) {
                 Ok(rabit_quantization::RotationType::Matrix) => "matrix",
                 _ => "fast",
             };
-            CompressionDetailsJson::Rq {
+            Some(CompressionDetailsJson::Rq {
                 num_bits: rq.num_bits,
                 rotation_type,
-            }
+            })
         }
     });
 
@@ -327,7 +332,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
     let metric_type = pb::VectorMetricType::try_from(vector_index.metric_type)
         .unwrap_or(pb::VectorMetricType::L2);
 
-    let mut compression = None;
+    let mut compression: Option<Compression> = None;
     for stage in &vector_index.stages {
         if let Some(Stage::Pq(pq)) = &stage.stage {
             compression = Some(Compression::Pq(ProductQuantization {
@@ -336,12 +341,14 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
             }));
         }
     }
+    let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
 
     let details = VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size: 0,
         hnsw_index_config: None,
         compression,
+        index_version: 0,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -351,7 +358,7 @@ async fn convert_v3_metadata_to_details(
     index_file: &object_store::path::Path,
 ) -> Result<prost_types::Any> {
     use lance_index::pb::vector_index_details::*;
-    use lance_index::pb::{HnswIndexDetails, VectorIndexDetails};
+    use lance_index::pb::{HnswParameters, VectorIndexDetails};
     use lance_index::vector::bq::storage::RABIT_METADATA_KEY;
     use lance_index::vector::hnsw::HnswMetadata;
     use lance_index::vector::ivf::storage::IVF_PARTITION_KEY;
@@ -416,13 +423,13 @@ async fn convert_v3_metadata_to_details(
             rotation_type: rotation_type.into(),
         }))
     } else {
-        None
+        Some(Compression::Flat(FlatCompression {}))
     };
 
     // Check for HNSW
     let hnsw_index_config = if let Some(partition_str) = metadata.get(IVF_PARTITION_KEY) {
         let partitions: Vec<HnswMetadata> = serde_json::from_str(partition_str)?;
-        partitions.first().map(|hnsw| HnswIndexDetails {
+        partitions.first().map(|hnsw| HnswParameters {
             max_connections: hnsw.params.m as u32,
             construction_ef: hnsw.params.ef_construction as u32,
         })
@@ -435,6 +442,7 @@ async fn convert_v3_metadata_to_details(
         target_partition_size: 0,
         hnsw_index_config,
         compression,
+        index_version: 0,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -443,11 +451,11 @@ async fn convert_v3_metadata_to_details(
 mod tests {
     use super::*;
     use lance_index::pb::vector_index_details::*;
-    use lance_index::pb::{HnswIndexDetails, VectorIndexDetails};
+    use lance_index::pb::{HnswParameters, VectorIndexDetails};
 
     fn make_details(
         metric: VectorMetricType,
-        hnsw: Option<HnswIndexDetails>,
+        hnsw: Option<HnswParameters>,
         compression: Option<Compression>,
     ) -> prost_types::Any {
         let details = VectorIndexDetails {
@@ -455,6 +463,7 @@ mod tests {
             target_partition_size: 0,
             hnsw_index_config: hnsw,
             compression,
+            index_version: 0,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -491,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_derive_index_type_with_hnsw() {
-        let hnsw = Some(HnswIndexDetails {
+        let hnsw = Some(HnswParameters {
             max_connections: 20,
             construction_ef: 150,
         });
@@ -549,7 +558,7 @@ mod tests {
     fn test_json_ivf_hnsw_sq() {
         let details = make_details(
             VectorMetricType::Cosine,
-            Some(HnswIndexDetails {
+            Some(HnswParameters {
                 max_connections: 30,
                 construction_ef: 200,
             }),
@@ -601,6 +610,7 @@ mod tests {
                 target_partition_size: 5000,
                 hnsw_index_config: None,
                 compression: None,
+                index_version: 0,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
