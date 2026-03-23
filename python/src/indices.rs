@@ -510,7 +510,7 @@ async fn do_load_shuffled_vectors(
             index_id,
             ds.fragments().iter().map(|f| f.id as u32),
             Arc::new(
-                prost_types::Any::from_msg(&lance_table::format::pb::VectorIndexDetails::default())
+                prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default())
                     .unwrap(),
             ),
             IndexType::IvfPq.version(),
