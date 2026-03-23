@@ -341,6 +341,7 @@ impl BlockingDataset {
         storage_format: Option<LanceFileVersion>,
         max_retries: u32,
         skip_auto_cleanup: bool,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
     ) -> Result<Self> {
         let mut builder = CommitBuilder::new(Arc::new(self.clone().inner))
             .with_store_params(store_params)
@@ -357,6 +358,9 @@ impl BlockingDataset {
         }
         if skip_auto_cleanup {
             builder = builder.with_skip_auto_cleanup(true);
+        }
+        if let Some(handler) = commit_handler {
+            builder = builder.with_commit_handler(handler);
         }
         let new_dataset = RT.block_on(builder.execute(transaction))?;
         Ok(BlockingDataset { inner: new_dataset })
@@ -2633,6 +2637,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let max_source_fragments = env
+        .call_method(
+            &java_options,
+            "getMaxSourceFragments",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
 
     build_compaction_options(
         env,
@@ -2646,6 +2658,7 @@ fn convert_java_compaction_options_to_rust(
         &defer_index_remap,
         &compaction_mode,
         &binary_copy_read_batch_bytes,
+        &max_source_fragments,
         config,
     )
 }
