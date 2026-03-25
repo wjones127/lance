@@ -103,15 +103,14 @@ pub struct CachedFileMetadata {
     pub num_footer_bytes: u64,
     pub major_version: u16,
     pub minor_version: u16,
+    /// The actual total file size in bytes, as reported by the object store.
+    pub file_size_bytes: u64,
 }
 
 impl CachedFileMetadata {
     /// Total file size in bytes.
     pub fn file_size(&self) -> u64 {
-        self.num_data_bytes
-            + self.num_global_buffer_bytes
-            + self.num_column_metadata_bytes
-            + self.num_footer_bytes
+        self.file_size_bytes
     }
 }
 
@@ -663,6 +662,7 @@ impl FileReader {
             file_buffers: gbo_table,
             major_version: footer.major_version,
             minor_version: footer.minor_version,
+            file_size_bytes: file_len,
         })
     }
 

@@ -393,47 +393,47 @@ pub(crate) async fn optimize_vector_indices_v2(
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
     let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
-    let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
+    let (_, _element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let merged_num = match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            if element_type == DataType::UInt8 {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
-                    dataset.clone(),
-                    vector_column.to_owned(),
-                    index_dir,
-                    distance_type,
-                    shuffler,
-                    (),
-                    frag_reuse_index,
-                    options.clone(),
-                )?
-                .with_ivf(ivf_model.clone())
-                .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
-                .build()
-                .await?
-            } else {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
-                    dataset.clone(),
-                    vector_column.to_owned(),
-                    index_dir,
-                    distance_type,
-                    shuffler,
-                    (),
-                    frag_reuse_index,
-                    options.clone(),
-                )?
-                .with_ivf(ivf_model.clone())
-                .with_quantizer(quantizer.try_into()?)
-                .with_existing_indices(existing_indices.clone())
-                .shuffle_data(unindexed)
-                .await?
-                .build()
-                .await?
-            }
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
+        }
+        // IVF_FLAT with binary (Hamming) vectors
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .shuffle_data(unindexed)
+            .await?
+            .build()
+            .await?
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -1502,28 +1502,22 @@ pub(crate) async fn remap_index_file_v3(
 ) -> Result<()> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().child(new_uuid);
-    let (_, element_type) = get_vector_type(dataset.schema(), &column)?;
+    let (_, _element_type) = get_vector_type(dataset.schema(), &column)?;
     match index.sub_index_type() {
-        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
-                .await
-            }
-            DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
-                .await
-            }
-            _ => Err(Error::index(format!(
-                "the field type {} is not supported for FLAT index",
-                element_type
-            ))),
-        },
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Flat, QuantizationType::Product) => {
             IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
@@ -1550,6 +1544,9 @@ pub(crate) async fn remap_index_file_v3(
                 .remap(mapping)
                 .await
         }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => Err(Error::index(
+            "HNSW does not support binary (Hamming) quantization".to_string(),
+        )),
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,

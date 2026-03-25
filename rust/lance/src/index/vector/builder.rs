@@ -2137,6 +2137,8 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
         // ignore FLAT sub index,
         // IVF_FLAT_FLAT => IVF_FLAT
         // IVF_FLAT_PQ => IVF_PQ
+        // FlatBin is the binary (Hamming) variant of Flat; same on-disk type string.
+        (SubIndexType::Flat, QuantizationType::FlatBin) => "IVF_FLAT".to_string(),
         (SubIndexType::Flat, quantization_type) => format!("IVF_{}", quantization_type),
         (sub_index_type, quantization_type) => {
             if sub_index_type.to_string() == quantization_type.to_string() {

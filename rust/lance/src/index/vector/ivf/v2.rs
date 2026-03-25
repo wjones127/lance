@@ -29,7 +29,7 @@ use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
@@ -394,13 +394,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
-            (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
+            (SubIndexType::Flat, QuantizationType::Flat)
+            | (SubIndexType::Flat, QuantizationType::FlatBin) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-            (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
+            (SubIndexType::Hnsw, QuantizationType::Flat)
+            | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
             (sub_index_type, quantization_type) => {
                 unimplemented!(
                     "unsupported index type: {}, {}",
@@ -435,10 +437,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
-            sub_index_stats.insert(
-                "index_type".to_string(),
-                Q::quantization_type().to_string().into(),
-            );
+            // FlatBin is the binary variant of Flat; report both as "FLAT" in stats.
+            let qt = Q::quantization_type();
+            let type_str = if qt == QuantizationType::FlatBin {
+                "FLAT".to_string()
+            } else {
+                qt.to_string()
+            };
+            sub_index_stats.insert("index_type".to_string(), type_str.into());
         } else {
             sub_index_stats.insert("index_type".to_string(), S::name().into());
         }
@@ -814,6 +820,15 @@ pub async fn reconstruct_vector_index(
     match (sub_idx.as_str(), quant.as_str()) {
         ("FLAT", "FLAT") => {
             reconstruct_typed::<FlatIndex, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        ("FLAT", "FLATBIN") => {
+            reconstruct_typed::<FlatIndex, FlatBinQuantizer>(
                 state,
                 object_store,
                 file_metadata_cache,
