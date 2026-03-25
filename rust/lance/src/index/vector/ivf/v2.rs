@@ -651,6 +651,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             index_file_path,
             uuid: self.uuid.clone(),
             ivf: self.ivf.clone(),
+            // The aux file has an independent row layout from the index file, so
+            // we must store its IvfModel separately for correct reconstruction.
+            aux_ivf: self.storage.ivf().clone(),
             distance_type: self.distance_type,
             sub_index_metadata: self.sub_index_metadata.clone(),
             quantizer_metadata_json: metadata_json,
@@ -773,7 +776,7 @@ where
 
     let storage = IvfQuantizationStorage::from_cached(
         storage_reader,
-        state.ivf.clone(),
+        state.aux_ivf.clone(),
         metadata,
         state.distance_type,
         None, // frag_reuse_index not cached

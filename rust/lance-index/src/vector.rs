@@ -181,7 +181,12 @@ pub struct IvfIndexState {
     /// Object-store path to the index file (before `to_local_path` conversion).
     pub index_file_path: String,
     pub uuid: String,
+    /// IvfModel for the index file (sub-index row layout).
     pub ivf: IvfModel,
+    /// IvfModel for the auxiliary/storage file (quantizer row layout).
+    /// The index and aux files have independent row layouts, so we must store
+    /// both to avoid using wrong row offsets during reconstruction.
+    pub aux_ivf: IvfModel,
     pub distance_type: DistanceType,
     pub sub_index_metadata: Vec<String>,
     /// JSON serialization of `Q::Metadata` (quantizer-specific metadata).
@@ -220,7 +225,7 @@ struct IvfIndexStateHeader {
 impl IvfIndexState {
     /// Wire format:
     /// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
-    ///  [extra_len: u64 LE][extra bytes]`
+    ///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let header = IvfIndexStateHeader {
             index_file_path: self.index_file_path.clone(),
@@ -242,7 +247,11 @@ impl IvfIndexState {
 
         let extra = self.quantizer_extra_data.as_deref().unwrap_or(&[]);
 
-        let total = 8 + header_json.len() + 8 + ivf_bytes.len() + 8 + extra.len();
+        let aux_ivf_pb = pb::Ivf::try_from(&self.aux_ivf)?;
+        let aux_ivf_bytes = aux_ivf_pb.encode_to_vec();
+
+        let total =
+            8 + header_json.len() + 8 + ivf_bytes.len() + 8 + extra.len() + 8 + aux_ivf_bytes.len();
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
         buf.extend_from_slice(&header_json);
@@ -250,6 +259,8 @@ impl IvfIndexState {
         buf.extend_from_slice(&ivf_bytes);
         buf.extend_from_slice(&(extra.len() as u64).to_le_bytes());
         buf.extend_from_slice(extra);
+        buf.extend_from_slice(&(aux_ivf_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&aux_ivf_bytes);
         Ok(buf)
     }
 
@@ -292,6 +303,23 @@ impl IvfIndexState {
         } else {
             None
         };
+        offset += extra_len;
+
+        // aux_ivf was added after the initial format; fall back to ivf if absent.
+        let aux_ivf = if offset + 8 <= data.len() {
+            let aux_ivf_len = read_u64(&data, &mut offset)? as usize;
+            if offset + aux_ivf_len > data.len() {
+                return Err(lance_core::Error::io(
+                    "IvfIndexState aux IVF data truncated",
+                ));
+            }
+            let aux_ivf_pb = pb::Ivf::decode(&data[offset..offset + aux_ivf_len])
+                .map_err(|e| lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}")))?;
+            IvfModel::try_from(aux_ivf_pb)?
+        } else {
+            // Legacy format without aux_ivf — fall back to index ivf.
+            ivf.clone()
+        };
 
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
         let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
@@ -301,6 +329,7 @@ impl IvfIndexState {
             index_file_path: header.index_file_path,
             uuid: header.uuid,
             ivf,
+            aux_ivf,
             distance_type,
             sub_index_metadata: header.sub_index_metadata,
             quantizer_metadata_json: header.quantizer_metadata_json,
@@ -319,6 +348,7 @@ impl DeepSizeOf for IvfIndexState {
         self.index_file_path.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
+            + self.aux_ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.quantizer_metadata_json.deep_size_of_children(context)
             + self

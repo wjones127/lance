@@ -261,6 +261,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         &self.reader
     }
 
+    pub fn ivf(&self) -> &IvfModel {
+        &self.ivf
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.reader.num_rows()
     }
