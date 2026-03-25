@@ -39,15 +39,22 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_table::format::IndexMetadata;
 use tracing::instrument;
 
-/// Load all FTS index segments for a column and return them as InvertedIndex instances.
-/// Also returns the union of all deleted_fragments bitmaps across segments.
+/// Load all FTS index segments for a column.
+///
+/// Returns the opened indices, the union of their deleted_fragments bitmaps, and the
+/// metadata for all segments (needed by `build_prefilter` to cover all segments).
 async fn load_all_fts_segments(
     ds: &Dataset,
     column: &str,
     metrics: &dyn MetricsCollector,
-) -> DataFusionResult<(Vec<InvertedIndex>, roaring::RoaringBitmap)> {
+) -> DataFusionResult<(
+    Vec<InvertedIndex>,
+    roaring::RoaringBitmap,
+    Vec<IndexMetadata>,
+)> {
     let first_meta = ds
         .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
         .await?
@@ -76,7 +83,7 @@ async fn load_all_fts_segments(
         all_deleted_fragments |= inverted_idx.deleted_fragments();
         indices.push(inverted_idx);
     }
-    Ok((indices, all_deleted_fragments))
+    Ok((indices, all_deleted_fragments, all_metas))
 }
 
 pub struct FtsIndexMetrics {
@@ -268,14 +275,9 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let (indices, all_deleted_fragments) =
+            let (indices, all_deleted_fragments, all_metas) =
                 load_all_fts_segments(&ds, &column, &metrics.index_metrics).await?;
 
-            let all_metas = ds
-                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-                .await?
-                .into_iter()
-                .collect::<Vec<_>>();
             let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
@@ -922,14 +924,9 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let (indices, all_deleted_fragments) =
+            let (indices, all_deleted_fragments, all_metas) =
                 load_all_fts_segments(&ds, &column, &metrics.index_metrics).await?;
 
-            let all_metas = ds
-                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-                .await?
-                .into_iter()
-                .collect::<Vec<_>>();
             let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,

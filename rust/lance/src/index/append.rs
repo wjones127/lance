@@ -303,11 +303,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // the builder only supports one source store.
                     let params = index.derive_index_params()?;
 
-                    // Collect all fragments to read from: merged segments + unindexed
+                    // Collect all fragments to read from: effective frags of merged
+                    // segments + unindexed. Use effective_old_frags (not frag_bitmap)
+                    // since frag_bitmap already includes unindexed fragment IDs.
                     let mut merge_frags: Vec<Fragment> = dataset
                         .fragments()
                         .iter()
-                        .filter(|f| frag_bitmap.contains(f.id as u32))
+                        .filter(|f| effective_old_frags.contains(f.id as u32))
                         .cloned()
                         .collect();
                     merge_frags.extend_from_slice(unindexed);
