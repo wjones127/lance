@@ -6,6 +6,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::io::{Read, Write};
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
@@ -319,6 +320,122 @@ impl IvfIndexState {
         } else {
             // Legacy format without aux_ivf — fall back to index ivf.
             ivf.clone()
+        };
+
+        let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
+        let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
+        let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
+
+        Ok(Self {
+            index_file_path: header.index_file_path,
+            uuid: header.uuid,
+            ivf,
+            aux_ivf,
+            distance_type,
+            sub_index_metadata: header.sub_index_metadata,
+            quantizer_metadata_json: header.quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+            cache_key_prefix: header.cache_key_prefix,
+            index_file_size: header.index_file_size,
+            aux_file_size: header.aux_file_size,
+        })
+    }
+
+    /// Write this state sequentially to `writer`, returning the number of bytes written.
+    ///
+    /// Same wire format as [`Self::serialize`] but streams directly to the writer
+    /// without accumulating into an intermediate buffer.
+    pub fn write_to_stream(&self, writer: &mut dyn Write) -> Result<usize> {
+        let header = IvfIndexStateHeader {
+            index_file_path: self.index_file_path.clone(),
+            uuid: self.uuid.clone(),
+            distance_type: self.distance_type.to_string(),
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_type: self.sub_index_type.to_string(),
+            quantization_type: self.quantization_type.to_string(),
+            quantizer_metadata_json: self.quantizer_metadata_json.clone(),
+            cache_key_prefix: self.cache_key_prefix.clone(),
+            index_file_size: self.index_file_size,
+            aux_file_size: self.aux_file_size,
+        };
+        let header_json = serde_json::to_vec(&header)
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+
+        let ivf_pb = pb::Ivf::try_from(&self.ivf)?;
+        let ivf_bytes = ivf_pb.encode_to_vec();
+
+        let extra = self.quantizer_extra_data.as_deref().unwrap_or(&[]);
+
+        let aux_ivf_pb = pb::Ivf::try_from(&self.aux_ivf)?;
+        let aux_ivf_bytes = aux_ivf_pb.encode_to_vec();
+
+        let mut written = 0usize;
+        macro_rules! w {
+            ($buf:expr) => {{
+                writer
+                    .write_all($buf)
+                    .map_err(|e| lance_core::Error::io(e.to_string()))?;
+                written += $buf.len();
+            }};
+        }
+        w!(&(header_json.len() as u64).to_le_bytes());
+        w!(&header_json);
+        w!(&(ivf_bytes.len() as u64).to_le_bytes());
+        w!(&ivf_bytes);
+        w!(&(extra.len() as u64).to_le_bytes());
+        w!(extra);
+        w!(&(aux_ivf_bytes.len() as u64).to_le_bytes());
+        w!(&aux_ivf_bytes);
+        Ok(written)
+    }
+
+    /// Read an [`IvfIndexState`] sequentially from `reader`.
+    ///
+    /// Reads the same wire format as [`Self::serialize`] / [`Self::write_to_stream`].
+    pub fn read_from_stream(reader: &mut dyn Read) -> Result<Self> {
+        fn read_u64(r: &mut dyn Read) -> Result<u64> {
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf)
+                .map_err(|e| lance_core::Error::io(e.to_string()))?;
+            Ok(u64::from_le_bytes(buf))
+        }
+        fn read_bytes(r: &mut dyn Read, len: usize) -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; len];
+            r.read_exact(&mut buf)
+                .map_err(|e| lance_core::Error::io(e.to_string()))?;
+            Ok(buf)
+        }
+
+        let header_len = read_u64(reader)? as usize;
+        let header_bytes = read_bytes(reader, header_len)?;
+        let header: IvfIndexStateHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+
+        let ivf_len = read_u64(reader)? as usize;
+        let ivf_bytes = read_bytes(reader, ivf_len)?;
+        let ivf_pb = pb::Ivf::decode(ivf_bytes.as_slice())
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?;
+        let ivf = IvfModel::try_from(ivf_pb)?;
+
+        let extra_len = read_u64(reader)? as usize;
+        let quantizer_extra_data = if extra_len > 0 {
+            Some(read_bytes(reader, extra_len)?)
+        } else {
+            None
+        };
+
+        let aux_ivf = match read_u64(reader) {
+            Ok(aux_ivf_len) => {
+                let aux_ivf_bytes = read_bytes(reader, aux_ivf_len as usize)?;
+                let aux_ivf_pb = pb::Ivf::decode(aux_ivf_bytes.as_slice()).map_err(|e| {
+                    lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
+                })?;
+                IvfModel::try_from(aux_ivf_pb)?
+            }
+            // Legacy format without aux_ivf — fall back to ivf.
+            Err(_) => ivf.clone(),
         };
 
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;

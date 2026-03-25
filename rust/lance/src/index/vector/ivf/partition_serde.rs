@@ -712,6 +712,20 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
 }
 
 // ---------------------------------------------------------------------------
+// IvfIndexState
+// ---------------------------------------------------------------------------
+
+impl Spillable for lance_index::vector::IvfIndexState {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
+        self.write_to_stream(writer)
+    }
+
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        lance_index::vector::IvfIndexState::read_from_stream(reader)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1183,5 +1197,53 @@ mod tests {
             let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
+    }
+
+    #[test]
+    fn test_ivf_index_state_roundtrip() {
+        use lance_index::vector::IvfIndexState;
+        use lance_index::vector::ivf::storage::IvfModel;
+        use lance_index::vector::quantizer::QuantizationType;
+        use lance_index::vector::v3::subindex::SubIndexType;
+
+        // Build a minimal IvfModel (single centroid, dim=2).
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32, 1.0]), 2)
+                .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+
+        let state = IvfIndexState {
+            index_file_path: "my/index.lance".to_string(),
+            uuid: "test-uuid-1234".to_string(),
+            ivf: ivf.clone(),
+            aux_ivf: ivf,
+            distance_type: DistanceType::L2,
+            sub_index_metadata: vec!["meta1".to_string()],
+            quantizer_metadata_json: r#"{"nbits":8}"#.to_string(),
+            quantizer_extra_data: Some(vec![1, 2, 3, 4]),
+            sub_index_type: SubIndexType::Flat,
+            quantization_type: QuantizationType::Product,
+            cache_key_prefix: "prefix/".to_string(),
+            index_file_size: 1024,
+            aux_file_size: 512,
+        };
+
+        let mut bytes = Vec::new();
+        let n = Spillable::serialize(&state, &mut bytes).unwrap();
+        assert_eq!(n, bytes.len());
+
+        let restored = Spillable::deserialize(&state, &mut Cursor::new(bytes)).unwrap();
+        assert_eq!(restored.index_file_path, state.index_file_path);
+        assert_eq!(restored.uuid, state.uuid);
+        assert_eq!(restored.distance_type, state.distance_type);
+        assert_eq!(restored.sub_index_metadata, state.sub_index_metadata);
+        assert_eq!(
+            restored.quantizer_metadata_json,
+            state.quantizer_metadata_json
+        );
+        assert_eq!(restored.quantizer_extra_data, state.quantizer_extra_data);
+        assert_eq!(restored.cache_key_prefix, state.cache_key_prefix);
+        assert_eq!(restored.index_file_size, state.index_file_size);
+        assert_eq!(restored.aux_file_size, state.aux_file_size);
     }
 }
