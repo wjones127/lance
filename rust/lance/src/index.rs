@@ -1383,15 +1383,6 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index.as_index());
         }
 
-        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self
-            .index_cache
-            .get_unsized_with_key(&vector_cache_key)
-            .await
-        {
-            return Ok(index.as_index());
-        }
-
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
             return Ok(index.as_index());
