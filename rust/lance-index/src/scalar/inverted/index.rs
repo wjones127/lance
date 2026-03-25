@@ -469,99 +469,7 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        let limit = params.limit.unwrap_or(usize::MAX);
-        if limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let mask = prefilter.mask();
-
-        let mut candidates = BinaryHeap::new();
-        let parts = self
-            .partitions
-            .iter()
-            .map(|part| {
-                let part = part.clone();
-                let tokens = tokens.clone();
-                let params = params.clone();
-                let mask = mask.clone();
-                let metrics = metrics.clone();
-                async move {
-                    let postings = part
-                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
-                        .await?;
-                    if postings.is_empty() {
-                        return Result::Ok(PartitionCandidates::empty());
-                    }
-                    let mut tokens_by_position = vec![String::new(); postings.len()];
-                    for posting in &postings {
-                        let idx = posting.term_index() as usize;
-                        tokens_by_position[idx] = posting.token().to_owned();
-                    }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
-                    spawn_cpu(move || {
-                        let candidates = part.bm25_search(
-                            params.as_ref(),
-                            operator,
-                            mask,
-                            postings,
-                            metrics.as_ref(),
-                        )?;
-                        Ok(PartitionCandidates {
-                            tokens_by_position,
-                            candidates,
-                        })
-                    })
-                    .await
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
-        let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
-            if res.candidates.is_empty() {
-                continue;
-            }
-            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
-            for token in &res.tokens_by_position {
-                let idf_weight = match idf_cache.get(token) {
-                    Some(weight) => *weight,
-                    None => {
-                        let weight = scorer.query_weight(token);
-                        idf_cache.insert(token.clone(), weight);
-                        weight
-                    }
-                };
-                idf_by_position.push(idf_weight);
-            }
-            for DocCandidate {
-                row_id,
-                freqs,
-                doc_length,
-            } in res.candidates
-            {
-                let mut score = 0.0;
-                for (term_index, freq) in freqs.into_iter() {
-                    debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
-                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
-                }
-                if candidates.len() < limit {
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-                } else if candidates.peek().unwrap().0.score.0 < score {
-                    candidates.pop();
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-                }
-            }
-        }
-
-        Ok(candidates
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
-            .unzip())
+        multi_index_bm25_search(&[self], tokens, params, operator, prefilter, metrics).await
     }
 
     async fn load_legacy_index(
@@ -3915,7 +3823,7 @@ async fn tokenize_and_count(
 /// In order to calculate BM25 scores we need to know token counts for the entire corpus.  We extract these from the
 /// counted input of the flat search combined with any counts recorded for the indexed portion.
 fn initialize_scorer(
-    index: &Option<InvertedIndex>,
+    indices: &[InvertedIndex],
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
 ) -> MemBM25Scorer {
@@ -3923,8 +3831,12 @@ fn initialize_scorer(
     let mut num_docs = 0;
     let mut all_token_counts = vec![0; query_tokens.len()];
 
-    if let Some(index) = index {
-        let index_bm25_scorer = IndexBM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
+    if !indices.is_empty() {
+        let all_partitions: Vec<_> = indices
+            .iter()
+            .flat_map(|idx| idx.partitions.iter().map(|p| p.as_ref()))
+            .collect();
+        let index_bm25_scorer = IndexBM25Scorer::new(all_partitions.into_iter());
         for (token_index, token) in query_tokens.into_iter().enumerate() {
             let token_nq = index_bm25_scorer.num_docs_containing_token(token);
             all_token_counts[token_index] = token_nq as u64;
@@ -4028,21 +3940,135 @@ fn flat_bm25_score(
     Ok(batch)
 }
 
+/// Search across multiple InvertedIndex segments with unified BM25 scoring.
+///
+/// Collects all partitions from all indices, creates a unified IndexBM25Scorer
+/// for cross-segment IDF reweighting, and returns merged top-k results.
+#[instrument(level = "debug", skip_all)]
+pub async fn multi_index_bm25_search(
+    indices: &[&InvertedIndex],
+    tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let limit = params.limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mask = prefilter.mask();
+
+    // Collect all partitions from all indices
+    let all_partitions: Vec<Arc<InvertedPartition>> = indices
+        .iter()
+        .flat_map(|idx| idx.partitions.iter().cloned())
+        .collect();
+
+    let mut candidates = BinaryHeap::new();
+    let parts = all_partitions
+        .iter()
+        .map(|part| {
+            let part = part.clone();
+            let tokens = tokens.clone();
+            let params = params.clone();
+            let mask = mask.clone();
+            let metrics = metrics.clone();
+            async move {
+                let postings = part
+                    .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                    .await?;
+                if postings.is_empty() {
+                    return Result::Ok(PartitionCandidates::empty());
+                }
+                let mut tokens_by_position = vec![String::new(); postings.len()];
+                for posting in &postings {
+                    let idx = posting.term_index() as usize;
+                    tokens_by_position[idx] = posting.token().to_owned();
+                }
+                let params = params.clone();
+                let mask = mask.clone();
+                let metrics = metrics.clone();
+                spawn_cpu(move || {
+                    let candidates = part.bm25_search(
+                        params.as_ref(),
+                        operator,
+                        mask,
+                        postings,
+                        metrics.as_ref(),
+                    )?;
+                    Ok(PartitionCandidates {
+                        tokens_by_position,
+                        candidates,
+                    })
+                })
+                .await
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+    // Create unified scorer from all partitions across all indices
+    let scorer = IndexBM25Scorer::new(all_partitions.iter().map(|part| part.as_ref()));
+    let mut idf_cache: HashMap<String, f32> = HashMap::new();
+    while let Some(res) = parts.try_next().await? {
+        if res.candidates.is_empty() {
+            continue;
+        }
+        let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+        for token in &res.tokens_by_position {
+            let idf_weight = match idf_cache.get(token) {
+                Some(weight) => *weight,
+                None => {
+                    let weight = scorer.query_weight(token);
+                    idf_cache.insert(token.clone(), weight);
+                    weight
+                }
+            };
+            idf_by_position.push(idf_weight);
+        }
+        for DocCandidate {
+            row_id,
+            freqs,
+            doc_length,
+        } in res.candidates
+        {
+            let mut score = 0.0;
+            for (term_index, freq) in freqs.into_iter() {
+                debug_assert!((term_index as usize) < idf_by_position.len());
+                score += idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+            }
+            if candidates.len() < limit {
+                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+            } else if candidates.peek().unwrap().0.score.0 < score {
+                candidates.pop();
+                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+            }
+        }
+    }
+
+    Ok(candidates
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+        .unzip())
+}
+
 pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
-    index: &Option<InvertedIndex>,
+    indices: &[InvertedIndex],
     target_batch_size: usize,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    let mut tokenizer = match index {
-        Some(index) => index.tokenizer(),
-        None => Box::new(TextTokenizer::new(
+    let mut tokenizer = if let Some(index) = indices.first() {
+        index.tokenizer()
+    } else {
+        Box::new(TextTokenizer::new(
             tantivy::tokenizer::TextAnalyzer::builder(
                 tantivy::tokenizer::SimpleTokenizer::default(),
             )
             .build(),
-        )),
+        ))
     };
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
 
@@ -4071,7 +4097,7 @@ pub async fn flat_bm25_search_stream(
         tokenize_and_count(chunked, tokenizer, query_tokens.clone(), doc_col_idx).await?;
 
     // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize)
-    let scorer = initialize_scorer(index, query_tokens.as_ref(), &counted_input);
+    let scorer = initialize_scorer(indices, query_tokens.as_ref(), &counted_input);
     let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
 
     // Finally we emit batches according to the target batch size

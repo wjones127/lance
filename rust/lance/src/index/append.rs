@@ -157,56 +157,40 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     let index_type = indices[0].index_type();
     let (new_uuid, indices_merged, created_index) = match index_type {
         it if it.is_scalar() => {
-            // Use effective bitmap (intersected with existing dataset fragments)
-            // to avoid carrying stale data from pruned indices.
-            let effective_old_frags: RoaringBitmap = old_indices
-                .iter()
-                .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
-                .fold(RoaringBitmap::new(), |mut acc, b| {
-                    acc |= &b;
-                    acc
-                });
-            let deleted_old_frags: RoaringBitmap = old_indices
-                .iter()
-                .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
-                .fold(RoaringBitmap::new(), |mut acc, b| {
-                    acc |= &b;
-                    acc
-                });
-            frag_bitmap |= &effective_old_frags;
+            let num_to_merge = options
+                .num_indices_to_merge
+                .unwrap_or(old_indices.len())
+                .min(old_indices.len());
 
-            let index = dataset
-                .open_scalar_index(
+            if num_to_merge == 0 {
+                // Append mode: build a new segment from only unindexed data.
+                // Existing segments are kept as-is.
+                if unindexed.is_empty() {
+                    return Ok(None);
+                }
+
+                let index = dataset
+                    .open_scalar_index(
+                        &field_path,
+                        &old_indices[0].uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                let params = index.derive_index_params()?;
+                let update_criteria = index.update_criteria();
+
+                let new_data_stream = load_training_data(
+                    dataset.as_ref(),
                     &field_path,
-                    &old_indices[0].uuid.to_string(),
-                    &NoOpMetricsCollector,
+                    &update_criteria.data_criteria,
+                    Some(unindexed.to_vec()),
+                    true,
+                    None,
                 )
                 .await?;
 
-            let update_criteria = index.update_criteria();
-
-            let fragments = if update_criteria.requires_old_data {
-                None
-            } else {
-                Some(unindexed.to_vec())
-            };
-            let new_data_stream = load_training_data(
-                dataset.as_ref(),
-                &field_path,
-                &update_criteria.data_criteria,
-                fragments,
-                true,
-                None,
-            )
-            .await?;
-
-            let new_uuid = Uuid::new_v4();
-
-            let created_index = if effective_old_frags.is_empty() {
-                // Old data is fully stale (bitmap pruned to empty). Rebuild
-                // from scratch instead of merging stale entries.
-                let params = index.derive_index_params()?;
-                super::scalar::build_scalar_index(
+                let new_uuid = Uuid::new_v4();
+                let created_index = super::scalar::build_scalar_index(
                     dataset.as_ref(),
                     column.name.as_str(),
                     &new_uuid.to_string(),
@@ -216,32 +200,144 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     Some(new_data_stream),
                     Arc::new(NoopIndexBuildProgress),
                 )
-                .await?
-            } else {
-                let new_store =
-                    LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
-                let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
-                    // Stable row IDs are opaque IDs, so fragment-bit filtering on
-                    // (row_id >> 32) is invalid. Build an exact allow-list from retained
-                    // fragments' row-id sequences and use precise filtering.
-                    let valid_old_row_ids =
-                        build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags).await?;
-                    Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
-                } else {
-                    // Address-style row IDs encode fragment_id in high 32 bits.
-                    // Fragment bitmap filtering is valid and cheaper in this mode.
-                    Some(OldIndexDataFilter::Fragments {
-                        to_keep: effective_old_frags,
-                        to_remove: deleted_old_frags,
-                    })
-                };
-                index
-                    .update(new_data_stream, &new_store, old_data_filter)
-                    .await?
-            };
+                .await?;
 
-            // TODO: don't hard-code index version
-            Ok((new_uuid, 1, created_index))
+                // indices_merged = 0: no old segments removed
+                Ok((new_uuid, 0, created_index))
+            } else {
+                // Merge mode: merge the `num_to_merge` most recent segments
+                // plus any unindexed data into a single new segment.
+                let merge_start = old_indices.len() - num_to_merge;
+                let indices_to_merge = &old_indices[merge_start..];
+
+                let effective_old_frags: RoaringBitmap = indices_to_merge
+                    .iter()
+                    .filter_map(|idx| idx.effective_fragment_bitmap(&dataset.fragment_bitmap))
+                    .fold(RoaringBitmap::new(), |mut acc, b| {
+                        acc |= &b;
+                        acc
+                    });
+                let deleted_old_frags: RoaringBitmap = indices_to_merge
+                    .iter()
+                    .filter_map(|idx| idx.deleted_fragment_bitmap(&dataset.fragment_bitmap))
+                    .fold(RoaringBitmap::new(), |mut acc, b| {
+                        acc |= &b;
+                        acc
+                    });
+                frag_bitmap |= &effective_old_frags;
+
+                let index = dataset
+                    .open_scalar_index(
+                        &field_path,
+                        &indices_to_merge[0].uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+
+                let new_uuid = Uuid::new_v4();
+
+                let created_index = if effective_old_frags.is_empty() {
+                    // Old data is fully stale (bitmap pruned to empty). Rebuild
+                    // from scratch instead of merging stale entries.
+                    let params = index.derive_index_params()?;
+                    let update_criteria = index.update_criteria();
+
+                    let new_data_stream = load_training_data(
+                        dataset.as_ref(),
+                        &field_path,
+                        &update_criteria.data_criteria,
+                        Some(unindexed.to_vec()),
+                        true,
+                        None,
+                    )
+                    .await?;
+
+                    super::scalar::build_scalar_index(
+                        dataset.as_ref(),
+                        column.name.as_str(),
+                        &new_uuid.to_string(),
+                        &params,
+                        true,
+                        None,
+                        Some(new_data_stream),
+                        Arc::new(NoopIndexBuildProgress),
+                    )
+                    .await?
+                } else if num_to_merge == 1 {
+                    // Single-segment merge: use the existing update path
+                    // which carries forward old partitions efficiently.
+                    let update_criteria = index.update_criteria();
+                    let fragments = if update_criteria.requires_old_data {
+                        None
+                    } else {
+                        Some(unindexed.to_vec())
+                    };
+                    let new_data_stream = load_training_data(
+                        dataset.as_ref(),
+                        &field_path,
+                        &update_criteria.data_criteria,
+                        fragments,
+                        true,
+                        None,
+                    )
+                    .await?;
+
+                    let new_store =
+                        LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid.to_string())?;
+                    let old_data_filter = if dataset.manifest.uses_stable_row_ids() {
+                        let valid_old_row_ids =
+                            build_stable_row_id_filter(dataset.as_ref(), &effective_old_frags)
+                                .await?;
+                        Some(OldIndexDataFilter::RowIds(valid_old_row_ids))
+                    } else {
+                        Some(OldIndexDataFilter::Fragments {
+                            to_keep: effective_old_frags,
+                            to_remove: deleted_old_frags,
+                        })
+                    };
+                    index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
+                } else {
+                    // Multi-segment merge (N > 1): rebuild from raw data since
+                    // the builder only supports one source store.
+                    let params = index.derive_index_params()?;
+
+                    // Collect all fragments to read from: merged segments + unindexed
+                    let mut merge_frags: Vec<Fragment> = dataset
+                        .fragments()
+                        .iter()
+                        .filter(|f| frag_bitmap.contains(f.id as u32))
+                        .cloned()
+                        .collect();
+                    merge_frags.extend_from_slice(unindexed);
+
+                    let update_criteria = index.update_criteria();
+                    let new_data_stream = load_training_data(
+                        dataset.as_ref(),
+                        &field_path,
+                        &update_criteria.data_criteria,
+                        Some(merge_frags),
+                        true,
+                        None,
+                    )
+                    .await?;
+
+                    super::scalar::build_scalar_index(
+                        dataset.as_ref(),
+                        column.name.as_str(),
+                        &new_uuid.to_string(),
+                        &params,
+                        true,
+                        None,
+                        Some(new_data_stream),
+                        Arc::new(NoopIndexBuildProgress),
+                    )
+                    .await?
+                };
+
+                Ok((new_uuid, num_to_merge, created_index))
+            }
         }
         it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {

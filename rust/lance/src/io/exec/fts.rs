@@ -35,11 +35,49 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
+    FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream, multi_index_bm25_search,
 };
 use lance_index::{DatasetIndexExt, IndexCriteria};
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use tracing::instrument;
+
+/// Load all FTS index segments for a column and return them as InvertedIndex instances.
+/// Also returns the union of all deleted_fragments bitmaps across segments.
+async fn load_all_fts_segments(
+    ds: &Dataset,
+    column: &str,
+    metrics: &dyn MetricsCollector,
+) -> DataFusionResult<(Vec<InvertedIndex>, roaring::RoaringBitmap)> {
+    let first_meta = ds
+        .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
+        .await?
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("No Inverted index found for column {}", column))
+        })?;
+
+    let all_metas = ds.load_indices_by_name(&first_meta.name).await?;
+
+    let mut indices = Vec::with_capacity(all_metas.len());
+    let mut all_deleted_fragments = roaring::RoaringBitmap::new();
+    for meta in &all_metas {
+        let idx = ds
+            .open_generic_index(column, &meta.uuid.to_string(), metrics)
+            .await?;
+        let inverted_idx = idx
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Index for column {} is not an inverted index",
+                    column,
+                ))
+            })?
+            .clone();
+        all_deleted_fragments |= inverted_idx.deleted_fragments();
+        indices.push(inverted_idx);
+    }
+    Ok((indices, all_deleted_fragments))
+}
 
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
@@ -230,54 +268,47 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-            let index_meta = ds
+            let (indices, all_deleted_fragments) =
+                load_all_fts_segments(&ds, &column, &metrics.index_metrics).await?;
+
+            let all_metas = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                .await?;
-
+                .into_iter()
+                .collect::<Vec<_>>();
             let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
                 ds,
-                &[index_meta],
+                &all_metas,
             )?;
 
-            let inverted_idx = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
-            if !inverted_idx.deleted_fragments().is_empty() {
+            if !all_deleted_fragments.is_empty() {
                 Arc::get_mut(&mut pre_filter)
                     .expect("prefilter just created")
-                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
+                    .set_deleted_fragments(all_deleted_fragments);
             }
-            metrics.record_parts_searched(inverted_idx.partition_count());
+            let total_partitions: usize = indices.iter().map(|i| i.partition_count()).sum();
+            metrics.record_parts_searched(total_partitions);
 
+            let first_idx = indices.first().ok_or_else(|| {
+                DataFusionError::Execution(
+                    format!("No Inverted index found for column {}", column,),
+                )
+            })?;
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let params = params
                 .with_fuzziness(query.fuzziness)
                 .with_max_expansions(query.max_expansions)
                 .with_prefix_length(query.prefix_length);
             let mut tokenizer = match is_fuzzy {
-                false => inverted_idx.tokenizer(),
+                false => first_idx.tokenizer(),
                 true => {
                     let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
                         tantivy::tokenizer::SimpleTokenizer::default(),
                     );
-                    match inverted_idx.tokenizer().doc_type() {
+                    match first_idx.tokenizer().doc_type() {
                         DocType::Text => {
                             Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
                         }
@@ -290,16 +321,17 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
 
             pre_filter.wait_for_ready().await?;
-            let (doc_ids, mut scores) = inverted_idx
-                .bm25_search(
-                    Arc::new(tokens),
-                    params.into(),
-                    query.operator,
-                    pre_filter,
-                    metrics.clone(),
-                )
-                .boxed()
-                .await?;
+            let index_refs: Vec<&InvertedIndex> = indices.iter().collect();
+            let (doc_ids, mut scores) = multi_index_bm25_search(
+                &index_refs,
+                Arc::new(tokens),
+                params.into(),
+                query.operator,
+                pre_filter,
+                metrics.clone(),
+            )
+            .boxed()
+            .await?;
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
@@ -674,28 +706,37 @@ impl ExecutionPlan for FlatMatchQueryExec {
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
-            let index_meta = ds
+            let indices = match ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-                .await?;
-            let inverted_idx = match index_meta {
-                Some(index_meta) => {
-                    let uuid = index_meta.uuid.to_string();
-                    let index = ds
-                        .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                        .await?;
-                    index.as_any().downcast_ref::<InvertedIndex>().cloned()
+                .await?
+            {
+                Some(first_meta) => {
+                    let all_metas = ds.load_indices_by_name(&first_meta.name).await?;
+                    let mut indices = Vec::with_capacity(all_metas.len());
+                    for meta in &all_metas {
+                        let idx = ds
+                            .open_generic_index(
+                                &column,
+                                &meta.uuid.to_string(),
+                                &metrics.index_metrics,
+                            )
+                            .await?;
+                        if let Some(inv) = idx.as_any().downcast_ref::<InvertedIndex>() {
+                            indices.push(inv.clone());
+                        }
+                    }
+                    indices
                 }
-                None => None,
+                None => Vec::new(),
             };
-            if let Some(index) = inverted_idx.as_ref() {
-                metrics.record_parts_searched(index.partition_count());
-            }
+            let total_partitions: usize = indices.iter().map(|i| i.partition_count()).sum();
+            metrics.record_parts_searched(total_partitions);
 
             flat_bm25_search_stream(
                 unindexed_input,
                 column,
                 query.terms,
-                &inverted_idx,
+                &indices,
                 target_batch_size,
             )
             .await
@@ -881,56 +922,50 @@ impl ExecutionPlan for PhraseQueryExec {
                 "column not set for PhraseQuery {}",
                 query.terms
             )))?;
-            let index_meta = ds
+            let (indices, all_deleted_fragments) =
+                load_all_fts_segments(&ds, &column, &metrics.index_metrics).await?;
+
+            let all_metas = ds
                 .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
                 .await?
-                .ok_or(DataFusionError::Execution(format!(
-                    "No Inverted index found for column {}",
-                    column,
-                )))?;
-            let uuid = index_meta.uuid.to_string();
-            let index = ds
-                .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                .await?;
-
+                .into_iter()
+                .collect::<Vec<_>>();
             let mut pre_filter = build_prefilter(
                 context.clone(),
                 partition,
                 &prefilter_source,
                 ds,
-                &[index_meta],
+                &all_metas,
             )?;
 
-            let index = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Index for column {} is not an inverted index",
-                        column,
-                    ))
-                })?;
-            if !index.deleted_fragments().is_empty() {
+            if !all_deleted_fragments.is_empty() {
                 Arc::get_mut(&mut pre_filter)
                     .expect("prefilter just created")
-                    .set_deleted_fragments(index.deleted_fragments().clone());
+                    .set_deleted_fragments(all_deleted_fragments);
             }
-            metrics.record_parts_searched(index.partition_count());
+            let total_partitions: usize = indices.iter().map(|i| i.partition_count()).sum();
+            metrics.record_parts_searched(total_partitions);
 
-            let mut tokenizer = index.tokenizer();
+            let first_idx = indices.first().ok_or_else(|| {
+                DataFusionError::Execution(
+                    format!("No Inverted index found for column {}", column,),
+                )
+            })?;
+            let mut tokenizer = first_idx.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
 
             pre_filter.wait_for_ready().await?;
-            let (doc_ids, scores) = index
-                .bm25_search(
-                    Arc::new(tokens),
-                    params.into(),
-                    lance_index::scalar::inverted::query::Operator::And,
-                    pre_filter,
-                    metrics.clone(),
-                )
-                .boxed()
-                .await?;
+            let index_refs: Vec<&InvertedIndex> = indices.iter().collect();
+            let (doc_ids, scores) = multi_index_bm25_search(
+                &index_refs,
+                Arc::new(tokens),
+                params.into(),
+                lance_index::scalar::inverted::query::Operator::And,
+                pre_filter,
+                metrics.clone(),
+            )
+            .boxed()
+            .await?;
             metrics.baseline_metrics.record_output(doc_ids.len());
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),

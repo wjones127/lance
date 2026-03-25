@@ -3,10 +3,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray, UInt32Array};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::scanner::ColumnOrdering;
-use lance::dataset::{InsertBuilder, WriteParams};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+use lance_core::utils::tempfile::TempStrDir;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};
@@ -340,4 +343,493 @@ async fn test_fts_after_delete_with_stable_row_ids() {
     for id in result_ids.values().iter() {
         assert!(*id >= 5, "Deleted row id {} should not appear", id);
     }
+}
+
+// Helper: create a dataset with text data, split into initial + append batches.
+async fn make_fts_dataset_with_append(test_uri: &str, with_position: bool) -> Dataset {
+    let ids1: Vec<i32> = (0..10).collect();
+    let texts1 = vec![
+        "hello world",
+        "world hello",
+        "hello",
+        "lance database",
+        "search engine",
+        "hello lance",
+        "lance",
+        "database",
+        "world",
+        "hello world search",
+    ];
+
+    let batch1 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(ids1)) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(
+                texts1.into_iter().map(Some).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    let mut ds = InsertBuilder::new(test_uri)
+        .execute(vec![batch1])
+        .await
+        .unwrap();
+
+    let params = base_inverted_params(with_position);
+    ds.create_index_builder(&["text"], IndexType::Inverted, &params)
+        .await
+        .unwrap();
+
+    // Append more data
+    let ids2: Vec<i32> = (10..20).collect();
+    let texts2 = vec![
+        "hello database",
+        "search world",
+        "lance search engine",
+        "hello hello hello",
+        "world world",
+        "database search",
+        "hello engine",
+        "lance world",
+        "search hello",
+        "engine database lance",
+    ];
+
+    let batch2 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(ids2)) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(
+                texts2.into_iter().map(Some).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    let append_params = WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+    InsertBuilder::new(test_uri)
+        .with_params(&append_params)
+        .execute(vec![batch2])
+        .await
+        .unwrap();
+
+    DatasetBuilder::from_uri(test_uri).load().await.unwrap()
+}
+
+// Run FTS and return (row_ids, scores) sorted by row_id for deterministic comparison.
+async fn fts_results_sorted(ds: &Dataset, query: &str) -> Vec<(i32, f32)> {
+    let fts_query = FullTextSearchQuery::new(query.to_string())
+        .with_column("text".to_string())
+        .unwrap();
+    let mut scanner = ds.scan();
+    scanner.full_text_search(fts_query).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let scores = batch
+        .column_by_name("_score")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    ids.values()
+        .iter()
+        .zip(scores.values().iter())
+        .map(|(&id, &score)| (id, score))
+        .collect()
+}
+
+#[tokio::test]
+async fn test_fts_append_creates_separate_segment() {
+    let test_dir = TempStrDir::default();
+    let mut ds = make_fts_dataset_with_append(test_dir.as_str(), false).await;
+
+    let indices = ds.load_indices().await.unwrap();
+    let fts_idx_name = indices
+        .iter()
+        .find(|i| i.name.contains("text"))
+        .unwrap()
+        .name
+        .clone();
+
+    // Before optimize: only 1 segment
+    assert_eq!(
+        ds.load_indices_by_name(&fts_idx_name).await.unwrap().len(),
+        1
+    );
+
+    // Append mode: create a new segment without merging
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Should have 2 segments
+    let segments = ds.load_indices_by_name(&fts_idx_name).await.unwrap();
+    assert_eq!(segments.len(), 2, "Expected 2 FTS segments after append");
+
+    // Fragment bitmaps should be disjoint
+    let bm0 = segments[0].fragment_bitmap.as_ref().unwrap();
+    let bm1 = segments[1].fragment_bitmap.as_ref().unwrap();
+    assert!(
+        bm0.intersection_len(bm1) == 0,
+        "Segment fragment bitmaps should be disjoint"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_multi_segment_score_equivalence() {
+    // Build single-segment index on full data
+    let single_dir = TempStrDir::default();
+    let mut ds_single = make_fts_dataset_with_append(single_dir.as_str(), false).await;
+
+    // Rebuild index on the whole dataset (single segment)
+    ds_single
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let ds_single = DatasetBuilder::from_uri(single_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Build multi-segment index on same data
+    let multi_dir = TempStrDir::default();
+    let mut ds_multi = make_fts_dataset_with_append(multi_dir.as_str(), false).await;
+
+    // Append mode: create second segment
+    ds_multi
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let ds_multi = DatasetBuilder::from_uri(multi_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Verify 2 segments
+    let indices = ds_multi.load_indices().await.unwrap();
+    let fts_name = indices
+        .iter()
+        .find(|i| i.name.contains("text"))
+        .unwrap()
+        .name
+        .clone();
+    let segments = ds_multi.load_indices_by_name(&fts_name).await.unwrap();
+    assert_eq!(segments.len(), 2);
+
+    // Compare results for multiple queries
+    for query in &["hello", "world", "lance", "database", "search", "engine"] {
+        let single_results = fts_results_sorted(&ds_single, query).await;
+        let multi_results = fts_results_sorted(&ds_multi, query).await;
+
+        assert_eq!(
+            single_results.len(),
+            multi_results.len(),
+            "Result count mismatch for query '{}'",
+            query
+        );
+
+        for (i, ((s_id, s_score), (m_id, m_score))) in
+            single_results.iter().zip(multi_results.iter()).enumerate()
+        {
+            assert_eq!(
+                s_id, m_id,
+                "ID mismatch at position {} for query '{}'",
+                i, query
+            );
+            assert!(
+                (s_score - m_score).abs() < 1e-5,
+                "Score mismatch at position {} for query '{}': single={}, multi={}",
+                i,
+                query,
+                s_score,
+                m_score,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fts_merge_combines_segments() {
+    let test_dir = TempStrDir::default();
+    let mut ds = make_fts_dataset_with_append(test_dir.as_str(), false).await;
+
+    // Create second segment
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    let indices = ds.load_indices().await.unwrap();
+    let fts_name = indices
+        .iter()
+        .find(|i| i.name.contains("text"))
+        .unwrap()
+        .name
+        .clone();
+    assert_eq!(ds.load_indices_by_name(&fts_name).await.unwrap().len(), 2);
+
+    // Query before merge
+    let before_merge = fts_results_sorted(&ds, "hello").await;
+
+    // Merge all segments
+    let mut ds = ds;
+    ds.optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Should be back to 1 segment
+    let segments = ds.load_indices_by_name(&fts_name).await.unwrap();
+    assert_eq!(segments.len(), 1, "Expected 1 segment after merge(2)");
+
+    // Results should be the same
+    let after_merge = fts_results_sorted(&ds, "hello").await;
+    assert_eq!(
+        before_merge.len(),
+        after_merge.len(),
+        "Result count changed after merge"
+    );
+    for ((_, s1), (_, s2)) in before_merge.iter().zip(after_merge.iter()) {
+        assert!(
+            (s1 - s2).abs() < 1e-5,
+            "Scores changed after merge: {} vs {}",
+            s1,
+            s2,
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_three_segments_partial_merge() {
+    let test_dir = TempStrDir::default();
+
+    // Create initial data
+    let batch1 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hello world", "lance db", "search"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+
+    let mut ds = InsertBuilder::new(test_dir.as_str())
+        .execute(vec![batch1])
+        .await
+        .unwrap();
+
+    let params = base_inverted_params(false);
+    ds.create_index_builder(&["text"], IndexType::Inverted, &params)
+        .await
+        .unwrap();
+
+    // Append batch 2 and create segment
+    let batch2 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![3, 4, 5])) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hello lance", "world search", "db"])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let append_params = WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+    InsertBuilder::new(test_dir.as_str())
+        .with_params(&append_params)
+        .execute(vec![batch2])
+        .await
+        .unwrap();
+    let mut ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    // Append batch 3 and create segment
+    let batch3 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![6, 7, 8])) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec![
+                "hello search",
+                "lance world",
+                "db engine",
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    InsertBuilder::new(test_dir.as_str())
+        .with_params(&append_params)
+        .execute(vec![batch3])
+        .await
+        .unwrap();
+    let mut ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    let indices = ds.load_indices().await.unwrap();
+    let fts_name = indices
+        .iter()
+        .find(|i| i.name.contains("text"))
+        .unwrap()
+        .name
+        .clone();
+    assert_eq!(ds.load_indices_by_name(&fts_name).await.unwrap().len(), 3);
+
+    // Query across 3 segments
+    let results_3seg = fts_results_sorted(&ds, "hello").await;
+    assert_eq!(results_3seg.len(), 3); // rows 0, 3, 6
+
+    // Partial merge: merge 2 most recent
+    let mut ds = ds;
+    ds.optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Should now have 2 segments (original + merged)
+    let segments = ds.load_indices_by_name(&fts_name).await.unwrap();
+    assert_eq!(segments.len(), 2, "Expected 2 segments after merge(2)");
+
+    // Results should be the same
+    let results_2seg = fts_results_sorted(&ds, "hello").await;
+    assert_eq!(results_3seg.len(), results_2seg.len());
+}
+
+#[tokio::test]
+async fn test_fts_multi_segment_with_unindexed_data() {
+    let test_dir = TempStrDir::default();
+    let mut ds = make_fts_dataset_with_append(test_dir.as_str(), false).await;
+
+    // Create second segment
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    // Append more data (stays unindexed)
+    let batch3 = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![20, 21])) as ArrayRef),
+        (
+            "text",
+            Arc::new(StringArray::from(vec![
+                "hello unindexed",
+                "world unindexed",
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let append_params = WriteParams {
+        mode: WriteMode::Append,
+        ..Default::default()
+    };
+    InsertBuilder::new(test_dir.as_str())
+        .with_params(&append_params)
+        .execute(vec![batch3])
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Query should include results from 2 segments + unindexed flat scan
+    let results = fts_results_sorted(&ds, "hello").await;
+    // Should find "hello" in indexed segments and in unindexed data
+    assert!(
+        results.iter().any(|(id, _)| *id == 20),
+        "Should find results in unindexed data"
+    );
+    assert!(
+        results.iter().any(|(id, _)| *id == 0),
+        "Should find results in first segment"
+    );
+    assert!(
+        results.iter().any(|(id, _)| *id == 10),
+        "Should find results in second segment"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_multi_segment_phrase_query() {
+    let test_dir = TempStrDir::default();
+    let mut ds = make_fts_dataset_with_append(test_dir.as_str(), true).await;
+
+    // Create second segment (with positions)
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let ds = DatasetBuilder::from_uri(test_dir.as_str())
+        .load()
+        .await
+        .unwrap();
+
+    // Phrase query across 2 segments
+    let phrase_query =
+        PhraseQuery::new("hello world".to_string()).with_column(Some("text".to_string()));
+    let fts_query = FullTextSearchQuery::new_query(phrase_query.into());
+    let mut scanner = ds.scan();
+    scanner.full_text_search(fts_query).unwrap();
+    scanner
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "id".to_string(),
+        )]))
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+
+    // "hello world" appears at rows 0 and 9
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let id_values: Vec<i32> = ids.values().to_vec();
+    assert!(
+        id_values.contains(&0),
+        "Should find 'hello world' in first segment"
+    );
+    assert!(
+        id_values.contains(&9),
+        "'hello world search' should match phrase 'hello world'"
+    );
 }
