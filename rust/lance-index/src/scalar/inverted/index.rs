@@ -194,14 +194,12 @@ impl FromStr for InvertedListFormatVersion {
 
 #[derive(Debug)]
 struct PartitionCandidates {
-    tokens_by_position: Vec<String>,
     candidates: Vec<DocCandidate>,
 }
 
 impl PartitionCandidates {
     fn empty() -> Self {
         Self {
-            tokens_by_position: Vec::new(),
             candidates: Vec::new(),
         }
     }
@@ -940,7 +938,7 @@ impl InvertedPartition {
         let num_docs = self.docs.len();
         stream::iter(token_ids)
             .enumerate()
-            .map(|(position, (token_id, token))| async move {
+            .map(|(position, (token_id, _token))| async move {
                 let posting = self
                     .inverted_list
                     .posting_list(token_id, is_phrase_query, metrics)
@@ -949,7 +947,6 @@ impl InvertedPartition {
                 let query_weight = idf(posting.len(), num_docs);
 
                 Result::Ok(PostingIterator::with_query_weight(
-                    token,
                     token_id,
                     position as u32,
                     query_weight,
@@ -3981,11 +3978,6 @@ pub async fn multi_index_bm25_search(
                 if postings.is_empty() {
                     return Result::Ok(PartitionCandidates::empty());
                 }
-                let mut tokens_by_position = vec![String::new(); postings.len()];
-                for posting in &postings {
-                    let idx = posting.term_index() as usize;
-                    tokens_by_position[idx] = posting.token().to_owned();
-                }
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
@@ -3997,34 +3989,23 @@ pub async fn multi_index_bm25_search(
                         postings,
                         metrics.as_ref(),
                     )?;
-                    Ok(PartitionCandidates {
-                        tokens_by_position,
-                        candidates,
-                    })
+                    Ok(PartitionCandidates { candidates })
                 })
                 .await
             }
         })
         .collect::<Vec<_>>();
     let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-    // Create unified scorer from all partitions across all indices
+    // Create unified scorer from all partitions across all indices, then precompute
+    // IDF weights indexed by token position. All partitions use the same term_index
+    // mapping for the same query, so this can be done once before the streaming loop.
     let scorer = IndexBM25Scorer::new(all_partitions.iter().map(|part| part.as_ref()));
-    let mut idf_cache: HashMap<String, f32> = HashMap::new();
+    let idf_by_position: Vec<f32> = (0..tokens.len())
+        .map(|i| scorer.query_weight(tokens.get_token(i)))
+        .collect();
     while let Some(res) = parts.try_next().await? {
         if res.candidates.is_empty() {
             continue;
-        }
-        let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
-        for token in &res.tokens_by_position {
-            let idf_weight = match idf_cache.get(token) {
-                Some(weight) => *weight,
-                None => {
-                    let weight = scorer.query_weight(token);
-                    idf_cache.insert(token.clone(), weight);
-                    weight
-                }
-            };
-            idf_by_position.push(idf_weight);
         }
         for DocCandidate {
             row_id,

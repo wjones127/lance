@@ -43,7 +43,6 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
 });
 
 pub struct PostingIterator {
-    token: String,
     token_id: u32,
     position: u32,
     query_weight: f32,
@@ -195,18 +194,11 @@ impl PostingIterator {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(
-        token: String,
-        token_id: u32,
-        position: u32,
-        list: PostingList,
-        num_doc: usize,
-    ) -> Self {
-        Self::with_query_weight(token, token_id, position, 1.0, list, num_doc)
+    pub(crate) fn new(token_id: u32, position: u32, list: PostingList, num_doc: usize) -> Self {
+        Self::with_query_weight(token_id, position, 1.0, list, num_doc)
     }
 
     pub(crate) fn with_query_weight(
-        token: String,
         token_id: u32,
         position: u32,
         query_weight: f32,
@@ -221,7 +213,6 @@ impl PostingIterator {
         let is_compressed = matches!(list, PostingList::Compressed(_));
 
         Self {
-            token,
             token_id,
             position,
             query_weight,
@@ -236,11 +227,6 @@ impl PostingIterator {
     #[inline]
     pub(crate) fn term_index(&self) -> u32 {
         self.position
-    }
-
-    #[inline]
-    pub(crate) fn token(&self) -> &str {
-        &self.token
     }
 
     #[inline]
@@ -1622,7 +1608,6 @@ mod tests {
         // when the pivot is greater than 0, and the first posting list is exhausted after shallow_next
         let postings = vec![
             PostingIterator::new(
-                String::from("test"),
                 0,
                 0,
                 generate_posting_list(
@@ -1634,7 +1619,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("full"),
                 1,
                 1,
                 generate_posting_list(vec![BLOCK_SIZE as u32 + 2], 1.0, None, is_compressed),
@@ -1665,7 +1649,7 @@ mod tests {
 
         let doc_ids = (0..num_docs).collect::<Vec<_>>();
         let posting = generate_posting_list(doc_ids, 1.0, None, true);
-        let mut iter = PostingIterator::new(String::from("term"), 0, 0, posting, docs.len());
+        let mut iter = PostingIterator::new(0, 0, posting, docs.len());
 
         iter.next(10);
         assert_eq!(iter.doc().unwrap().doc_id(), 10);
@@ -1689,14 +1673,12 @@ mod tests {
 
         let postings = vec![
             PostingIterator::new(
-                String::from("full"),
                 0,
                 0,
                 generate_posting_list(large_posting_docs1, 1.0, Some(vec![0.5, 0.5]), true),
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("text"),
                 1,
                 1,
                 generate_posting_list(vec![0], 1.0, Some(vec![0.5]), true),
@@ -1726,7 +1708,6 @@ mod tests {
         docs.append(1, 1);
 
         let postings = vec![PostingIterator::with_query_weight(
-            String::from("term"),
             0,
             0,
             2.0,
@@ -1752,7 +1733,6 @@ mod tests {
 
         let postings = vec![
             PostingIterator::with_query_weight(
-                String::from("a"),
                 0,
                 0,
                 1.0,
@@ -1760,7 +1740,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::with_query_weight(
-                String::from("b"),
                 1,
                 1,
                 1.0,
@@ -1781,7 +1760,6 @@ mod tests {
         }
 
         let postings = vec![PostingIterator::with_query_weight(
-            String::from("term"),
             0,
             0,
             1.0,
@@ -1811,7 +1789,6 @@ mod tests {
 
         let postings = vec![
             PostingIterator::with_query_weight(
-                String::from("a"),
                 0,
                 0,
                 1.0,
@@ -1819,7 +1796,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::with_query_weight(
-                String::from("b"),
                 1,
                 1,
                 1.0,
@@ -1849,21 +1825,18 @@ mod tests {
 
         let postings = vec![
             PostingIterator::new(
-                String::from("a"),
                 0,
                 0,
                 generate_posting_list(vec![1, 10], 1.0, None, is_compressed),
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("b"),
                 1,
                 1,
                 generate_posting_list(vec![2, 10], 1.0, None, is_compressed),
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("c"),
                 2,
                 2,
                 generate_posting_list(vec![10], 1.0, None, is_compressed),
@@ -1888,7 +1861,6 @@ mod tests {
         }
 
         let posting = PostingIterator::with_query_weight(
-            String::from("term"),
             0,
             0,
             1.0,
@@ -1932,7 +1904,7 @@ mod tests {
             PostingList::Plain(_) => unreachable!("expected compressed posting list"),
         };
 
-        let posting = PostingIterator::new(String::from("test"), 0, 0, posting_list, 1);
+        let posting = PostingIterator::new(0, 0, posting_list, 1);
 
         let actual = posting.block_max_score();
         assert!(
@@ -1950,7 +1922,6 @@ mod tests {
         let token_b_positions = vec![vec![2_u32, 11]];
         let postings = vec![
             PostingIterator::new(
-                String::from("a"),
                 0,
                 0,
                 generate_posting_list_with_positions(
@@ -1962,7 +1933,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("b"),
                 1,
                 1,
                 generate_posting_list_with_positions(
@@ -1974,7 +1944,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("a"),
                 2,
                 2,
                 generate_posting_list_with_positions(
@@ -2001,7 +1970,6 @@ mod tests {
 
         let postings = vec![
             PostingIterator::new(
-                String::from("a"),
                 0,
                 0,
                 generate_posting_list_with_positions(
@@ -2013,7 +1981,6 @@ mod tests {
                 docs.len(),
             ),
             PostingIterator::new(
-                String::from("b"),
                 1,
                 1,
                 generate_posting_list_with_positions(

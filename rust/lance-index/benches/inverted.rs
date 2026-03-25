@@ -10,14 +10,16 @@ use std::{sync::Arc, time::Duration};
 use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
+use futures::{TryStreamExt, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::cache::LanceCache;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::lance_tokenizer::DocType;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
-use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
+use lance_index::scalar::inverted::{
+    InvertedIndex, InvertedIndexBuilder, flat_bm25_search_stream, multi_index_bm25_search,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
@@ -233,6 +235,140 @@ fn bench_inverted(c: &mut Criterion) {
             }
         })
     });
+
+    // === Multi-segment search: 2 segments of HALF docs each vs 1 segment of TOTAL ===
+    // Measures the overhead introduced by coordinating across segment boundaries.
+    const HALF: usize = TOTAL / 2;
+    let batch_a = batch.slice(0, HALF);
+    let batch_b = batch.slice(HALF, HALF);
+
+    let seg_a_tempdir = tempfile::tempdir().unwrap();
+    let seg_b_tempdir = tempfile::tempdir().unwrap();
+    let seg_a_store = make_store(seg_a_tempdir.path());
+    let seg_b_store = make_store(seg_b_tempdir.path());
+
+    rt.block_on(async {
+        for (b, store) in [(&batch_a, &seg_a_store), (&batch_b, &seg_b_store)] {
+            let stream =
+                RecordBatchStreamAdapter::new(b.schema(), stream::iter(vec![Ok(b.clone())]));
+            let mut builder =
+                InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
+            builder
+                .update(Box::pin(stream), store.as_ref(), None)
+                .await
+                .unwrap();
+        }
+    });
+
+    let idx_a = rt
+        .block_on(InvertedIndex::load(
+            seg_a_store,
+            None,
+            &LanceCache::no_cache(),
+        ))
+        .unwrap();
+    let idx_b = rt
+        .block_on(InvertedIndex::load(
+            seg_b_store,
+            None,
+            &LanceCache::no_cache(),
+        ))
+        .unwrap();
+
+    let params_multi = FtsSearchParams::new().with_limit(Some(10));
+    let mut query_idx_multi = 0usize;
+
+    c.bench_function(
+        format!("multi_index_search_2_segs({HALF}+{HALF})").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| {
+                let query = queries[query_idx_multi % queries.len()].clone();
+                query_idx_multi = query_idx_multi.wrapping_add(1);
+                let idx_a = idx_a.clone();
+                let idx_b = idx_b.clone();
+                let params = params_multi.clone();
+                let no_filter = no_filter.clone();
+                async move {
+                    black_box(
+                        multi_index_bm25_search(
+                            &[idx_a.as_ref(), idx_b.as_ref()],
+                            query,
+                            params.into(),
+                            Operator::Or,
+                            no_filter,
+                            Arc::new(NoOpMetricsCollector),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                }
+            })
+        },
+    );
+
+    // === Flat (brute-force) search: simulates querying over unindexed rows ===
+    // Uses a smaller slice to keep iterations fast.
+    const FLAT_ROWS: usize = 50_000;
+    let flat_batch = batch.slice(0, FLAT_ROWS);
+    // The most common term in the Zipf vocabulary.
+    let flat_query = vocab[0].clone();
+
+    // Flat search with no indexed segment — pure brute-force BM25, no prior IDF stats.
+    c.bench_function(
+        format!("flat_bm25_search_no_index({FLAT_ROWS})").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| {
+                let flat_batch = flat_batch.clone();
+                let query = flat_query.clone();
+                async move {
+                    let stream = RecordBatchStreamAdapter::new(
+                        flat_batch.schema(),
+                        stream::iter(vec![Ok(flat_batch)]),
+                    );
+                    let result = flat_bm25_search_stream(
+                        Box::pin(stream),
+                        "doc".to_string(),
+                        query,
+                        &[],
+                        1024,
+                    )
+                    .await
+                    .unwrap();
+                    black_box(result.try_collect::<Vec<_>>().await.unwrap());
+                }
+            })
+        },
+    );
+
+    // Flat search with an existing indexed segment providing IDF stats.
+    // This is the code path triggered when some rows are indexed and some are not.
+    let flat_index = Arc::new(vec![(*invert_index).clone()]);
+    c.bench_function(
+        format!("flat_bm25_search_with_index({FLAT_ROWS})").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| {
+                let flat_batch = flat_batch.clone();
+                let flat_index = flat_index.clone();
+                let query = flat_query.clone();
+                async move {
+                    let stream = RecordBatchStreamAdapter::new(
+                        flat_batch.schema(),
+                        stream::iter(vec![Ok(flat_batch)]),
+                    );
+                    let result = flat_bm25_search_stream(
+                        Box::pin(stream),
+                        "doc".to_string(),
+                        query,
+                        flat_index.as_slice(),
+                        1024,
+                    )
+                    .await
+                    .unwrap();
+                    black_box(result.try_collect::<Vec<_>>().await.unwrap());
+                }
+            })
+        },
+    );
 }
 
 #[cfg(target_os = "linux")]
