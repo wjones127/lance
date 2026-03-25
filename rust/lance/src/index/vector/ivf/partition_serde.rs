@@ -3,36 +3,36 @@
 
 //! Serialization and zero-copy deserialization for IVF partition cache entries.
 //!
-//! The format is a simple binary layout designed for ephemeral caching (not stable across versions):
+//! The format is:
 //!
 //! ```text
 //! [header_len: u64 LE]
 //! [header: JSON bytes]
-//! [sub_index IPC file bytes]
-//! [... quantizer-specific IPC sections ...]
-//! [storage batch IPC file bytes]
+//! [sub_index Arrow IPC stream]
+//! [... quantizer-specific IPC streams ...]
+//! [storage Arrow IPC stream]
 //! ```
 //!
-//! Each IPC section is a complete Arrow IPC file. On deserialization, the IPC
-//! sections are read zero-copy using [`FileDecoder`] so that Arrow arrays
-//! reference the original buffer directly.
+//! Each IPC section is a self-delimiting Arrow IPC stream (schema + batches + EOS
+//! marker), written directly to the underlying writer without buffering. On
+//! deserialization, each message is read into a per-message buffer and zero-copy
+//! decoded via [`FileDecoder`].
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, RecordBatch};
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, MutableBuffer};
 use arrow_ipc::convert::fb_to_schema;
-use arrow_ipc::reader::{FileDecoder, read_footer_length};
-use arrow_ipc::root_as_footer;
-use arrow_ipc::writer::FileWriter;
+use arrow_ipc::reader::FileDecoder;
+use arrow_ipc::root_as_message;
+use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
-use bytes::Bytes;
 use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::storage::RabitQuantizationMetadata;
-use lance_index::vector::flat::index::{FlatMetadata, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatMetadata, FlatQuantizer};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::storage::ProductQuantizationMetadata;
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
@@ -47,13 +47,12 @@ use super::v2::PartitionEntry;
 
 /// Serialization interface for spilling cache entries to an external store.
 ///
-/// `serialize` writes the entry into the provided writer and returns the
-/// number of bytes written.  `deserialize` reconstructs the entry from a
-/// contiguous `Bytes` buffer (typically obtained by reading back whatever
-/// was written).
+/// `serialize` streams the entry into the provided writer and returns the number
+/// of bytes written. `deserialize` reconstructs the entry by reading sequentially
+/// from the provided reader.
 pub trait Spillable: Sized {
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize>;
-    fn deserialize(data: Bytes) -> Result<Self>;
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self>;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,99 +93,225 @@ fn u8_to_rotation_type(v: u8) -> Result<RQRotationType> {
     }
 }
 
-/// Write one or more RecordBatches as a complete Arrow IPC file into a Vec<u8>.
-///
-/// Panics if `batches` is empty (caller is responsible for checking).
-fn write_ipc_batches(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut writer = FileWriter::try_new(&mut buf, batches[0].schema_ref())?;
-    for batch in batches {
-        writer.write(batch)?;
+/// Forwards writes to an inner writer while counting total bytes written.
+struct CountingWriter<'a> {
+    inner: &'a mut dyn Write,
+    written: usize,
+}
+
+impl<'a> CountingWriter<'a> {
+    fn new(inner: &'a mut dyn Write) -> Self {
+        Self { inner, written: 0 }
     }
-    writer.finish()?;
-    Ok(buf)
 }
 
-/// Write a single RecordBatch as a complete Arrow IPC file into a Vec<u8>.
-fn write_ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
-    write_ipc_batches(std::slice::from_ref(batch))
-}
-
-/// Decode the IPC footer and schema from a `Buffer`, returning the decoder and
-/// the list of record-batch blocks. Zero-copy: all returned data references
-/// the original buffer.
-fn parse_ipc_footer(data: &Buffer) -> Result<(FileDecoder, Vec<arrow_ipc::Block>)> {
-    let trailer_start = data
-        .len()
-        .checked_sub(10)
-        .ok_or_else(|| Error::io("IPC section too small to contain footer".to_string()))?;
-    let footer_len = read_footer_length(
-        data[trailer_start..]
-            .try_into()
-            .map_err(|_| Error::io("IPC section too small for footer length".to_string()))?,
-    )?;
-    let footer_start = trailer_start
-        .checked_sub(footer_len)
-        .ok_or_else(|| Error::io("IPC footer length exceeds section size".to_string()))?;
-    let footer = root_as_footer(&data[footer_start..trailer_start])
-        .map_err(|e| Error::io(format!("failed to parse IPC footer: {e}")))?;
-
-    let schema =
-        Arc::new(fb_to_schema(footer.schema().ok_or_else(|| {
-            Error::io("IPC footer missing schema".to_string())
-        })?));
-
-    let mut decoder = FileDecoder::new(schema, footer.version());
-
-    for block in footer.dictionaries().iter().flatten() {
-        let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-        let block_data = data.slice_with_length(block.offset() as usize, block_len);
-        decoder.read_dictionary(block, &block_data)?;
+impl Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
     }
 
-    let batch_blocks: Vec<arrow_ipc::Block> = footer
-        .recordBatches()
-        .map(|b| b.iter().copied().collect())
-        .unwrap_or_default();
-
-    Ok((decoder, batch_blocks))
-}
-
-/// Read all RecordBatches from an Arrow IPC file stored in a `Buffer`, zero-copy.
-///
-/// The returned arrays reference slices of the provided buffer directly.
-fn read_ipc_all_zero_copy(data: Buffer) -> Result<Vec<RecordBatch>> {
-    let (decoder, batch_blocks) = parse_ipc_footer(&data)?;
-    batch_blocks
-        .iter()
-        .map(|block| {
-            let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-            let block_data = data.slice_with_length(block.offset() as usize, block_len);
-            decoder
-                .read_record_batch(block, &block_data)?
-                .ok_or_else(|| Error::io("IPC record batch was None".to_string()))
-        })
-        .collect()
-}
-
-/// Read a single RecordBatch from an Arrow IPC file stored in a `Buffer`, zero-copy.
-///
-/// The returned `RecordBatch`'s arrays reference slices of the provided buffer
-/// directly, avoiding copies.
-fn read_ipc_zero_copy(data: Buffer) -> Result<RecordBatch> {
-    let (decoder, batch_blocks) = parse_ipc_footer(&data)?;
-    if batch_blocks.is_empty() {
-        return Err(Error::io("IPC file contains no record batches".to_string()));
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
-    let block = &batch_blocks[0];
-    let block_len = block.bodyLength() as usize + block.metaDataLength() as usize;
-    let block_data = data.slice_with_length(block.offset() as usize, block_len);
-    decoder
-        .read_record_batch(block, &block_data)?
-        .ok_or_else(|| Error::io("IPC record batch was None".to_string()))
 }
 
-/// Wrap a `FixedSizeListArray` in a single-column RecordBatch with the given column name.
+/// Write `batch` as a single-batch Arrow IPC stream directly to `writer`.
+///
+/// No buffering: the schema message and record batch message are written
+/// immediately as produced, followed by the EOS marker.
+fn stream_ipc(batch: &RecordBatch, writer: &mut dyn Write) -> Result<()> {
+    let mut sw = StreamWriter::try_new(&mut *writer, batch.schema_ref())
+        .map_err(|e| Error::io(format!("{e}")))?;
+    sw.write(batch).map_err(|e| Error::io(format!("{e}")))?;
+    sw.finish().map_err(|e| Error::io(format!("{e}")))?;
+    Ok(())
+}
+
+/// Write all batches from `iter` as a single Arrow IPC stream directly to `writer`.
+///
+/// The iterator must yield at least one batch (used to obtain the schema). Each
+/// batch is written immediately without collecting the full iterator first.
+fn stream_ipc_batches<I>(iter: I, writer: &mut dyn Write) -> Result<()>
+where
+    I: IntoIterator<Item = RecordBatch>,
+{
+    let mut iter = iter.into_iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| Error::io("no batches to serialize".to_string()))?;
+    let mut sw = StreamWriter::try_new(&mut *writer, first.schema_ref())
+        .map_err(|e| Error::io(format!("{e}")))?;
+    sw.write(&first).map_err(|e| Error::io(format!("{e}")))?;
+    for batch in iter {
+        sw.write(&batch).map_err(|e| Error::io(format!("{e}")))?;
+    }
+    sw.finish().map_err(|e| Error::io(format!("{e}")))?;
+    Ok(())
+}
+
+// 4-byte continuation marker used by modern Arrow IPC streams.
+const IPC_CONTINUATION: [u8; 4] = [0xff; 4];
+
+/// Read one complete Arrow IPC stream message from `reader` into a contiguous
+/// [`Buffer`].
+///
+/// Returns `None` on EOS (size field == 0) or clean EOF. The returned buffer
+/// contains the raw message bytes in the same layout that was written, so it
+/// can be passed directly to [`StreamDecoder::decode`] for zero-copy decoding.
+fn read_one_stream_message(reader: &mut dyn Read) -> Result<Option<Buffer>> {
+    // Read the first 4 bytes: either a continuation marker or the size directly
+    // (legacy IPC format).
+    let mut first4 = [0u8; 4];
+    match reader.read_exact(&mut first4) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(Error::io(e.to_string())),
+    }
+
+    let has_continuation = first4 == IPC_CONTINUATION;
+    let size_bytes: [u8; 4] = if has_continuation {
+        let mut sb = [0u8; 4];
+        reader
+            .read_exact(&mut sb)
+            .map_err(|e| Error::io(e.to_string()))?;
+        sb
+    } else {
+        first4
+    };
+    let meta_size = u32::from_le_bytes(size_bytes) as usize;
+
+    if meta_size == 0 {
+        return Ok(None); // EOS
+    }
+
+    // Read the metadata flatbuffer (plus any alignment padding included in meta_size).
+    let mut meta = vec![0u8; meta_size];
+    reader
+        .read_exact(&mut meta)
+        .map_err(|e| Error::io(e.to_string()))?;
+
+    let msg =
+        root_as_message(&meta).map_err(|e| Error::io(format!("IPC message parse error: {e}")))?;
+    let body_len = msg.bodyLength() as usize;
+
+    // Build one contiguous buffer in the same layout as written.
+    // Use MutableBuffer (Arrow's 64-byte-aligned allocator) so that the body
+    // data is properly aligned for SIMD operations during decoding.
+    //   [continuation: 4 (if present)] [size: 4] [metadata: meta_size] [body: body_len]
+    let prefix_len = if has_continuation { 8 } else { 4 };
+    let total = prefix_len + meta_size + body_len;
+    let mut buf = MutableBuffer::from_len_zeroed(total);
+    if has_continuation {
+        buf[..4].copy_from_slice(&IPC_CONTINUATION);
+        buf[4..8].copy_from_slice(&size_bytes);
+    } else {
+        buf[..4].copy_from_slice(&size_bytes);
+    }
+    buf[prefix_len..prefix_len + meta_size].copy_from_slice(&meta);
+    if body_len > 0 {
+        reader
+            .read_exact(&mut buf[prefix_len + meta_size..])
+            .map_err(|e| Error::io(e.to_string()))?;
+    }
+
+    Ok(Some(buf.into()))
+}
+
+/// Read all [`RecordBatch`]es from one Arrow IPC stream starting at the current
+/// reader position.  Reads until the EOS marker.
+///
+/// Zero-copy: each batch's array data is backed by per-message [`Buffer`]s
+/// allocated during reading rather than copied into a central buffer.
+///
+/// Uses [`FileDecoder`] directly (rather than `StreamDecoder`) to avoid a
+/// known edge-case where `StreamDecoder` does not produce a batch for messages
+/// with a zero-length body when the message exactly fills the decode buffer.
+fn read_ipc_stream_zero_copy(reader: &mut dyn Read) -> Result<Vec<RecordBatch>> {
+    // Read the schema message first and use it to create a FileDecoder.
+    let schema_buf = read_one_stream_message(reader)?
+        .ok_or_else(|| Error::io("IPC stream: expected schema message, got EOS".to_string()))?;
+
+    let (prefix_len, meta_size) = parse_message_prefix(&schema_buf)?;
+    let schema_msg = root_as_message(&schema_buf[prefix_len..prefix_len + meta_size])
+        .map_err(|e| Error::io(format!("IPC schema parse error: {e}")))?;
+    let schema = Arc::new(fb_to_schema(schema_msg.header_as_schema().ok_or_else(
+        || Error::io("IPC stream: first message is not a schema".to_string()),
+    )?));
+    let mut decoder = FileDecoder::new(schema, schema_msg.version());
+
+    let mut batches = Vec::new();
+
+    loop {
+        let Some(buf) = read_one_stream_message(reader)? else {
+            break;
+        };
+
+        let (prefix_len, meta_size) = parse_message_prefix(&buf)?;
+        let msg = root_as_message(&buf[prefix_len..prefix_len + meta_size])
+            .map_err(|e| Error::io(format!("IPC message parse error: {e}")))?;
+        let body_len = msg.bodyLength() as usize;
+
+        // Block offset = 0 since the buffer starts at the message boundary.
+        // metaDataLength = prefix_len + meta_size (prefix + flatbuf + padding).
+        let block = arrow_ipc::Block::new(0, (prefix_len + meta_size) as i32, body_len as i64);
+
+        match msg.header_type() {
+            arrow_ipc::MessageHeader::RecordBatch => {
+                if let Some(batch) = decoder
+                    .read_record_batch(&block, &buf)
+                    .map_err(|e| Error::io(format!("IPC record batch decode error: {e}")))?
+                {
+                    batches.push(batch);
+                }
+            }
+            arrow_ipc::MessageHeader::DictionaryBatch => {
+                decoder
+                    .read_dictionary(&block, &buf)
+                    .map_err(|e| Error::io(format!("IPC dictionary decode error: {e}")))?;
+            }
+            _ => break,
+        }
+    }
+
+    Ok(batches)
+}
+
+/// Extract the prefix length and metadata size from a raw IPC stream message buffer.
+///
+/// Modern IPC streams have an 8-byte prefix `[continuation: 4][size: 4]`.
+/// Legacy streams have a 4-byte prefix `[size: 4]`.  Returns `(prefix_len, meta_size)`.
+fn parse_message_prefix(buf: &Buffer) -> Result<(usize, usize)> {
+    let has_continuation = buf.len() >= 4 && buf[..4] == [0xff; 4];
+    if has_continuation {
+        if buf.len() < 8 {
+            return Err(Error::io("IPC message buffer too short".to_string()));
+        }
+        let meta_size = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        Ok((8, meta_size))
+    } else {
+        if buf.len() < 4 {
+            return Err(Error::io("IPC message buffer too short".to_string()));
+        }
+        let meta_size = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        Ok((4, meta_size))
+    }
+}
+
+/// Read exactly one [`RecordBatch`] from one Arrow IPC stream.
+fn read_ipc_stream_single_zero_copy(reader: &mut dyn Read) -> Result<RecordBatch> {
+    let mut batches = read_ipc_stream_zero_copy(reader)?;
+    match batches.len() {
+        1 => Ok(batches.remove(0)),
+        n => Err(Error::io(format!(
+            "expected exactly 1 IPC record batch, got {n}"
+        ))),
+    }
+}
+
+/// Wrap a `FixedSizeListArray` in a single-column `RecordBatch` with the given
+/// column name.
 fn fsl_to_batch(arr: &FixedSizeListArray, name: &str) -> Result<RecordBatch> {
     let field = Field::new(
         name,
@@ -200,10 +325,11 @@ fn fsl_to_batch(arr: &FixedSizeListArray, name: &str) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema, vec![Arc::new(arr.clone())])?)
 }
 
-/// Extract a `FixedSizeListArray` from the first column of a RecordBatch.
+/// Extract a `FixedSizeListArray` from the first column of a `RecordBatch`.
 fn batch_to_fsl(batch: &RecordBatch) -> Result<FixedSizeListArray> {
-    let col = batch.column(0);
-    col.as_any()
+    batch
+        .column(0)
+        .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .cloned()
         .ok_or_else(|| Error::io("column is not FixedSizeListArray".to_string()))
@@ -228,38 +354,16 @@ struct PqPartitionHeader {
     num_sub_vectors: usize,
     dimension: usize,
     transposed: bool,
-    /// Length of the sub-index IPC section in bytes.
-    sub_index_len: u64,
-    /// Length of the codebook IPC section in bytes.
-    codebook_len: u64,
-    /// Length of the storage batch IPC section in bytes.
-    storage_len: u64,
 }
 
 impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
-    /// Serialize this partition entry to bytes.
-    ///
-    /// The sub-index, PQ codebook, and storage batch are each written as Arrow
-    /// IPC file sections, preceded by a small JSON header containing scalar
-    /// metadata and section lengths.
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
-        // Serialize the three Arrow sections.
-        let sub_index_ipc = write_ipc(&self.index.to_batch()?)?;
         let codebook = metadata.codebook.as_ref().ok_or_else(|| {
             Error::io("PQ metadata missing codebook during serialization".to_string())
         })?;
-        let codebook_ipc = write_ipc(&codebook_to_batch(codebook)?)?;
-        let storage_batches: Vec<_> = self.storage.to_batches()?.collect();
-        let storage_ipc = if storage_batches.len() == 1 {
-            write_ipc(&storage_batches[0])?
-        } else {
-            return Err(Error::io(
-                "expected exactly one storage batch for PQ storage".to_string(),
-            ));
-        };
 
         let header = PqPartitionHeader {
             distance_type: distance_type_to_u8(distance_type),
@@ -267,65 +371,36 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
             num_sub_vectors: metadata.num_sub_vectors,
             dimension: metadata.dimension,
             transposed: metadata.transposed,
-            sub_index_len: sub_index_ipc.len() as u64,
-            codebook_len: codebook_ipc.len() as u64,
-            storage_len: storage_ipc.len() as u64,
         };
-
         let header_json = serde_json::to_vec(&header)?;
-        let total_len =
-            8 + header_json.len() + sub_index_ipc.len() + codebook_ipc.len() + storage_ipc.len();
 
-        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        writer.write_all(&header_json)?;
-        writer.write_all(&sub_index_ipc)?;
-        writer.write_all(&codebook_ipc)?;
-        writer.write_all(&storage_ipc)?;
+        let mut cw = CountingWriter::new(writer);
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
+        stream_ipc(&self.index.to_batch()?, &mut cw)?;
+        stream_ipc(&codebook_to_batch(codebook)?, &mut cw)?;
+        stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(total_len)
+        Ok(cw.written)
     }
 
-    /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    ///
-    /// The Arrow IPC sections are decoded using [`FileDecoder`] so that the
-    /// resulting arrays reference slices of the provided `Bytes` buffer directly.
-    fn deserialize(data: Bytes) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(Error::io("partition data too small".to_string()));
-        }
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        let mut header_len_buf = [0u8; 8];
+        reader
+            .read_exact(&mut header_len_buf)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
 
-        let header_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let header_end = 8 + header_len;
-        if data.len() < header_end {
-            return Err(Error::io("partition data truncated in header".to_string()));
-        }
-
-        let header: PqPartitionHeader = serde_json::from_slice(&data[8..header_end])?;
+        let mut header_bytes = vec![0u8; header_len];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header: PqPartitionHeader = serde_json::from_slice(&header_bytes)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_start = header_end;
-        let sub_index_end = sub_index_start + header.sub_index_len as usize;
-        let codebook_start = sub_index_end;
-        let codebook_end = codebook_start + header.codebook_len as usize;
-        let storage_start = codebook_end;
-        let storage_end = storage_start + header.storage_len as usize;
-
-        if data.len() < storage_end {
-            return Err(Error::io(
-                "partition data truncated in IPC sections".to_string(),
-            ));
-        }
-
-        // Zero-copy: create Buffer slices backed by the original Bytes.
-        let buffer = Buffer::from(data);
-        let sub_index_buf =
-            buffer.slice_with_length(sub_index_start, header.sub_index_len as usize);
-        let codebook_buf = buffer.slice_with_length(codebook_start, header.codebook_len as usize);
-        let storage_buf = buffer.slice_with_length(storage_start, header.storage_len as usize);
-
-        let sub_index_batch = read_ipc_zero_copy(sub_index_buf)?;
-        let codebook_batch = read_ipc_zero_copy(codebook_buf)?;
-        let storage_batch = read_ipc_zero_copy(storage_buf)?;
+        let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
+        let codebook_batch = read_ipc_stream_single_zero_copy(reader)?;
+        let storage_batch = read_ipc_stream_single_zero_copy(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let codebook = batch_to_codebook(&codebook_batch)?;
@@ -352,87 +427,109 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
 }
 
 // ---------------------------------------------------------------------------
-// Flat
+// Flat (Float32)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
 struct FlatPartitionHeader {
     distance_type: u8,
     dim: usize,
-    sub_index_len: u64,
-    storage_len: u64,
 }
 
 impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatQuantizer> {
-    /// Serialize this partition entry to bytes.
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
 
-        let sub_index_ipc = write_ipc(&self.index.to_batch()?)?;
-        let storage_batches: Vec<_> = self.storage.to_batches()?.collect();
-        let storage_ipc = if storage_batches.len() == 1 {
-            write_ipc(&storage_batches[0])?
-        } else {
-            return Err(Error::io(
-                "expected exactly one storage batch for Flat storage".to_string(),
-            ));
-        };
-
         let header = FlatPartitionHeader {
             distance_type: distance_type_to_u8(distance_type),
             dim: metadata.dim,
-            sub_index_len: sub_index_ipc.len() as u64,
-            storage_len: storage_ipc.len() as u64,
         };
-
         let header_json = serde_json::to_vec(&header)?;
-        let total_len = 8 + header_json.len() + sub_index_ipc.len() + storage_ipc.len();
 
-        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        writer.write_all(&header_json)?;
-        writer.write_all(&sub_index_ipc)?;
-        writer.write_all(&storage_ipc)?;
+        let mut cw = CountingWriter::new(writer);
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
+        stream_ipc(&self.index.to_batch()?, &mut cw)?;
+        stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(total_len)
+        Ok(cw.written)
     }
 
-    /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    fn deserialize(data: Bytes) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(Error::io("partition data too small".to_string()));
-        }
-        let header_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let header_end = 8 + header_len;
-        if data.len() < header_end {
-            return Err(Error::io("partition data truncated in header".to_string()));
-        }
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        let mut header_len_buf = [0u8; 8];
+        reader
+            .read_exact(&mut header_len_buf)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
 
-        let header: FlatPartitionHeader = serde_json::from_slice(&data[8..header_end])?;
+        let mut header_bytes = vec![0u8; header_len];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header: FlatPartitionHeader = serde_json::from_slice(&header_bytes)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_start = header_end;
-        let sub_index_end = sub_index_start + header.sub_index_len as usize;
-        let storage_start = sub_index_end;
-        let storage_end = storage_start + header.storage_len as usize;
-
-        if data.len() < storage_end {
-            return Err(Error::io(
-                "partition data truncated in IPC sections".to_string(),
-            ));
-        }
-
-        let buffer = Buffer::from(data);
-        let sub_index_buf =
-            buffer.slice_with_length(sub_index_start, header.sub_index_len as usize);
-        let storage_buf = buffer.slice_with_length(storage_start, header.storage_len as usize);
-
-        let sub_index_batch = read_ipc_zero_copy(sub_index_buf)?;
-        let storage_batch = read_ipc_zero_copy(storage_buf)?;
+        let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
+        let storage_batch = read_ipc_stream_single_zero_copy(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = FlatMetadata { dim: header.dim };
         let storage = <FlatQuantizer as Quantization>::Storage::try_from_batch(
+            storage_batch,
+            &metadata,
+            distance_type,
+            None,
+        )?;
+
+        Ok(Self { index, storage })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flat (Binary / Hamming)
+// ---------------------------------------------------------------------------
+
+impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatBinQuantizer> {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
+        let metadata = self.storage.metadata();
+        let distance_type = self.storage.distance_type();
+
+        let header = FlatPartitionHeader {
+            distance_type: distance_type_to_u8(distance_type),
+            dim: metadata.dim,
+        };
+        let header_json = serde_json::to_vec(&header)?;
+
+        let mut cw = CountingWriter::new(writer);
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
+        stream_ipc(&self.index.to_batch()?, &mut cw)?;
+        stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
+
+        Ok(cw.written)
+    }
+
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        let mut header_len_buf = [0u8; 8];
+        reader
+            .read_exact(&mut header_len_buf)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
+
+        let mut header_bytes = vec![0u8; header_len];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header: FlatPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let distance_type = u8_to_distance_type(header.distance_type)?;
+
+        let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
+        let storage_batch = read_ipc_stream_single_zero_copy(reader)?;
+
+        let index = S::load(sub_index_batch)?;
+        let metadata = FlatMetadata { dim: header.dim };
+        let storage = <FlatBinQuantizer as Quantization>::Storage::try_from_batch(
             storage_batch,
             &metadata,
             distance_type,
@@ -454,26 +551,12 @@ struct SqPartitionHeader {
     dim: usize,
     bounds_start: f64,
     bounds_end: f64,
-    sub_index_len: u64,
-    storage_len: u64,
 }
 
 impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ScalarQuantizer> {
-    /// Serialize this partition entry to bytes.
-    ///
-    /// Multiple SQ storage chunks are concatenated into a single IPC section.
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
-
-        let sub_index_ipc = write_ipc(&self.index.to_batch()?)?;
-
-        // Write all SQ chunks as multiple record batches in one IPC file, avoiding copies.
-        let batches: Vec<_> = self.storage.to_batches()?.collect();
-        if batches.is_empty() {
-            return Err(Error::io("SQ storage has no batches".to_string()));
-        }
-        let storage_ipc = write_ipc_batches(&batches)?;
 
         let header = SqPartitionHeader {
             distance_type: distance_type_to_u8(distance_type),
@@ -481,53 +564,35 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ScalarQuantizer> {
             dim: metadata.dim,
             bounds_start: metadata.bounds.start,
             bounds_end: metadata.bounds.end,
-            sub_index_len: sub_index_ipc.len() as u64,
-            storage_len: storage_ipc.len() as u64,
         };
-
         let header_json = serde_json::to_vec(&header)?;
-        let total_len = 8 + header_json.len() + sub_index_ipc.len() + storage_ipc.len();
 
-        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        writer.write_all(&header_json)?;
-        writer.write_all(&sub_index_ipc)?;
-        writer.write_all(&storage_ipc)?;
+        let mut cw = CountingWriter::new(writer);
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
+        stream_ipc(&self.index.to_batch()?, &mut cw)?;
+        // SQ storage may contain multiple batches; stream them all in one IPC stream.
+        stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(total_len)
+        Ok(cw.written)
     }
 
-    /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    fn deserialize(data: Bytes) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(Error::io("partition data too small".to_string()));
-        }
-        let header_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let header_end = 8 + header_len;
-        if data.len() < header_end {
-            return Err(Error::io("partition data truncated in header".to_string()));
-        }
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        let mut header_len_buf = [0u8; 8];
+        reader
+            .read_exact(&mut header_len_buf)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
 
-        let header: SqPartitionHeader = serde_json::from_slice(&data[8..header_end])?;
+        let mut header_bytes = vec![0u8; header_len];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header: SqPartitionHeader = serde_json::from_slice(&header_bytes)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_start = header_end;
-        let sub_index_end = sub_index_start + header.sub_index_len as usize;
-        let storage_start = sub_index_end;
-        let storage_end = storage_start + header.storage_len as usize;
-
-        if data.len() < storage_end {
-            return Err(Error::io(
-                "partition data truncated in IPC sections".to_string(),
-            ));
-        }
-
-        let buffer = Buffer::from(data);
-        let sub_index_buf =
-            buffer.slice_with_length(sub_index_start, header.sub_index_len as usize);
-        let storage_buf = buffer.slice_with_length(storage_start, header.storage_len as usize);
-
-        let sub_index_batch = read_ipc_zero_copy(sub_index_buf)?;
-        let storage_batches = read_ipc_all_zero_copy(storage_buf)?;
+        let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
+        let storage_batches = read_ipc_stream_zero_copy(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = ScalarQuantizationMetadata {
@@ -560,47 +625,12 @@ struct RabitPartitionHeader {
     rotation_type: u8,
     /// Fast rotation signs (only set when rotation_type == Fast).
     fast_rotation_signs: Option<Vec<u8>>,
-    sub_index_len: u64,
-    /// Length of the rotation matrix IPC section; 0 when rotation_type == Fast.
-    rotate_mat_len: u64,
-    storage_len: u64,
 }
 
 impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
-    /// Serialize this partition entry to bytes.
-    ///
-    /// For Matrix rotation the rotation matrix is stored as an Arrow IPC section.
-    /// For Fast rotation the signs are stored compactly in the JSON header.
-    ///
-    /// The storage batch is stored with already-packed codes so deserialization
-    /// can skip re-packing.
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
-
-        let sub_index_ipc = write_ipc(&self.index.to_batch()?)?;
-
-        let rotate_mat_ipc = match metadata.rotation_type {
-            RQRotationType::Matrix => {
-                let mat = metadata.rotate_mat.as_ref().ok_or_else(|| {
-                    Error::io(
-                        "RabitQ Matrix metadata missing rotate_mat during serialization"
-                            .to_string(),
-                    )
-                })?;
-                write_ipc(&fsl_to_batch(mat, "rotate_mat")?)?
-            }
-            RQRotationType::Fast => Vec::new(),
-        };
-
-        let storage_batches: Vec<_> = self.storage.to_batches()?.collect();
-        let storage_ipc = if storage_batches.len() == 1 {
-            write_ipc(&storage_batches[0])?
-        } else {
-            return Err(Error::io(
-                "expected exactly one storage batch for RabitQ storage".to_string(),
-            ));
-        };
 
         let header = RabitPartitionHeader {
             distance_type: distance_type_to_u8(distance_type),
@@ -608,68 +638,56 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
             code_dim: metadata.code_dim,
             rotation_type: rotation_type_to_u8(metadata.rotation_type),
             fast_rotation_signs: metadata.fast_rotation_signs.clone(),
-            sub_index_len: sub_index_ipc.len() as u64,
-            rotate_mat_len: rotate_mat_ipc.len() as u64,
-            storage_len: storage_ipc.len() as u64,
         };
-
         let header_json = serde_json::to_vec(&header)?;
-        let total_len =
-            8 + header_json.len() + sub_index_ipc.len() + rotate_mat_ipc.len() + storage_ipc.len();
 
-        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        writer.write_all(&header_json)?;
-        writer.write_all(&sub_index_ipc)?;
-        writer.write_all(&rotate_mat_ipc)?;
-        writer.write_all(&storage_ipc)?;
+        let mut cw = CountingWriter::new(writer);
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
 
-        Ok(total_len)
+        stream_ipc(&self.index.to_batch()?, &mut cw)?;
+
+        // Write the rotation matrix IPC stream only for Matrix rotation; the
+        // Fast rotation case stores its signs compactly in the JSON header.
+        if metadata.rotation_type == RQRotationType::Matrix {
+            let mat = metadata.rotate_mat.as_ref().ok_or_else(|| {
+                Error::io(
+                    "RabitQ Matrix metadata missing rotate_mat during serialization".to_string(),
+                )
+            })?;
+            stream_ipc(&fsl_to_batch(mat, "rotate_mat")?, &mut cw)?;
+        }
+
+        stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
+
+        Ok(cw.written)
     }
 
-    /// Deserialize a partition entry from bytes, zero-copy for Arrow data.
-    fn deserialize(data: Bytes) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(Error::io("partition data too small".to_string()));
-        }
-        let header_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        let header_end = 8 + header_len;
-        if data.len() < header_end {
-            return Err(Error::io("partition data truncated in header".to_string()));
-        }
+    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+        let mut header_len_buf = [0u8; 8];
+        reader
+            .read_exact(&mut header_len_buf)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header_len = u64::from_le_bytes(header_len_buf) as usize;
 
-        let header: RabitPartitionHeader = serde_json::from_slice(&data[8..header_end])?;
+        let mut header_bytes = vec![0u8; header_len];
+        reader
+            .read_exact(&mut header_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+        let header: RabitPartitionHeader = serde_json::from_slice(&header_bytes)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
         let rotation_type = u8_to_rotation_type(header.rotation_type)?;
 
-        let sub_index_start = header_end;
-        let sub_index_end = sub_index_start + header.sub_index_len as usize;
-        let rotate_mat_start = sub_index_end;
-        let rotate_mat_end = rotate_mat_start + header.rotate_mat_len as usize;
-        let storage_start = rotate_mat_end;
-        let storage_end = storage_start + header.storage_len as usize;
+        let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
 
-        if data.len() < storage_end {
-            return Err(Error::io(
-                "partition data truncated in IPC sections".to_string(),
-            ));
-        }
-
-        let buffer = Buffer::from(data);
-        let sub_index_buf =
-            buffer.slice_with_length(sub_index_start, header.sub_index_len as usize);
-        let storage_buf = buffer.slice_with_length(storage_start, header.storage_len as usize);
-
-        let sub_index_batch = read_ipc_zero_copy(sub_index_buf)?;
-        let storage_batch = read_ipc_zero_copy(storage_buf)?;
-
-        let rotate_mat = if header.rotate_mat_len > 0 {
-            let rotate_mat_buf =
-                buffer.slice_with_length(rotate_mat_start, header.rotate_mat_len as usize);
-            let mat_batch = read_ipc_zero_copy(rotate_mat_buf)?;
+        let rotate_mat = if rotation_type == RQRotationType::Matrix {
+            let mat_batch = read_ipc_stream_single_zero_copy(reader)?;
             Some(batch_to_fsl(&mat_batch)?)
         } else {
             None
         };
+
+        let storage_batch = read_ipc_stream_single_zero_copy(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = RabitQuantizationMetadata {
@@ -700,6 +718,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
@@ -785,8 +804,7 @@ mod tests {
 
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
-        let deserialized =
-            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(serialized.into()).unwrap();
+        let deserialized = entry.deserialize(&mut Cursor::new(serialized)).unwrap();
 
         assert_eq!(entry.storage, deserialized.storage);
     }
@@ -836,8 +854,7 @@ mod tests {
 
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(bytes.into()).unwrap();
+            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(
                 restored.storage.distance_type(),
                 entry.storage.distance_type()
@@ -857,19 +874,23 @@ mod tests {
 
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
-        let deserialized =
-            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(serialized.into()).unwrap();
+        let deserialized = entry.deserialize(&mut Cursor::new(serialized)).unwrap();
         assert_eq!(entry.storage, deserialized.storage);
     }
 
     #[test]
     fn test_truncated_data_errors() {
-        assert!(
-            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(Bytes::from_static(
-                b"short"
-            ))
-            .is_err()
-        );
+        // Serialize a valid entry, then truncate the bytes and verify that
+        // deserialization fails rather than panicking.
+        let storage = make_test_pq_storage(1, 16, 2);
+        let entry = PartitionEntry::<FlatIndex, ProductQuantizer> {
+            index: FlatIndex::default(),
+            storage,
+        };
+        let mut bytes = Vec::new();
+        entry.serialize(&mut bytes).unwrap();
+        bytes.truncate(3);
+        assert!(entry.deserialize(&mut Cursor::new(bytes)).is_err());
     }
 
     // ----- Flat helpers -----------------------------------------------------
@@ -893,8 +914,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(bytes.into()).unwrap();
+        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(
             restored.storage.metadata().dim,
@@ -922,8 +942,7 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(bytes.into()).unwrap();
+            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -969,8 +988,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
+        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -983,7 +1001,6 @@ mod tests {
         );
         assert_eq!(restored.storage.len(), entry.storage.len());
 
-        // Verify row IDs are preserved.
         let orig_ids: Vec<u64> = entry.storage.row_ids().copied().collect();
         let rest_ids: Vec<u64> = restored.storage.row_ids().copied().collect();
         assert_eq!(orig_ids, rest_ids);
@@ -999,8 +1016,7 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
+            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -1043,8 +1059,7 @@ mod tests {
         };
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(bytes.into()).unwrap();
+        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(restored.storage.len(), 30);
         let orig_ids: Vec<u64> = entry.storage.row_ids().copied().collect();
@@ -1066,7 +1081,6 @@ mod tests {
             code_dim as i32,
             RQRotationType::Fast,
         );
-        // Generate float vectors and quantize them to binary codes.
         let values: Vec<f32> = (0..num_rows * code_dim)
             .map(|i| (i % 100) as f32 / 100.0 - 0.5)
             .collect();
@@ -1127,8 +1141,7 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored =
-            PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(bytes.into()).unwrap();
+        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -1143,12 +1156,10 @@ mod tests {
         );
         assert_eq!(restored.storage.len(), entry.storage.len());
 
-        // Verify row IDs are preserved.
         let orig_ids: Vec<u64> = entry.storage.row_ids().copied().collect();
         let rest_ids: Vec<u64> = restored.storage.row_ids().copied().collect();
         assert_eq!(orig_ids, rest_ids);
 
-        // Verify codes are preserved.
         let orig_batch = entry.storage.to_batches().unwrap().next().unwrap();
         let rest_batch = restored.storage.to_batches().unwrap().next().unwrap();
         let orig_codes = orig_batch[RABIT_CODE_COLUMN].as_fixed_size_list();
@@ -1169,8 +1180,7 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(bytes.into()).unwrap();
+            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
