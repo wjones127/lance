@@ -52,7 +52,7 @@ use super::v2::PartitionEntry;
 /// from the provided reader.
 pub trait Spillable: Sized {
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize>;
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self>;
+    fn deserialize(reader: &mut dyn Read) -> Result<Self>;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +384,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
         Ok(cw.written)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         let mut header_len_buf = [0u8; 8];
         reader
             .read_exact(&mut header_len_buf)
@@ -456,7 +456,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatQuantizer> {
         Ok(cw.written)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         let mut header_len_buf = [0u8; 8];
         reader
             .read_exact(&mut header_len_buf)
@@ -510,7 +510,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatBinQuantizer> {
         Ok(cw.written)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         let mut header_len_buf = [0u8; 8];
         reader
             .read_exact(&mut header_len_buf)
@@ -577,7 +577,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ScalarQuantizer> {
         Ok(cw.written)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         let mut header_len_buf = [0u8; 8];
         reader
             .read_exact(&mut header_len_buf)
@@ -663,7 +663,7 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
         Ok(cw.written)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         let mut header_len_buf = [0u8; 8];
         reader
             .read_exact(&mut header_len_buf)
@@ -720,7 +720,7 @@ impl Spillable for lance_index::vector::IvfIndexState {
         self.write_to_stream(writer)
     }
 
-    fn deserialize(&self, reader: &mut dyn Read) -> Result<Self> {
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         lance_index::vector::IvfIndexState::read_from_stream(reader)
     }
 }
@@ -818,7 +818,10 @@ mod tests {
 
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
-        let deserialized = entry.deserialize(&mut Cursor::new(serialized)).unwrap();
+        let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
+            &mut Cursor::new(serialized),
+        )
+        .unwrap();
 
         assert_eq!(entry.storage, deserialized.storage);
     }
@@ -868,7 +871,9 @@ mod tests {
 
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+            let restored =
+                PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&mut Cursor::new(bytes))
+                    .unwrap();
             assert_eq!(
                 restored.storage.distance_type(),
                 entry.storage.distance_type()
@@ -888,7 +893,10 @@ mod tests {
 
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
-        let deserialized = entry.deserialize(&mut Cursor::new(serialized)).unwrap();
+        let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
+            &mut Cursor::new(serialized),
+        )
+        .unwrap();
         assert_eq!(entry.storage, deserialized.storage);
     }
 
@@ -904,7 +912,10 @@ mod tests {
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
         bytes.truncate(3);
-        assert!(entry.deserialize(&mut Cursor::new(bytes)).is_err());
+        assert!(
+            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&mut Cursor::new(bytes))
+                .is_err()
+        );
     }
 
     // ----- Flat helpers -----------------------------------------------------
@@ -928,7 +939,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&mut Cursor::new(bytes))
+                .unwrap();
 
         assert_eq!(
             restored.storage.metadata().dim,
@@ -956,7 +969,9 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+            let restored =
+                PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&mut Cursor::new(bytes))
+                    .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -1002,7 +1017,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
+                .unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -1030,7 +1047,9 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+            let restored =
+                PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
+                    .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -1073,7 +1092,9 @@ mod tests {
         };
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
+                .unwrap();
 
         assert_eq!(restored.storage.len(), 30);
         let orig_ids: Vec<u64> = entry.storage.row_ids().copied().collect();
@@ -1155,7 +1176,9 @@ mod tests {
 
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
-        let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored =
+            PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&mut Cursor::new(bytes))
+                .unwrap();
 
         let m = entry.storage.metadata();
         let rm = restored.storage.metadata();
@@ -1194,7 +1217,9 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored = entry.deserialize(&mut Cursor::new(bytes)).unwrap();
+            let restored =
+                PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&mut Cursor::new(bytes))
+                    .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -1232,7 +1257,7 @@ mod tests {
         let n = Spillable::serialize(&state, &mut bytes).unwrap();
         assert_eq!(n, bytes.len());
 
-        let restored = Spillable::deserialize(&state, &mut Cursor::new(bytes)).unwrap();
+        let restored = <IvfIndexState as Spillable>::deserialize(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(restored.index_file_path, state.index_file_path);
         assert_eq!(restored.uuid, state.uuid);
         assert_eq!(restored.distance_type, state.distance_type);
