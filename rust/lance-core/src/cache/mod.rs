@@ -177,59 +177,6 @@ impl LanceCache {
         }
     }
 
-    async fn get_or_insert_with_id<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
-        &self,
-        key: &str,
-        type_name: &str,
-        loader: F,
-    ) -> Result<Arc<T>>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = Result<T>> + Send,
-    {
-        let cache_key = make_cache_key(&self.prefix, key, type_name);
-
-        // Type-erase the loader into a pinned future for the backend.
-        let typed_loader = Box::pin(async move {
-            let value = loader().await?;
-            let arc = Arc::new(value);
-            let size = cache_entry_size(&*arc);
-            Ok((arc as CacheEntry, size))
-        });
-
-        let entry = self.cache.get_or_insert(&cache_key, typed_loader).await?;
-
-        // TODO: distinguish "backend had it" from "loader ran and inserted" to track true hits vs misses.
-        // Track hit/miss based on whether we got a pre-existing entry.
-        // (Approximate: we can't distinguish "backend had it" from "loader ran"
-        // without a richer return type. Count all get_or_insert as misses for now.)
-        self.misses.fetch_add(1, Ordering::Relaxed);
-
-        Ok(entry.downcast::<T>().unwrap())
-    }
-
-    // -- Unsized insert/get ---------------------------------------------------
-    // TODO: can we unify some of these methods?
-
-    async fn insert_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
-        &self,
-        key: &str,
-        type_name: &str,
-        metadata: Arc<T>,
-    ) {
-        self.insert_with_id(key, type_name, Arc::new(metadata))
-            .await
-    }
-
-    async fn get_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
-        &self,
-        key: &str,
-        type_name: &str,
-    ) -> Option<Arc<T>> {
-        let outer = self.get_with_id::<Arc<T>>(key, type_name).await?;
-        Some(outer.as_ref().clone())
-    }
-
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
@@ -280,9 +227,21 @@ impl LanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
-        let type_name = cache_key.type_name();
-        let key_str = cache_key.key().into_owned();
-        Box::pin(self.get_or_insert_with_id(&key_str, type_name, loader)).await
+        let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+
+        let typed_loader = Box::pin(async move {
+            let value = loader().await?;
+            let arc = Arc::new(value);
+            let size = cache_entry_size(&*arc);
+            Ok((arc as CacheEntry, size))
+        });
+
+        let entry = self.cache.get_or_insert(&key, typed_loader).await?;
+
+        // TODO: distinguish "backend had it" from "loader ran and inserted" to track true hits vs misses.
+        self.misses.fetch_add(1, Ordering::Relaxed);
+
+        Ok(entry.downcast::<K::ValueType>().unwrap())
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -290,7 +249,7 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_unsized_with_id(&cache_key.key(), cache_key.type_name(), metadata)
+        self.insert_with_id(&cache_key.key(), cache_key.type_name(), Arc::new(metadata))
             .boxed()
             .await
     }
@@ -300,9 +259,11 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_unsized_with_id::<K::ValueType>(&cache_key.key(), cache_key.type_name())
+        let outer = self
+            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), cache_key.type_name())
             .boxed()
-            .await
+            .await?;
+        Some(outer.as_ref().clone())
     }
 }
 
