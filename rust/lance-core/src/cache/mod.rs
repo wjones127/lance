@@ -10,9 +10,8 @@
 //! - [`LanceCache`] is the typed wrapper that handles key construction (prefix + type tag),
 //!   type-safe get/insert, and DeepSizeOf-based size computation.
 //!
-//! Cache keys are handled by the [`keys`] submodule: [`CacheKey`] / [`UnsizedCacheKey`]
-//! define the typed key interface, and [`InternalCacheKey`] is the structured key passed
-//! to backends.
+//! [`CacheKey`] / [`UnsizedCacheKey`] define the typed key interface, and
+//! [`InternalCacheKey`] is the structured key passed to backends.
 
 mod backend;
 mod keys;

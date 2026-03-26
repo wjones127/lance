@@ -131,6 +131,9 @@ impl CacheBackend for MokaCacheBackend {
     }
 
     fn approx_size_bytes(&self) -> usize {
-        self.cache.weighted_size() as usize
+        // Iterate rather than using `weighted_size()` because moka's
+        // weighted_size can be stale without `run_pending_tasks()`, which
+        // is async and can't be called from this synchronous context.
+        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
     }
 }
