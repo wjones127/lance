@@ -120,6 +120,6 @@ impl CacheBackend for MokaCacheBackend {
     }
 
     fn approx_size_bytes(&self) -> usize {
-        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
+        self.cache.weighted_size() as usize
     }
 }

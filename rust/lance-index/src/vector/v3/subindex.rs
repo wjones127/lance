@@ -59,7 +59,6 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     fn to_batch(&self) -> Result<RecordBatch>;
 }
 
-#[derive(Debug, Clone, Copy)]
 pub enum SubIndexType {
     Flat,
     Hnsw,

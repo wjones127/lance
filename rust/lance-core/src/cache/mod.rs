@@ -35,6 +35,11 @@ pub use deepsize::{Context, DeepSizeOf};
 
 use keys::make_cache_key;
 
+/// Size of a cached `Arc<T>`, accounting for the Arc overhead (two atomic counters).
+fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
+    value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
+}
+
 // ---------------------------------------------------------------------------
 // LanceCache — typed wrapper around dyn CacheBackend
 // ---------------------------------------------------------------------------
@@ -141,7 +146,7 @@ impl LanceCache {
         type_name: &str,
         metadata: Arc<T>,
     ) {
-        let size = metadata.deep_size_of() + 8;
+        let size = cache_entry_size(&*metadata);
         let cache_key = make_cache_key(&self.prefix, key, type_name);
         self.cache.insert(&cache_key, metadata, size).await;
     }
@@ -188,12 +193,13 @@ impl LanceCache {
         let typed_loader = Box::pin(async move {
             let value = loader().await?;
             let arc = Arc::new(value);
-            let size = arc.deep_size_of() + 8;
+            let size = cache_entry_size(&*arc);
             Ok((arc as CacheEntry, size))
         });
 
         let entry = self.cache.get_or_insert(&cache_key, typed_loader).await?;
 
+        // TODO: distinguish "backend had it" from "loader ran and inserted" to track true hits vs misses.
         // Track hit/miss based on whether we got a pre-existing entry.
         // (Approximate: we can't distinguish "backend had it" from "loader ran"
         // without a richer return type. Count all get_or_insert as misses for now.)
@@ -203,6 +209,7 @@ impl LanceCache {
     }
 
     // -- Unsized insert/get ---------------------------------------------------
+    // TODO: can we unify some of these methods?
 
     async fn insert_unsized_with_id<T: DeepSizeOf + Send + Sync + 'static + ?Sized>(
         &self,
@@ -359,7 +366,7 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         if let Some(cache) = self.inner.upgrade() {
-            let size = value.deep_size_of() + 8;
+            let size = cache_entry_size(&*value);
             let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
             cache.insert(&key, value, size).await;
             true
@@ -388,7 +395,7 @@ impl WeakLanceCache {
             let typed_loader = Box::pin(async move {
                 let value = loader().await?;
                 let arc = Arc::new(value);
-                let size = arc.deep_size_of() + 8;
+                let size = cache_entry_size(&*arc);
                 Ok((arc as CacheEntry, size))
             });
             let entry = cache.get_or_insert(&key, typed_loader).await?;
@@ -424,7 +431,7 @@ impl WeakLanceCache {
     {
         if let Some(cache) = self.inner.upgrade() {
             let wrapper = Arc::new(value);
-            let size = wrapper.deep_size_of() + 8;
+            let size = cache_entry_size(&*wrapper);
             let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
             cache.insert(&key, wrapper, size).await;
         } else {
