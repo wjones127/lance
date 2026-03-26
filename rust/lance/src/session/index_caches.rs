@@ -88,10 +88,6 @@ impl CacheKey for FragReuseIndexKey<'_> {
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("frag_reuse/{}", self.uuid))
     }
-
-    fn type_name(&self) -> &'static str {
-        "FragReuseIndex"
-    }
 }
 
 #[derive(Debug)]
@@ -104,10 +100,6 @@ impl CacheKey for IndexMetadataKey {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(self.version.to_string())
-    }
-
-    fn type_name(&self) -> &'static str {
-        "Vec<IndexMetadata>"
     }
 }
 
@@ -135,9 +127,5 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("type/{}", self.uuid))
-    }
-
-    fn type_name(&self) -> &'static str {
-        "ScalarIndexDetails"
     }
 }

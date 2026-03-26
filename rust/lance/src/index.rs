@@ -43,8 +43,6 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::{IvfIndexState, VectorIndexData};
-use lance_index::{DatasetIndexExt, INDEX_METADATA_SCHEMA_KEY, IndexDescription, IndexSegment};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -66,41 +64,6 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
 use vector::utils::get_vector_type;
-
-/// Wraps a live legacy (v0.1) IVFIndex for in-memory caching.
-///
-/// Legacy indices don't support disk caching (write_to returns an error), but
-/// caching the live instance avoids re-reading the index proto from disk on
-/// every scan. Partitions loaded into the shared LanceCache by prewarm() are
-/// still accessible from the reconstructed IVFIndex via the same cache key.
-#[derive(Debug)]
-struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
-
-impl deepsize::DeepSizeOf for CachedLegacyVectorIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        // The cached index is shared (Arc), so don't double-count partition data
-        // that is already tracked separately in the partition cache. Return a
-        // small fixed overhead for the struct itself.
-        1024
-    }
-}
-
-impl VectorIndexData for CachedLegacyVectorIndex {
-    fn write_to(&self, _writer: &mut dyn std::io::Write) -> Result<()> {
-        // Legacy IVF indices don't support disk caching.
-        Err(Error::internal(
-            "Legacy IVF indices cannot be persisted to disk cache",
-        ))
-    }
-
-    fn index_type_tag(&self) -> &'static str {
-        "LegacyIVF"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
 
 mod api;
 pub(crate) mod append;
@@ -201,10 +164,6 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
-
-    fn type_name(&self) -> &'static str {
-        "ScalarIndex"
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -220,7 +179,7 @@ impl<'a> VectorIndexCacheKey<'a> {
 }
 
 impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
-    type ValueType = dyn VectorIndexData;
+    type ValueType = dyn VectorIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -228,10 +187,6 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         } else {
             self.uuid.into()
         }
-    }
-
-    fn type_name(&self) -> &'static str {
-        "VectorIndex"
     }
 }
 
@@ -257,10 +212,6 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
             self.uuid.into()
         }
     }
-
-    fn type_name(&self) -> &'static str {
-        "FragReuseIndex"
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -284,10 +235,6 @@ impl CacheKey for MemWalCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
-    }
-
-    fn type_name(&self) -> &'static str {
-        "MemWalIndex"
     }
 }
 
@@ -1409,13 +1356,19 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn Index>> {
-        // Quick cache checks for scalar and frag-reuse indices. VectorIndex
-        // is not checked here because the cache stores VectorIndexData (serializable
-        // state), not a live VectorIndex — reconstruction is handled by
-        // open_vector_index.
+        // Checking for cache existence is cheap so we just check both scalar and vector caches
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = ScalarIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            return Ok(index.as_index());
+        }
+
+        let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        if let Some(index) = self
+            .index_cache
+            .get_unsized_with_key(&vector_cache_key)
+            .await
+        {
             return Ok(index.as_index());
         }
 
@@ -1493,24 +1446,9 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        // Check cache for a previously opened index.
-        if let Some(data) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            if let Some(state) = data.as_any().downcast_ref::<IvfIndexState>() {
-                log::debug!(
-                    "Reconstructing vector index from cached state uuid: {}",
-                    uuid
-                );
-                let partition_cache = self.index_cache.with_key_prefix(&cache_key.key());
-                return vector::ivf::v2::reconstruct_vector_index(
-                    state.clone(),
-                    self.object_store.clone(),
-                    &self.metadata_cache,
-                    partition_cache,
-                )
-                .await;
-            } else if let Some(cached) = data.as_any().downcast_ref::<CachedLegacyVectorIndex>() {
-                return Ok(cached.0.clone());
-            }
+        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            log::debug!("Found vector index in cache uuid: {}", uuid);
+            return Ok(index);
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
@@ -1737,22 +1675,9 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        if let Some(state) = index.cacheable_state() {
-            // For v3+ indices, cache the serializable state so that the next
-            // open can reconstruct cheaply without re-reading the index file.
-            self.index_cache
-                .insert_unsized_with_key(&cache_key, Arc::from(state))
-                .await;
-        } else {
-            // For legacy indices (v0.1, v0.2) that don't implement
-            // cacheable_state(), cache the live index directly. This avoids
-            // re-reading the index proto on every scan while still allowing
-            // partition data cached by prewarm() to be reused.
-            let cached: Arc<dyn VectorIndexData> = Arc::new(CachedLegacyVectorIndex(index.clone()));
-            self.index_cache
-                .insert_unsized_with_key(&cache_key, cached)
-                .await;
-        }
+        self.index_cache
+            .insert_unsized_with_key(&cache_key, index.clone())
+            .await;
         Ok(index)
     }
 
