@@ -247,11 +247,8 @@ impl MemTableFlusher {
                     index_meta.fields = vec![field_idx];
                     index_meta.dataset_version = dataset.version().version;
                     // Calculate fragment_bitmap from dataset fragments
-                    let fragment_ids: roaring::RoaringBitmap = dataset
-                        .get_fragments()
-                        .iter()
-                        .map(|f| f.id() as u32)
-                        .collect();
+                    let fragment_ids: roaring::RoaringBitmap =
+                        dataset.fragment_bitmap.as_ref().clone();
                     index_meta.fragment_bitmap = Some(fragment_ids);
 
                     // Commit the index to the dataset
@@ -467,11 +464,7 @@ impl MemTableFlusher {
             let schema = dataset.schema();
             let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).unwrap_or(0);
 
-            let fragment_ids: roaring::RoaringBitmap = dataset
-                .get_fragments()
-                .iter()
-                .map(|f| f.id() as u32)
-                .collect();
+            let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -969,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_btree_index() {
         use super::super::super::index::{BTreeIndexConfig, IndexStore};
-        use lance_index::DatasetIndexExt;
+        use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let region_id = Uuid::new_v4();
@@ -1067,9 +1060,9 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_ivf_pq_index() {
         use super::super::super::index::{IndexStore, IvfPqIndexConfig};
+        use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
-        use lance_index::DatasetIndexExt;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
         use lance_index::vector::pq::PQBuildParams;
@@ -1291,9 +1284,9 @@ mod tests {
     #[tokio::test]
     async fn test_flusher_with_fts_index() {
         use super::super::super::index::{FtsIndexConfig, IndexStore};
+        use crate::index::DatasetIndexExt;
         use arrow_array::StringArray;
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-        use lance_index::DatasetIndexExt;
         use std::sync::Arc;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;

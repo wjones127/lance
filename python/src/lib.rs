@@ -34,6 +34,7 @@ use ::arrow::pyarrow::PyArrowType;
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use ::lance::datafusion::LanceTableProvider;
+use ::lance::index::DatasetIndexExt;
 use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
@@ -44,13 +45,14 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::{
+    DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PyIndexSegmentBuilder, PySearchFilter,
+};
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
 };
-use lance_index::DatasetIndexExt;
 use log::Level;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
@@ -252,6 +254,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowIdMeta>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<PyIndexSegmentBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;

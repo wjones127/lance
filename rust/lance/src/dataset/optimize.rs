@@ -89,12 +89,15 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
-use super::transaction::{Operation, RewriteGroup, RewrittenIndex, Transaction};
+use super::transaction::{
+    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+};
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
+use crate::index::DatasetIndexExt;
 use crate::io::commit::{commit_transaction, migrate_fragments};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -103,7 +106,6 @@ use lance_core::Error;
 use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_index::DatasetIndexExt;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -207,6 +209,13 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Transaction properties to store with this commit.
+    ///
+    /// These key-value pairs are stored in the transaction file
+    /// and can be read later to identify the source of the commit
+    /// (e.g., job_id for tracking completed compaction jobs).
+    #[serde(skip)]
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 #[allow(deprecated)]
@@ -227,6 +236,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            transaction_properties: None,
         }
     }
 }
@@ -377,6 +387,12 @@ impl CompactionOptions {
             (true, false) => CompactionMode::TryBinaryCopy,
             _ => CompactionMode::Reencode,
         }
+    }
+
+    /// Set transaction properties to store in the commit manifest.
+    pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.transaction_properties = Some(Arc::new(properties));
+        self
     }
 }
 
@@ -1569,15 +1585,16 @@ pub async fn commit_compaction(
         None
     };
 
-    let transaction = Transaction::new(
+    let transaction = TransactionBuilder::new(
         dataset.manifest.version,
         Operation::Rewrite {
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
         },
-        None,
-    );
+    )
+    .transaction_properties(options.transaction_properties.clone())
+    .build();
 
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
