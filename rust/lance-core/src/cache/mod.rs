@@ -6,20 +6,20 @@
 //! This module provides a two-layer caching system:
 //!
 //! - [`CacheBackend`] is the low-level, pluggable trait that custom cache implementations
-//!   can implement. It uses opaque byte keys and type-erased entries.
-//! - [`LanceCache`] is the typed wrapper that handles key construction (prefix + type tag
-//!   encoding), type-safe get/insert, and DeepSizeOf-based size computation.
+//!   can implement. It uses [`InternalCacheKey`] keys and type-erased entries.
+//! - [`LanceCache`] is the typed wrapper that handles key construction (prefix + type tag),
+//!   type-safe get/insert, and DeepSizeOf-based size computation.
 //!
 //! Cache keys are handled by the [`keys`] submodule: [`CacheKey`] / [`UnsizedCacheKey`]
-//! define the typed key interface, and [`parse_cache_key`] lets backends inspect the
-//! encoded `user_key\0type_name` format.
+//! define the typed key interface, and [`InternalCacheKey`] is the structured key passed
+//! to backends.
 
 mod backend;
 mod keys;
 mod moka;
 
 pub use backend::{CacheBackend, CacheEntry};
-pub use keys::{CacheKey, UnsizedCacheKey, parse_cache_key};
+pub use keys::{CacheKey, InternalCacheKey, UnsizedCacheKey};
 pub use moka::MokaCacheBackend;
 
 use std::sync::{
@@ -33,11 +33,15 @@ use crate::Result;
 
 pub use deepsize::{Context, DeepSizeOf};
 
-use keys::make_cache_key;
-
 /// Size of a cached `Arc<T>`, accounting for the Arc overhead (two atomic counters).
 fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
     value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
+}
+
+/// Build an [`InternalCacheKey`] from a cache's prefix, a user key string,
+/// and a type name.
+fn build_key(prefix: &Arc<str>, key: &str, type_name: &'static str) -> InternalCacheKey {
+    InternalCacheKey::new(prefix.clone(), Arc::from(key), type_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +55,7 @@ fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
 #[derive(Clone)]
 pub struct LanceCache {
     cache: Arc<dyn CacheBackend>,
-    prefix: String,
+    prefix: Arc<str>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
 }
@@ -74,7 +78,7 @@ impl LanceCache {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             cache: Arc::new(MokaCacheBackend::with_capacity(capacity)),
-            prefix: String::new(),
+            prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
         }
@@ -84,7 +88,7 @@ impl LanceCache {
     pub fn with_backend(backend: Arc<dyn CacheBackend>) -> Self {
         Self {
             cache: backend,
-            prefix: String::new(),
+            prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
         }
@@ -93,7 +97,7 @@ impl LanceCache {
     pub fn no_cache() -> Self {
         Self {
             cache: Arc::new(MokaCacheBackend::no_cache()),
-            prefix: String::new(),
+            prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
         }
@@ -104,7 +108,7 @@ impl LanceCache {
     pub fn with_backend_and_prefix(backend: Arc<dyn CacheBackend>, prefix: String) -> Self {
         Self {
             cache: backend,
-            prefix,
+            prefix: Arc::from(prefix),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
         }
@@ -114,16 +118,16 @@ impl LanceCache {
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
             cache: self.cache.clone(),
-            prefix: format!("{}{}/", self.prefix, prefix),
+            prefix: Arc::from(format!("{}{}/", self.prefix, prefix)),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
         }
     }
 
-    /// Invalidate all entries whose key starts with the given prefix.
+    /// Invalidate all entries whose prefix starts with the given string.
     pub async fn invalidate_prefix(&self, prefix: &str) {
-        let prefix_bytes = format!("{}{}", self.prefix, prefix).into_bytes();
-        self.cache.invalidate_prefix(&prefix_bytes).await;
+        let full_prefix = format!("{}{}", self.prefix, prefix);
+        self.cache.invalidate_prefix(&full_prefix).await;
     }
 
     pub async fn size(&self) -> usize {
@@ -138,25 +142,25 @@ impl LanceCache {
         self.cache.size_bytes().await
     }
 
-    // -- Sized insert/get (internal, used by CacheKey methods) ----------------
+    // -- Sized insert/get (internal, shared by sized and unsized paths) --------
 
     async fn insert_with_id<T: DeepSizeOf + Send + Sync + 'static>(
         &self,
         key: &str,
-        type_name: &str,
+        type_name: &'static str,
         metadata: Arc<T>,
     ) {
         let size = cache_entry_size(&*metadata);
-        let cache_key = make_cache_key(&self.prefix, key, type_name);
+        let cache_key = build_key(&self.prefix, key, type_name);
         self.cache.insert(&cache_key, metadata, size).await;
     }
 
     async fn get_with_id<T: Send + Sync + 'static>(
         &self,
         key: &str,
-        type_name: &str,
+        type_name: &'static str,
     ) -> Option<Arc<T>> {
-        let cache_key = make_cache_key(&self.prefix, key, type_name);
+        let cache_key = build_key(&self.prefix, key, type_name);
         if let Some(entry) = self.cache.get(&cache_key).await {
             match entry.downcast::<T>() {
                 Ok(val) => {
@@ -227,7 +231,7 @@ impl LanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
-        let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
 
         let typed_loader = Box::pin(async move {
             let value = loader().await?;
@@ -236,10 +240,13 @@ impl LanceCache {
             Ok((arc as CacheEntry, size))
         });
 
-        let entry = self.cache.get_or_insert(&key, typed_loader).await?;
+        let (entry, was_cached) = self.cache.get_or_insert(&key, typed_loader).await?;
 
-        // TODO: distinguish "backend had it" from "loader ran and inserted" to track true hits vs misses.
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        if was_cached {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(entry.downcast::<K::ValueType>().unwrap())
     }
@@ -276,7 +283,7 @@ impl LanceCache {
 #[derive(Clone, Debug)]
 pub struct WeakLanceCache {
     inner: std::sync::Weak<dyn CacheBackend>,
-    prefix: String,
+    prefix: Arc<str>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
 }
@@ -294,7 +301,7 @@ impl WeakLanceCache {
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
             inner: self.inner.clone(),
-            prefix: format!("{}{}/", self.prefix, prefix),
+            prefix: Arc::from(format!("{}{}/", self.prefix, prefix)),
             hits: self.hits.clone(),
             misses: self.misses.clone(),
         }
@@ -311,7 +318,7 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let cache = self.inner.upgrade()?;
-        let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
         if let Some(entry) = cache.get(&key).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.downcast::<K::ValueType>().unwrap())
@@ -328,7 +335,7 @@ impl WeakLanceCache {
     {
         if let Some(cache) = self.inner.upgrade() {
             let size = cache_entry_size(&*value);
-            let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
             cache.insert(&key, value, size).await;
             true
         } else {
@@ -352,15 +359,19 @@ impl WeakLanceCache {
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
         if let Some(cache) = self.inner.upgrade() {
-            let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
             let typed_loader = Box::pin(async move {
                 let value = loader().await?;
                 let arc = Arc::new(value);
                 let size = cache_entry_size(&*arc);
                 Ok((arc as CacheEntry, size))
             });
-            let entry = cache.get_or_insert(&key, typed_loader).await?;
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            let (entry, was_cached) = cache.get_or_insert(&key, typed_loader).await?;
+            if was_cached {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
             Ok(entry.downcast::<K::ValueType>().unwrap())
         } else {
             log::warn!("WeakLanceCache: cache no longer available, computing without caching");
@@ -374,7 +385,7 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let cache = self.inner.upgrade()?;
-        let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
         if let Some(entry) = cache.get(&key).await {
             entry
                 .downcast::<Arc<K::ValueType>>()
@@ -393,7 +404,7 @@ impl WeakLanceCache {
         if let Some(cache) = self.inner.upgrade() {
             let wrapper = Arc::new(value);
             let size = cache_entry_size(&*wrapper);
-            let key = make_cache_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
             cache.insert(&key, wrapper, size).await;
         } else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
@@ -610,8 +621,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*v, vec![1, 2, 3]);
+        assert_eq!(cache.stats().await.misses, 1);
+        assert_eq!(cache.stats().await.hits, 0);
 
-        // Second call should not invoke loader
+        // Second call should not invoke loader and should be a hit
         let v: Arc<Vec<i32>> = cache
             .get_or_insert_with_key(TestKey::<Vec<i32>>::new("k"), || async {
                 panic!("should not be called")
@@ -619,6 +632,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*v, vec![1, 2, 3]);
+        assert_eq!(cache.stats().await.hits, 1);
     }
 
     #[tokio::test]
@@ -628,7 +642,7 @@ mod tests {
 
         #[derive(Debug)]
         struct HashMapBackend {
-            map: Mutex<HashMap<Vec<u8>, (CacheEntry, usize)>>,
+            map: Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
         }
 
         impl HashMapBackend {
@@ -641,35 +655,35 @@ mod tests {
 
         #[async_trait]
         impl CacheBackend for HashMapBackend {
-            async fn get(&self, key: &[u8]) -> Option<CacheEntry> {
+            async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
                 self.map.lock().await.get(key).map(|(e, _)| e.clone())
             }
-            async fn insert(&self, key: &[u8], entry: CacheEntry, size_bytes: usize) {
+            async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize) {
                 self.map
                     .lock()
                     .await
-                    .insert(key.to_vec(), (entry, size_bytes));
+                    .insert(key.clone(), (entry, size_bytes));
             }
             async fn get_or_insert<'a>(
                 &self,
-                key: &[u8],
+                key: &InternalCacheKey,
                 loader: std::pin::Pin<
                     Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
                 >,
-            ) -> Result<CacheEntry> {
+            ) -> Result<(CacheEntry, bool)> {
                 if let Some((entry, _)) = self.map.lock().await.get(key) {
-                    Ok(entry.clone())
+                    Ok((entry.clone(), true))
                 } else {
                     let (entry, size) = loader.await?;
                     self.map
                         .lock()
                         .await
-                        .insert(key.to_vec(), (entry.clone(), size));
-                    Ok(entry)
+                        .insert(key.clone(), (entry.clone(), size));
+                    Ok((entry, false))
                 }
             }
-            async fn invalidate_prefix(&self, prefix: &[u8]) {
-                self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
+            async fn invalidate_prefix(&self, prefix: &str) {
+                self.map.lock().await.retain(|k, _| !k.has_prefix(prefix));
             }
             async fn clear(&self) {
                 self.map.lock().await.clear();

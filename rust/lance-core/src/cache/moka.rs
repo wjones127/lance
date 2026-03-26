@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures::Future;
@@ -9,6 +11,7 @@ use futures::Future;
 use crate::Result;
 
 use super::backend::{CacheBackend, CacheEntry};
+use super::keys::InternalCacheKey;
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
@@ -22,7 +25,7 @@ struct MokaCacheEntry {
 /// Provides weighted-capacity eviction and concurrent-load deduplication
 /// via moka's built-in `optionally_get_with`.
 pub struct MokaCacheBackend {
-    cache: moka::future::Cache<Vec<u8>, MokaCacheEntry>,
+    cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
 }
 
 impl std::fmt::Debug for MokaCacheBackend {
@@ -52,26 +55,31 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
-    async fn get(&self, key: &[u8]) -> Option<CacheEntry> {
+    async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }
 
-    async fn insert(&self, key: &[u8], entry: CacheEntry, size_bytes: usize) {
+    async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize) {
         self.cache
-            .insert(key.to_vec(), MokaCacheEntry { entry, size_bytes })
+            .insert(key.clone(), MokaCacheEntry { entry, size_bytes })
             .await;
     }
 
     async fn get_or_insert<'a>(
         &self,
-        key: &[u8],
+        key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-    ) -> Result<CacheEntry> {
+    ) -> Result<(CacheEntry, bool)> {
         // Use moka's built-in dedup: optionally_get_with runs the init future
         // at most once per key, even under concurrent access.
         let (error_tx, error_rx) = tokio::sync::oneshot::channel();
 
+        // Track whether the loader actually ran (= cache miss).
+        let was_miss = Arc::new(AtomicBool::new(false));
+        let was_miss_clone = was_miss.clone();
+
         let init = async move {
+            was_miss_clone.store(true, Ordering::Relaxed);
             match loader.await {
                 Ok((entry, size_bytes)) => Some(MokaCacheEntry { entry, size_bytes }),
                 Err(e) => {
@@ -81,9 +89,12 @@ impl CacheBackend for MokaCacheBackend {
             }
         };
 
-        let owned_key = key.to_vec();
+        let owned_key = key.clone();
         match self.cache.optionally_get_with(owned_key, init).await {
-            Some(record) => Ok(record.entry),
+            Some(record) => {
+                let was_cached = !was_miss.load(Ordering::Relaxed);
+                Ok((record.entry, was_cached))
+            }
             None => match error_rx.await {
                 Ok(err) => Err(err),
                 Err(_) => Err(crate::Error::internal(
@@ -93,10 +104,10 @@ impl CacheBackend for MokaCacheBackend {
         }
     }
 
-    async fn invalidate_prefix(&self, prefix: &[u8]) {
-        let prefix = prefix.to_vec();
+    async fn invalidate_prefix(&self, prefix: &str) {
+        let prefix = prefix.to_owned();
         self.cache
-            .invalidate_entries_if(move |key, _value| key.starts_with(&prefix))
+            .invalidate_entries_if(move |key, _value| key.has_prefix(&prefix))
             .expect("Cache configured correctly");
     }
 

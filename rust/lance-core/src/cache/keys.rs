@@ -1,39 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
-/// Cache keys are structured as `user_key\0type_name`.
+/// Structured cache key used by [`CacheBackend`](super::CacheBackend).
 ///
-/// This function splits an opaque cache key into the user-visible portion
-/// and the type_name string. Backend implementations can use this to inspect keys.
-/// Returns `(empty slice, "")` if no separator is found.
-pub fn parse_cache_key(key: &[u8]) -> (&[u8], &str) {
-    if let Some(sep) = key.iter().position(|&b| b == 0) {
-        let user_key = &key[..sep];
-        let type_name = std::str::from_utf8(&key[sep + 1..]).unwrap_or("");
-        (user_key, type_name)
-    } else {
-        (key, "")
-    }
+/// Composed of a prefix (scoping the key to a dataset/index), a user key
+/// (identifying the specific entry), and a type name (distinguishing value
+/// types that share the same user key).
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct InternalCacheKey {
+    prefix: Arc<str>,
+    key: Arc<str>,
+    type_name: &'static str,
 }
 
-/// Build a key: `prefix/user_key\0type_name`.
-pub(super) fn make_cache_key(prefix: &str, key: &str, type_name: &str) -> Vec<u8> {
-    let user_key_len = if prefix.is_empty() {
-        key.len()
-    } else {
-        prefix.len() + 1 + key.len()
-    };
-    let mut bytes = Vec::with_capacity(user_key_len + 1 + type_name.len());
-    if !prefix.is_empty() {
-        bytes.extend_from_slice(prefix.as_bytes());
-        bytes.push(b'/');
+impl InternalCacheKey {
+    pub fn new(prefix: Arc<str>, key: Arc<str>, type_name: &'static str) -> Self {
+        Self {
+            prefix,
+            key,
+            type_name,
+        }
     }
-    bytes.extend_from_slice(key.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(type_name.as_bytes());
-    bytes
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Returns true if this key's prefix starts with the given string.
+    pub fn has_prefix(&self, prefix: &str) -> bool {
+        self.prefix.starts_with(prefix)
+    }
 }
 
 pub trait CacheKey {

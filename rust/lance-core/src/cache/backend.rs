@@ -10,30 +10,32 @@ use futures::Future;
 
 use crate::Result;
 
+use super::keys::InternalCacheKey;
+
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
 /// Low-level pluggable cache backend.
 ///
-/// Implementations store entries keyed by opaque byte slices.
+/// Implementations store entries keyed by [`InternalCacheKey`], which provides
+/// structured access to the prefix, user key, and type name components.
 /// The [`LanceCache`](super::LanceCache) wrapper handles key construction and type safety;
 /// backend authors do not need to worry about key encoding.
-///
-/// Keys are structured as `user_key\0type_name` where `type_name` comes from
-/// [`CacheKey::type_name()`](super::CacheKey::type_name). Backend authors who need to
-/// inspect keys can use [`parse_cache_key()`](super::parse_cache_key) to split them.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
-    /// Look up an entry by its opaque key.
-    async fn get(&self, key: &[u8]) -> Option<CacheEntry>;
+    /// Look up an entry by its key.
+    async fn get(&self, key: &InternalCacheKey) -> Option<CacheEntry>;
 
     /// Store an entry. `size_bytes` is used for eviction accounting.
-    async fn insert(&self, key: &[u8], entry: CacheEntry, size_bytes: usize);
+    async fn insert(&self, key: &InternalCacheKey, entry: CacheEntry, size_bytes: usize);
 
     /// Get an existing entry or compute it from `loader`.
     ///
     /// Implementations should deduplicate concurrent loads for the same key
     /// so the loader runs at most once.
+    ///
+    /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
+    /// was already present in the cache (the loader was not invoked).
     ///
     /// The loader is a pinned, boxed future rather than a generic closure
     /// because `async_trait` erases the `Self` lifetime, making it impossible
@@ -45,12 +47,12 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// this method — implementations must not store it beyond the call.
     async fn get_or_insert<'a>(
         &self,
-        key: &[u8],
+        key: &InternalCacheKey,
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-    ) -> Result<CacheEntry>;
+    ) -> Result<(CacheEntry, bool)>;
 
-    /// Remove all entries whose key starts with `prefix`.
-    async fn invalidate_prefix(&self, prefix: &[u8]);
+    /// Remove all entries whose prefix starts with the given string.
+    async fn invalidate_prefix(&self, prefix: &str);
 
     /// Remove all entries.
     async fn clear(&self);
