@@ -28,6 +28,7 @@ use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::root_as_message;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
+use lance_core::cache::CacheCodec;
 use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -44,16 +45,6 @@ use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use super::v2::PartitionEntry;
-
-/// Serialization interface for spilling cache entries to an external store.
-///
-/// `serialize` streams the entry into the provided writer and returns the number
-/// of bytes written. `deserialize` reconstructs the entry by reading sequentially
-/// from the provided reader.
-pub trait Spillable: Sized {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<usize>;
-    fn deserialize(reader: &mut dyn Read) -> Result<Self>;
-}
 
 // ---------------------------------------------------------------------------
 // Common helpers
@@ -356,7 +347,11 @@ struct PqPartitionHeader {
     transposed: bool,
 }
 
-impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ProductQuantizer> {
+impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ProductQuantizer> {
+    fn type_tag(&self) -> &'static str {
+        "PartitionEntry<PQ>"
+    }
+
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
@@ -436,7 +431,11 @@ struct FlatPartitionHeader {
     dim: usize,
 }
 
-impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatQuantizer> {
+impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatQuantizer> {
+    fn type_tag(&self) -> &'static str {
+        "PartitionEntry<Flat>"
+    }
+
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
@@ -490,7 +489,11 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatQuantizer> {
 // Flat (Binary / Hamming)
 // ---------------------------------------------------------------------------
 
-impl<S: IvfSubIndex> Spillable for PartitionEntry<S, FlatBinQuantizer> {
+impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatBinQuantizer> {
+    fn type_tag(&self) -> &'static str {
+        "PartitionEntry<FlatBin>"
+    }
+
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
@@ -553,7 +556,11 @@ struct SqPartitionHeader {
     bounds_end: f64,
 }
 
-impl<S: IvfSubIndex> Spillable for PartitionEntry<S, ScalarQuantizer> {
+impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ScalarQuantizer> {
+    fn type_tag(&self) -> &'static str {
+        "PartitionEntry<SQ>"
+    }
+
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
@@ -627,7 +634,11 @@ struct RabitPartitionHeader {
     fast_rotation_signs: Option<Vec<u8>>,
 }
 
-impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
+impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, RabitQuantizer> {
+    fn type_tag(&self) -> &'static str {
+        "PartitionEntry<Rabit>"
+    }
+
     fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let metadata = self.storage.metadata();
         let distance_type = self.storage.distance_type();
@@ -708,20 +719,6 @@ impl<S: IvfSubIndex> Spillable for PartitionEntry<S, RabitQuantizer> {
         )?;
 
         Ok(Self { index, storage })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IvfIndexState
-// ---------------------------------------------------------------------------
-
-impl Spillable for lance_index::vector::IvfIndexState {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
-        self.write_to_stream(writer)
-    }
-
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        lance_index::vector::IvfIndexState::read_from_stream(reader)
     }
 }
 
@@ -1254,10 +1251,10 @@ mod tests {
         };
 
         let mut bytes = Vec::new();
-        let n = Spillable::serialize(&state, &mut bytes).unwrap();
+        let n = CacheCodec::serialize(&state, &mut bytes).unwrap();
         assert_eq!(n, bytes.len());
 
-        let restored = <IvfIndexState as Spillable>::deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored = <IvfIndexState as CacheCodec>::deserialize(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(restored.index_file_path, state.index_file_path);
         assert_eq!(restored.uuid, state.uuid);
         assert_eq!(restored.distance_type, state.distance_type);

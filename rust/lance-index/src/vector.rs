@@ -16,6 +16,7 @@ use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
+use lance_core::cache::CacheCodec;
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -149,26 +150,20 @@ impl From<DistanceType> for pb::VectorMetricType {
 /// [`VectorIndex`] given an ObjectStore, file metadata cache, and partition
 /// cache. The reconstruction cost should be dominated by re-opening
 /// `FileReader`s, which is cheap when the file metadata cache is warm.
-pub trait VectorIndexData: Send + Sync + DeepSizeOf + std::fmt::Debug {
-    /// Serialize this state into `writer`. Called on a blocking thread by
-    /// the disk cache codec.
-    fn write_to(&self, writer: &mut dyn std::io::Write) -> Result<()>;
-
-    /// Tag used to dispatch deserialization to the correct concrete type.
-    fn index_type_tag(&self) -> &'static str;
-
+pub trait VectorIndexData: CacheCodec + DeepSizeOf + std::fmt::Debug {
     /// Downcast to `&dyn Any` for concrete type access during reconstruction.
     fn as_any(&self) -> &dyn Any;
 }
 
 /// Deserialize a [`VectorIndexData`] from bytes previously written by
-/// [`VectorIndexData::write_to`].
+/// [`CacheCodec::serialize`].
 pub fn deserialize_vector_index_data(data: Bytes) -> Result<Arc<dyn VectorIndexData>> {
     // Currently only IVF indices support disk caching. The serialization
     // format is self-describing (IvfIndexState header), so no external tag
     // is needed yet. When additional index types are added, prepend a
     // version/tag byte to the wire format.
-    let state = IvfIndexState::deserialize(data)?;
+    let mut cursor = std::io::Cursor::new(data);
+    let state = IvfIndexState::deserialize(&mut cursor)?;
     Ok(Arc::new(state))
 }
 
@@ -223,131 +218,11 @@ struct IvfIndexStateHeader {
     aux_file_size: u64,
 }
 
-impl IvfIndexState {
-    /// Wire format:
-    /// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
-    ///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
-    pub fn serialize(&self) -> Result<Vec<u8>> {
-        let header = IvfIndexStateHeader {
-            index_file_path: self.index_file_path.clone(),
-            uuid: self.uuid.clone(),
-            distance_type: self.distance_type.to_string(),
-            sub_index_metadata: self.sub_index_metadata.clone(),
-            sub_index_type: self.sub_index_type.to_string(),
-            quantization_type: self.quantization_type.to_string(),
-            quantizer_metadata_json: self.quantizer_metadata_json.clone(),
-            cache_key_prefix: self.cache_key_prefix.clone(),
-            index_file_size: self.index_file_size,
-            aux_file_size: self.aux_file_size,
-        };
-        let header_json = serde_json::to_vec(&header)
-            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
-
-        let ivf_pb = pb::Ivf::try_from(&self.ivf)?;
-        let ivf_bytes = ivf_pb.encode_to_vec();
-
-        let extra = self.quantizer_extra_data.as_deref().unwrap_or(&[]);
-
-        let aux_ivf_pb = pb::Ivf::try_from(&self.aux_ivf)?;
-        let aux_ivf_bytes = aux_ivf_pb.encode_to_vec();
-
-        let total =
-            8 + header_json.len() + 8 + ivf_bytes.len() + 8 + extra.len() + 8 + aux_ivf_bytes.len();
-        let mut buf = Vec::with_capacity(total);
-        buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&header_json);
-        buf.extend_from_slice(&(ivf_bytes.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&ivf_bytes);
-        buf.extend_from_slice(&(extra.len() as u64).to_le_bytes());
-        buf.extend_from_slice(extra);
-        buf.extend_from_slice(&(aux_ivf_bytes.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&aux_ivf_bytes);
-        Ok(buf)
-    }
-
-    pub fn deserialize(data: Bytes) -> Result<Self> {
-        let mut offset = 0;
-
-        let read_u64 = |data: &[u8], off: &mut usize| -> Result<u64> {
-            if *off + 8 > data.len() {
-                return Err(lance_core::Error::io("IvfIndexState data truncated"));
-            }
-            let val = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
-            *off += 8;
-            Ok(val)
-        };
-
-        let header_len = read_u64(&data, &mut offset)? as usize;
-        if offset + header_len > data.len() {
-            return Err(lance_core::Error::io("IvfIndexState header truncated"));
-        }
-        let header: IvfIndexStateHeader =
-            serde_json::from_slice(&data[offset..offset + header_len])
-                .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
-        offset += header_len;
-
-        let ivf_len = read_u64(&data, &mut offset)? as usize;
-        if offset + ivf_len > data.len() {
-            return Err(lance_core::Error::io("IvfIndexState IVF data truncated"));
-        }
-        let ivf_pb = pb::Ivf::decode(&data[offset..offset + ivf_len])
-            .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?;
-        let ivf = IvfModel::try_from(ivf_pb)?;
-        offset += ivf_len;
-
-        let extra_len = read_u64(&data, &mut offset)? as usize;
-        if offset + extra_len > data.len() {
-            return Err(lance_core::Error::io("IvfIndexState extra data truncated"));
-        }
-        let quantizer_extra_data = if extra_len > 0 {
-            Some(data[offset..offset + extra_len].to_vec())
-        } else {
-            None
-        };
-        offset += extra_len;
-
-        // aux_ivf was added after the initial format; fall back to ivf if absent.
-        let aux_ivf = if offset + 8 <= data.len() {
-            let aux_ivf_len = read_u64(&data, &mut offset)? as usize;
-            if offset + aux_ivf_len > data.len() {
-                return Err(lance_core::Error::io(
-                    "IvfIndexState aux IVF data truncated",
-                ));
-            }
-            let aux_ivf_pb = pb::Ivf::decode(&data[offset..offset + aux_ivf_len])
-                .map_err(|e| lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}")))?;
-            IvfModel::try_from(aux_ivf_pb)?
-        } else {
-            // Legacy format without aux_ivf — fall back to index ivf.
-            ivf.clone()
-        };
-
-        let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
-        let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
-        let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
-
-        Ok(Self {
-            index_file_path: header.index_file_path,
-            uuid: header.uuid,
-            ivf,
-            aux_ivf,
-            distance_type,
-            sub_index_metadata: header.sub_index_metadata,
-            quantizer_metadata_json: header.quantizer_metadata_json,
-            quantizer_extra_data,
-            sub_index_type,
-            quantization_type,
-            cache_key_prefix: header.cache_key_prefix,
-            index_file_size: header.index_file_size,
-            aux_file_size: header.aux_file_size,
-        })
-    }
-
-    /// Write this state sequentially to `writer`, returning the number of bytes written.
-    ///
-    /// Same wire format as [`Self::serialize`] but streams directly to the writer
-    /// without accumulating into an intermediate buffer.
-    pub fn write_to_stream(&self, writer: &mut dyn Write) -> Result<usize> {
+/// Wire format:
+/// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
+///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
+impl CacheCodec for IvfIndexState {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<usize> {
         let header = IvfIndexStateHeader {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.clone(),
@@ -391,10 +266,11 @@ impl IvfIndexState {
         Ok(written)
     }
 
-    /// Read an [`IvfIndexState`] sequentially from `reader`.
-    ///
-    /// Reads the same wire format as [`Self::serialize`] / [`Self::write_to_stream`].
-    pub fn read_from_stream(reader: &mut dyn Read) -> Result<Self> {
+    fn type_tag(&self) -> &'static str {
+        "IVF"
+    }
+
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
         fn read_u64(r: &mut dyn Read) -> Result<u64> {
             let mut buf = [0u8; 8];
             r.read_exact(&mut buf)
@@ -478,16 +354,6 @@ impl DeepSizeOf for IvfIndexState {
 }
 
 impl VectorIndexData for IvfIndexState {
-    fn write_to(&self, writer: &mut dyn std::io::Write) -> Result<()> {
-        let bytes = self.serialize()?;
-        writer.write_all(&bytes)?;
-        Ok(())
-    }
-
-    fn index_type_tag(&self) -> &'static str {
-        "IVF"
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

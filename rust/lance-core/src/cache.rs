@@ -594,6 +594,26 @@ impl CacheStats {
     }
 }
 
+/// Streaming serialization codec for cache entries.
+///
+/// **Experimental**: the serialized format is not stable and may change
+/// between releases without notice.
+///
+/// `serialize` streams the entry into the provided writer and returns the
+/// number of bytes written. `deserialize` reconstructs the entry by reading
+/// sequentially from the provided reader.
+///
+/// `type_tag` returns a static string that identifies the concrete type,
+/// enabling dispatch to the correct deserializer when working through trait
+/// objects (where `deserialize` is unavailable due to the `Sized` bound).
+pub trait CacheCodec: Send + Sync {
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<usize>;
+    fn type_tag(&self) -> &'static str;
+    fn deserialize(reader: &mut dyn std::io::Read) -> Result<Self>
+    where
+        Self: Sized;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
