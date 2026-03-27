@@ -80,7 +80,7 @@ impl std::fmt::Debug for Session {
                 &format!(
                     "LanceCache(items={}, size_bytes={})",
                     self.metadata_cache.0.approx_size(),
-                    self.metadata_cache.0.approx_size_bytes(),
+                    self.metadata_cache.0.approx_size(),
                 ),
             )
             .field(

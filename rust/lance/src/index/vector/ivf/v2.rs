@@ -96,6 +96,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
     }
+
+    fn type_name(&self) -> &'static str {
+        "IVFPartition"
+    }
 }
 
 /// IVF Index.

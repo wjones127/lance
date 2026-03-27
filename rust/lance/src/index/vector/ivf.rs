@@ -128,6 +128,10 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
     }
+
+    fn type_name(&self) -> &'static str {
+        "LegacyIVFPartition"
+    }
 }
 
 /// IVF Index.
