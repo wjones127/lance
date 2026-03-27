@@ -83,11 +83,15 @@ impl<'a, T> StringCacheKey<'a, T> {
     }
 }
 
-impl<T> CacheKey for StringCacheKey<'_, T> {
+impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
     type ValueType = T;
 
     fn key(&self) -> Cow<'_, str> {
         self.key.into()
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
     }
 }
 
@@ -238,7 +242,7 @@ impl FileReader {
         loader: F,
     ) -> Result<Arc<T>>
     where
-        F: Fn(&str) -> Fut,
+        F: Fn(&str) -> Fut + Send + Sync,
         Fut: Future<Output = Result<T>> + Send,
     {
         if let Some(cache) = cache {
