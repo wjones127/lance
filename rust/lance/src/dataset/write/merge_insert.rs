@@ -41,6 +41,7 @@ pub mod inserted_rows;
 use assign_action::merge_insert_action;
 use inserted_rows::KeyExistenceFilter;
 
+use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
@@ -1775,8 +1776,19 @@ impl MergeInsertJob {
 
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
 
-            let (old_fragments, removed_fragment_ids) =
-                Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
+            let deletions_result = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
+            let (old_fragments, removed_fragment_ids) = match deletions_result {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup_data_fragments(
+                        &self.dataset.object_store,
+                        &self.dataset.base,
+                        &new_fragments,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
 
             // Commit updated and new fragments
             let operation = Operation::Update {

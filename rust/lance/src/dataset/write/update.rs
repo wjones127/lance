@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
@@ -351,7 +352,19 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
+        let deletions_result = self.apply_deletions(&row_addrs).await;
+        let (old_fragments, removed_fragment_ids) = match deletions_result {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
+            }
+        };
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 
         let num_updated_rows = new_fragments
