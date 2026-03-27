@@ -614,6 +614,41 @@ pub trait CacheCodec: Send + Sync {
         Self: Sized;
 }
 
+/// Write a [`CacheCodec`] value with a leading type tag for later dispatch.
+///
+/// Wire format: `[tag_len: u16 LE][tag: UTF-8 bytes][payload via CacheCodec::serialize]`
+pub fn serialize_tagged(value: &dyn CacheCodec, writer: &mut dyn std::io::Write) -> Result<usize> {
+    let tag = value.type_tag();
+    let tag_bytes = tag.as_bytes();
+    let tag_len = tag_bytes.len() as u16;
+    writer
+        .write_all(&tag_len.to_le_bytes())
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    writer
+        .write_all(tag_bytes)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    let payload = value.serialize(writer)?;
+    Ok(2 + tag_bytes.len() + payload)
+}
+
+/// Read the type tag written by [`serialize_tagged`].
+///
+/// Returns the tag string. The reader is left positioned at the start of the
+/// payload, ready for [`CacheCodec::deserialize`].
+pub fn read_type_tag(reader: &mut dyn std::io::Read) -> Result<String> {
+    let mut len_buf = [0u8; 2];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    let tag_len = u16::from_le_bytes(len_buf) as usize;
+    let mut tag_buf = vec![0u8; tag_len];
+    reader
+        .read_exact(&mut tag_buf)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    String::from_utf8(tag_buf)
+        .map_err(|e| crate::Error::io(format!("CacheCodec type tag is not valid UTF-8: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

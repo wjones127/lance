@@ -12,11 +12,10 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
-use lance_core::cache::CacheCodec;
+use lance_core::cache::{CacheCodec, read_type_tag};
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -155,16 +154,21 @@ pub trait VectorIndexData: CacheCodec + DeepSizeOf + std::fmt::Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Deserialize a [`VectorIndexData`] from bytes previously written by
-/// [`CacheCodec::serialize`].
-pub fn deserialize_vector_index_data(data: Bytes) -> Result<Arc<dyn VectorIndexData>> {
-    // Currently only IVF indices support disk caching. The serialization
-    // format is self-describing (IvfIndexState header), so no external tag
-    // is needed yet. When additional index types are added, prepend a
-    // version/tag byte to the wire format.
-    let mut cursor = std::io::Cursor::new(data);
-    let state = IvfIndexState::deserialize(&mut cursor)?;
-    Ok(Arc::new(state))
+/// Deserialize a [`VectorIndexData`] from a stream previously written by
+/// [`lance_core::cache::serialize_tagged`].
+///
+/// Reads the type tag and dispatches to the correct concrete deserializer.
+pub fn deserialize_vector_index_data(reader: &mut dyn Read) -> Result<Arc<dyn VectorIndexData>> {
+    let tag = read_type_tag(reader)?;
+    match tag.as_str() {
+        "IVF" => {
+            let state = IvfIndexState::deserialize(reader)?;
+            Ok(Arc::new(state))
+        }
+        other => Err(lance_core::Error::io(format!(
+            "unknown VectorIndexData type tag: {other:?}"
+        ))),
+    }
 }
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index

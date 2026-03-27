@@ -84,6 +84,33 @@ fn u8_to_rotation_type(v: u8) -> Result<RQRotationType> {
     }
 }
 
+/// Write a JSON-serializable header prefixed by its length as a u64 LE.
+fn write_json_header(writer: &mut dyn Write, header: &impl Serialize) -> Result<()> {
+    let header_json = serde_json::to_vec(header)?;
+    writer
+        .write_all(&(header_json.len() as u64).to_le_bytes())
+        .map_err(|e| Error::io(e.to_string()))?;
+    writer
+        .write_all(&header_json)
+        .map_err(|e| Error::io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a JSON header written by [`write_json_header`].
+fn read_json_header<T: serde::de::DeserializeOwned>(reader: &mut dyn Read) -> Result<T> {
+    let mut len_buf = [0u8; 8];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|e| Error::io(e.to_string()))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+
+    let mut header_bytes = vec![0u8; header_len];
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(|e| Error::io(e.to_string()))?;
+    serde_json::from_slice(&header_bytes).map_err(|e| Error::io(e.to_string()))
+}
+
 /// Forwards writes to an inner writer while counting total bytes written.
 struct CountingWriter<'a> {
     inner: &'a mut dyn Write,
@@ -367,11 +394,8 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ProductQuantizer> {
             dimension: metadata.dimension,
             transposed: metadata.transposed,
         };
-        let header_json = serde_json::to_vec(&header)?;
-
         let mut cw = CountingWriter::new(writer);
-        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        cw.write_all(&header_json)?;
+        write_json_header(&mut cw, &header)?;
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         stream_ipc(&codebook_to_batch(codebook)?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
@@ -380,17 +404,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ProductQuantizer> {
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let mut header_len_buf = [0u8; 8];
-        reader
-            .read_exact(&mut header_len_buf)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        reader
-            .read_exact(&mut header_bytes)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header: PqPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let header: PqPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
         let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
@@ -444,11 +458,9 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatQuantizer> {
             distance_type: distance_type_to_u8(distance_type),
             dim: metadata.dim,
         };
-        let header_json = serde_json::to_vec(&header)?;
 
         let mut cw = CountingWriter::new(writer);
-        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        cw.write_all(&header_json)?;
+        write_json_header(&mut cw, &header)?;
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
@@ -456,17 +468,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatQuantizer> {
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let mut header_len_buf = [0u8; 8];
-        reader
-            .read_exact(&mut header_len_buf)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        reader
-            .read_exact(&mut header_bytes)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header: FlatPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let header: FlatPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
         let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
@@ -502,11 +504,9 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatBinQuantizer> {
             distance_type: distance_type_to_u8(distance_type),
             dim: metadata.dim,
         };
-        let header_json = serde_json::to_vec(&header)?;
 
         let mut cw = CountingWriter::new(writer);
-        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        cw.write_all(&header_json)?;
+        write_json_header(&mut cw, &header)?;
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
@@ -514,17 +514,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatBinQuantizer> {
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let mut header_len_buf = [0u8; 8];
-        reader
-            .read_exact(&mut header_len_buf)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        reader
-            .read_exact(&mut header_bytes)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header: FlatPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let header: FlatPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
         let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
@@ -572,11 +562,8 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ScalarQuantizer> {
             bounds_start: metadata.bounds.start,
             bounds_end: metadata.bounds.end,
         };
-        let header_json = serde_json::to_vec(&header)?;
-
         let mut cw = CountingWriter::new(writer);
-        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        cw.write_all(&header_json)?;
+        write_json_header(&mut cw, &header)?;
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         // SQ storage may contain multiple batches; stream them all in one IPC stream.
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
@@ -585,17 +572,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ScalarQuantizer> {
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let mut header_len_buf = [0u8; 8];
-        reader
-            .read_exact(&mut header_len_buf)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        reader
-            .read_exact(&mut header_bytes)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header: SqPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let header: SqPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
         let sub_index_batch = read_ipc_stream_single_zero_copy(reader)?;
@@ -650,11 +627,8 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, RabitQuantizer> {
             rotation_type: rotation_type_to_u8(metadata.rotation_type),
             fast_rotation_signs: metadata.fast_rotation_signs.clone(),
         };
-        let header_json = serde_json::to_vec(&header)?;
-
         let mut cw = CountingWriter::new(writer);
-        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
-        cw.write_all(&header_json)?;
+        write_json_header(&mut cw, &header)?;
 
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
 
@@ -675,17 +649,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, RabitQuantizer> {
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let mut header_len_buf = [0u8; 8];
-        reader
-            .read_exact(&mut header_len_buf)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header_len = u64::from_le_bytes(header_len_buf) as usize;
-
-        let mut header_bytes = vec![0u8; header_len];
-        reader
-            .read_exact(&mut header_bytes)
-            .map_err(|e| Error::io(e.to_string()))?;
-        let header: RabitPartitionHeader = serde_json::from_slice(&header_bytes)?;
+        let header: RabitPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
         let rotation_type = u8_to_rotation_type(header.rotation_type)?;
 
@@ -1267,5 +1231,65 @@ mod tests {
         assert_eq!(restored.cache_key_prefix, state.cache_key_prefix);
         assert_eq!(restored.index_file_size, state.index_file_size);
         assert_eq!(restored.aux_file_size, state.aux_file_size);
+    }
+
+    #[test]
+    fn test_tagged_roundtrip_ivf_index_state() {
+        use lance_core::cache::serialize_tagged;
+        use lance_index::vector::IvfIndexState;
+        use lance_index::vector::deserialize_vector_index_data;
+        use lance_index::vector::ivf::storage::IvfModel;
+        use lance_index::vector::quantizer::QuantizationType;
+        use lance_index::vector::v3::subindex::SubIndexType;
+
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0f32, 1.0]), 2)
+                .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+
+        let state = IvfIndexState {
+            index_file_path: "my/index.lance".to_string(),
+            uuid: "test-uuid-1234".to_string(),
+            ivf: ivf.clone(),
+            aux_ivf: ivf,
+            distance_type: DistanceType::L2,
+            sub_index_metadata: vec!["meta1".to_string()],
+            quantizer_metadata_json: r#"{"nbits":8}"#.to_string(),
+            quantizer_extra_data: Some(vec![1, 2, 3, 4]),
+            sub_index_type: SubIndexType::Flat,
+            quantization_type: QuantizationType::Product,
+            cache_key_prefix: "prefix/".to_string(),
+            index_file_size: 1024,
+            aux_file_size: 512,
+        };
+
+        let mut bytes = Vec::new();
+        serialize_tagged(&state, &mut bytes).unwrap();
+
+        let restored = deserialize_vector_index_data(&mut Cursor::new(bytes)).unwrap();
+        let restored = restored.as_any().downcast_ref::<IvfIndexState>().unwrap();
+        assert_eq!(restored.index_file_path, state.index_file_path);
+        assert_eq!(restored.uuid, state.uuid);
+        assert_eq!(restored.cache_key_prefix, state.cache_key_prefix);
+    }
+
+    #[test]
+    fn test_tagged_unknown_type_tag_errors() {
+        use lance_index::vector::deserialize_vector_index_data;
+
+        // Write a fake tag that doesn't match any known type.
+        let mut bytes = Vec::new();
+        let tag = "UNKNOWN";
+        bytes.extend_from_slice(&(tag.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(tag.as_bytes());
+        // Payload doesn't matter — should error on tag.
+
+        let result = deserialize_vector_index_data(&mut Cursor::new(bytes));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown VectorIndexData type tag"),
+            "{err_msg}"
+        );
     }
 }
