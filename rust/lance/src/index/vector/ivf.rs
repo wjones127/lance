@@ -106,6 +106,7 @@ use crate::index::{IndexSegment, IndexSegmentPlan};
 
 pub mod builder;
 pub mod io;
+pub mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
@@ -126,10 +127,6 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("ivf-{}", self.partition_id).into()
-    }
-
-    fn type_name(&self) -> &'static str {
-        "LegacyIVFPartition"
     }
 }
 
@@ -1541,6 +1538,13 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
@@ -1553,6 +1557,9 @@ pub(crate) async fn remap_index_file_v3(
                 .remap(mapping)
                 .await
         }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => Err(Error::index(
+            "HNSW does not support binary (Hamming) quantization".to_string(),
+        )),
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,

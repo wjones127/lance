@@ -1930,10 +1930,6 @@ impl CacheKey for PostingListKey {
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("postings-{}", self.token_id).into()
     }
-
-    fn type_name(&self) -> &'static str {
-        "PostingList"
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1946,10 +1942,6 @@ impl CacheKey for PositionKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("positions-{}", self.token_id).into()
-    }
-
-    fn type_name(&self) -> &'static str {
-        "Position"
     }
 }
 

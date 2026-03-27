@@ -972,7 +972,7 @@ pub(crate) async fn build_vector_index_incremental(
         )));
     };
 
-    let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+    let (vector_type, _element_type) = get_vector_type(dataset.schema(), column)?;
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
@@ -1015,48 +1015,41 @@ pub(crate) async fn build_vector_index_incremental(
 
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
-        (SubIndexType::Flat, QuantizationType::Flat) => match element_type {
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
-                    dataset.clone(),
-                    column.to_owned(),
-                    index_dir,
-                    params.metric_type,
-                    shuffler,
-                    (),
-                    frag_reuse_index,
-                    OptimizeOptions::append(),
-                )?
-                .with_ivf(ivf_model)
-                .with_quantizer(quantizer.try_into()?)
-                .with_progress(progress.clone())
-                .build()
-                .await?;
-            }
-            DataType::UInt8 => {
-                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
-                    dataset.clone(),
-                    column.to_owned(),
-                    index_dir,
-                    params.metric_type,
-                    shuffler,
-                    (),
-                    frag_reuse_index,
-                    OptimizeOptions::append(),
-                )?
-                .with_ivf(ivf_model)
-                .with_quantizer(quantizer.try_into()?)
-                .with_progress(progress.clone())
-                .build()
-                .await?;
-            }
-            _ => {
-                return Err(Error::index(format!(
-                    "Build Vector Index: invalid data type: {:?}",
-                    element_type
-                )));
-            }
-        },
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+                dataset.clone(),
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                OptimizeOptions::append(),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
+        // IVF_FLAT with binary (Hamming) vectors
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                dataset.clone(),
+                column.to_owned(),
+                index_dir,
+                params.metric_type,
+                shuffler,
+                (),
+                frag_reuse_index,
+                OptimizeOptions::append(),
+            )?
+            .with_ivf(ivf_model)
+            .with_quantizer(quantizer.try_into()?)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+        }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
             let mut builder = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_incremental(
@@ -1176,9 +1169,10 @@ pub(crate) async fn build_vector_index_incremental(
                     .build()
                     .await?;
                 }
-                QuantizationType::Rabit => {
+                QuantizationType::FlatBin | QuantizationType::Rabit => {
                     return Err(Error::index(
-                        "Rabit quantization is not supported for HNSW index".to_string(),
+                        "Binary and Rabit quantization are not supported for HNSW index"
+                            .to_string(),
                     ));
                 }
             }
@@ -1473,7 +1467,8 @@ pub async fn initialize_vector_index(
     let ivf_params = derive_ivf_params(ivf_model);
 
     let params = match (sub_index_type, quantization_type) {
-        (SubIndexType::Flat, QuantizationType::Flat) => {
+        (SubIndexType::Flat, QuantizationType::Flat)
+        | (SubIndexType::Flat, QuantizationType::FlatBin) => {
             VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
         }
         (SubIndexType::Flat, QuantizationType::Product) => {
@@ -1517,9 +1512,10 @@ pub async fn initialize_vector_index(
                         sq_params,
                     )
                 }
-                QuantizationType::Rabit => {
+                QuantizationType::FlatBin | QuantizationType::Rabit => {
                     return Err(Error::index(
-                        "Rabit quantization is not supported for HNSW index".to_string(),
+                        "Binary and Rabit quantization are not supported for HNSW index"
+                            .to_string(),
                     ));
                 }
             }
