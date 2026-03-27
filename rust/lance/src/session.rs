@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheBackend, LanceCache};
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -17,7 +17,7 @@ use crate::session::index_caches::GlobalIndexCache;
 use self::index_extension::IndexExtension;
 
 pub(crate) mod caches;
-pub(crate) mod index_caches;
+pub mod index_caches;
 pub(crate) mod index_extension;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
@@ -108,6 +108,20 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
+            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            index_extensions: HashMap::new(),
+            store_registry,
+        }
+    }
+
+    /// Create a session with a custom [`CacheBackend`] for the index cache.
+    pub fn with_index_cache_backend(
+        index_cache_backend: Arc<dyn CacheBackend>,
+        metadata_cache_size: usize,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
+        Self {
+            index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
