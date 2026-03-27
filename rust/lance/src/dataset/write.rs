@@ -570,6 +570,8 @@ pub async fn do_write_fragments(
                 let last_fragment = fragments.last_mut().unwrap();
                 last_fragment.physical_rows = Some(num_rows as usize);
                 last_fragment.files.push(data_file);
+                // Notify after pushing the data file so it's tracked for cleanup
+                // if the callback fails.
                 params.progress.complete(fragments.last().unwrap()).await?;
                 if let Some(cb) = &params.write_progress {
                     cb.call(WriteStats {
@@ -586,28 +588,18 @@ pub async fn do_write_fragments(
     .await;
 
     if let Err(e) = loop_result {
-        let in_progress_filename = writer
+        let in_progress_path = writer
             .as_ref()
             .filter(|w| w.base_id().is_none())
             .map(|w| w.path().to_owned());
         drop(writer.take());
-        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
-        if let Some(filename) = in_progress_filename {
-            let path = base_dir.child(DATA_DIR).child(filename.as_str());
-            if let Err(del_e) = object_store.delete(&path).await {
-                log::warn!(
-                    "Failed to clean up in-progress data file '{}': {}",
-                    path,
-                    del_e
-                );
-            }
-        }
+        cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
         return Err(e);
     }
 
     // Complete the final writer
     if let Some(mut w) = writer.take() {
-        let in_progress_filename = if w.base_id().is_none() {
+        let in_progress_path = if w.base_id().is_none() {
             Some(w.path().to_owned())
         } else {
             None
@@ -630,17 +622,7 @@ pub async fn do_write_fragments(
                 }
             }
             Err(e) => {
-                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
-                if let Some(filename) = in_progress_filename {
-                    let path = base_dir.child(DATA_DIR).child(filename.as_str());
-                    if let Err(del_e) = object_store.delete(&path).await {
-                        log::warn!(
-                            "Failed to clean up in-progress data file '{}': {}",
-                            path,
-                            del_e
-                        );
-                    }
-                }
+                cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
                 return Err(e);
             }
         }
@@ -674,6 +656,23 @@ pub(crate) async fn cleanup_data_fragments(
                     file.base_id.unwrap()
                 );
             }
+        }
+    }
+}
+
+/// Best-effort cleanup of a partially-failed write: deletes all completed fragment
+/// data files plus an optional in-progress file that was never finished.
+async fn cleanup_partial_write(
+    object_store: &ObjectStore,
+    base_dir: &Path,
+    fragments: &[Fragment],
+    in_progress_filename: Option<String>,
+) {
+    cleanup_data_fragments(object_store, base_dir, fragments).await;
+    if let Some(filename) = in_progress_filename {
+        let path = base_dir.child(DATA_DIR).child(filename.as_str());
+        if let Err(e) = object_store.delete(&path).await {
+            log::warn!("Failed to clean up in-progress data file '{}': {}", path, e);
         }
     }
 }
