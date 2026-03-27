@@ -129,7 +129,7 @@ impl CacheKey for BitmapKey {
         format!("{}", self.value.0).into()
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "Bitmap"
     }
 }

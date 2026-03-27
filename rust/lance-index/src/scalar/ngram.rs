@@ -171,7 +171,7 @@ impl CacheKey for NGramPostingListKey {
         format!("posting-list-{}", self.row_offset).into()
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "NGramPostingList"
     }
 }

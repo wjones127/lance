@@ -3417,7 +3417,7 @@ impl CacheKey for FieldDataCacheKey {
         self.column_index.to_string().into()
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "FieldData"
     }
 }

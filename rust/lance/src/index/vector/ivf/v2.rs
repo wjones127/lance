@@ -97,7 +97,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
         format!("ivf-{}", self.partition_id).into()
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         // Using type_name is safe here: the impl is in the same crate as the
         // types, so the monomorphized pointer is consistent.
         std::any::type_name::<PartitionEntry<S, Q>>()

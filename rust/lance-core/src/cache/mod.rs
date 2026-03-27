@@ -204,7 +204,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), cache_key.type_name(), metadata)
+        self.insert_with_id(&cache_key.key(), K::type_name(), metadata)
             .boxed()
             .await
     }
@@ -214,7 +214,7 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_with_id::<K::ValueType>(&cache_key.key(), cache_key.type_name())
+        self.get_with_id::<K::ValueType>(&cache_key.key(), K::type_name())
             .boxed()
             .await
     }
@@ -230,7 +230,7 @@ impl LanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
-        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
 
         let typed_loader = Box::pin(async move {
             let value = loader().await?;
@@ -255,7 +255,7 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), cache_key.type_name(), Arc::new(metadata))
+        self.insert_with_id(&cache_key.key(), K::type_name(), Arc::new(metadata))
             .boxed()
             .await
     }
@@ -266,7 +266,7 @@ impl LanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let outer = self
-            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), cache_key.type_name())
+            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), K::type_name())
             .boxed()
             .await?;
         Some(outer.as_ref().clone())
@@ -317,7 +317,7 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let cache = self.inner.upgrade()?;
-        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
         if let Some(entry) = cache.get(&key).await {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.downcast::<K::ValueType>().unwrap())
@@ -334,7 +334,7 @@ impl WeakLanceCache {
     {
         if let Some(cache) = self.inner.upgrade() {
             let size = cache_entry_size(&*value);
-            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
             cache.insert(&key, value, size).await;
             true
         } else {
@@ -358,7 +358,7 @@ impl WeakLanceCache {
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
         if let Some(cache) = self.inner.upgrade() {
-            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
             let typed_loader = Box::pin(async move {
                 let value = loader().await?;
                 let arc = Arc::new(value);
@@ -384,7 +384,7 @@ impl WeakLanceCache {
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
         let cache = self.inner.upgrade()?;
-        let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
         if let Some(entry) = cache.get(&key).await {
             entry
                 .downcast::<Arc<K::ValueType>>()
@@ -403,7 +403,7 @@ impl WeakLanceCache {
         if let Some(cache) = self.inner.upgrade() {
             let wrapper = Arc::new(value);
             let size = cache_entry_size(&*wrapper);
-            let key = build_key(&self.prefix, &cache_key.key(), cache_key.type_name());
+            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
             cache.insert(&key, wrapper, size).await;
         } else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
@@ -470,7 +470,7 @@ mod tests {
         fn key(&self) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed(&self.key)
         }
-        fn type_name(&self) -> &'static str {
+        fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
     }
@@ -495,7 +495,7 @@ mod tests {
         fn key(&self) -> std::borrow::Cow<'_, str> {
             std::borrow::Cow::Borrowed(&self.key)
         }
-        fn type_name(&self) -> &'static str {
+        fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
     }

@@ -56,7 +56,7 @@ pub trait CacheKey {
     ///
     /// Must be consistent across crate boundaries — use a short literal, not
     /// `std::any::type_name` pointers.
-    fn type_name(&self) -> &'static str;
+    fn type_name() -> &'static str;
 }
 
 pub trait UnsizedCacheKey {
@@ -67,5 +67,5 @@ pub trait UnsizedCacheKey {
     /// Short, stable string that distinguishes this value type from others in
     /// the cache. Must be unique per value type — collisions cause silent
     /// downcast failures.
-    fn type_name(&self) -> &'static str;
+    fn type_name() -> &'static str;
 }

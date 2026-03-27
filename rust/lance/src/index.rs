@@ -111,7 +111,7 @@ impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "ScalarIndex"
     }
 }
@@ -139,7 +139,7 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "VectorIndex"
     }
 }
@@ -167,7 +167,7 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "FragReuseIndex"
     }
 }
@@ -195,7 +195,7 @@ impl CacheKey for MemWalCacheKey<'_> {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name() -> &'static str {
         "MemWalIndex"
     }
 }
