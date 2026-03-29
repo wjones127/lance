@@ -10,8 +10,7 @@ use futures::Future;
 
 use crate::Result;
 
-use super::backend::{CacheBackend, CacheEntry};
-use super::keys::InternalCacheKey;
+use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
@@ -107,7 +106,7 @@ impl CacheBackend for MokaCacheBackend {
     async fn invalidate_prefix(&self, prefix: &str) {
         let prefix = prefix.to_owned();
         self.cache
-            .invalidate_entries_if(move |key, _value| key.has_prefix(&prefix))
+            .invalidate_entries_if(move |key, _value| key.starts_with(&prefix))
             .expect("Cache configured correctly");
     }
 

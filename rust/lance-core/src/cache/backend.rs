@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Backend interface for cache implementors.
+//!
+//! This module defines the trait that custom cache backends must implement,
+//! along with the key and entry types they operate on. Most callers should
+//! use [`LanceCache`](super::LanceCache) instead of interacting with
+//! backends directly.
+
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,17 +17,60 @@ use futures::Future;
 
 use crate::Result;
 
-use super::keys::InternalCacheKey;
-
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
+/// Structured cache key passed to [`CacheBackend`] methods.
+///
+/// Composed of three parts:
+/// - **prefix**: scopes the key to a dataset or index (e.g. `"s3://bucket/dataset/"`)
+/// - **key**: identifies the specific entry (e.g. `"42"` for a version number)
+/// - **type_name**: distinguishes different value types stored under the same
+///   user key (e.g. `"Vec<IndexMetadata>"`)
+///
+/// [`LanceCache`](super::LanceCache) constructs these automatically from
+/// [`CacheKey`](super::CacheKey) values; backend authors receive them
+/// ready-made.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct InternalCacheKey {
+    prefix: Arc<str>,
+    key: Arc<str>,
+    type_name: &'static str,
+}
+
+impl InternalCacheKey {
+    pub fn new(prefix: Arc<str>, key: Arc<str>, type_name: &'static str) -> Self {
+        Self {
+            prefix,
+            key,
+            type_name,
+        }
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Returns true if this key's prefix starts with the given string.
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.prefix.starts_with(prefix)
+    }
+}
+
 /// Low-level pluggable cache backend.
 ///
-/// Implementations store entries keyed by [`InternalCacheKey`], which provides
-/// structured access to the prefix, user key, and type name components.
-/// The [`LanceCache`](super::LanceCache) wrapper handles key construction and type safety;
-/// backend authors do not need to worry about key encoding.
+/// Implementations store entries keyed by [`InternalCacheKey`] and return
+/// type-erased [`CacheEntry`] values.
+/// [`LanceCache`](super::LanceCache) handles key construction and type safety;
+/// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Look up an entry by its key.
@@ -36,15 +86,6 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
     /// was already present in the cache (the loader was not invoked).
-    ///
-    /// The loader is a pinned, boxed future rather than a generic closure
-    /// because `async_trait` erases the `Self` lifetime, making it impossible
-    /// to express a generic closure whose returned future borrows from the
-    /// caller. Boxing the future once at the call site (in `LanceCache`)
-    /// avoids this lifetime conflict while keeping the trait object-safe.
-    ///
-    /// The future borrows from the caller's scope and will be `.await`ed within
-    /// this method — implementations must not store it beyond the call.
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
@@ -72,6 +113,9 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Approximate weighted size in bytes, callable from synchronous contexts.
     /// Used by `DeepSizeOf` to report cache memory usage.
     /// Backends that cannot provide this cheaply should return 0.
+    ///
+    /// Assumes entries do not share underlying buffers; if they do, the
+    /// returned total may overcount.
     fn approx_size_bytes(&self) -> usize {
         0
     }

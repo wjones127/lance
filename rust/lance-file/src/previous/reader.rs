@@ -91,6 +91,9 @@ impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
     }
 
     fn type_name() -> &'static str {
+        // This is a private, crate-internal key that is only instantiated with
+        // a single concrete T within one build, so std::any::type_name is fine
+        // here — there is no cross-crate collision risk.
         std::any::type_name::<T>()
     }
 }

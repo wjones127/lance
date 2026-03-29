@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Cache implementation
+//! Lance cache system.
 //!
-//! This module provides a two-layer caching system:
+//! ## For cache users
 //!
-//! - [`CacheBackend`] is the low-level, pluggable trait that custom cache implementations
-//!   can implement. It uses [`InternalCacheKey`] keys and type-erased entries.
-//! - [`LanceCache`] is the typed wrapper that handles key construction (prefix + type tag),
-//!   type-safe get/insert, and DeepSizeOf-based size computation.
+//! Use [`LanceCache`] (or [`WeakLanceCache`]) to store and retrieve typed
+//! values. Define a [`CacheKey`] (or [`UnsizedCacheKey`] for trait objects) to
+//! describe what you're caching and its type.
 //!
-//! [`CacheKey`] / [`UnsizedCacheKey`] define the typed key interface, and
-//! [`InternalCacheKey`] is the structured key passed to backends.
+//! ## For backend implementors
+//!
+//! Implement [`CacheBackend`] to provide a custom storage layer (disk, Redis,
+//! etc.). Backends receive [`InternalCacheKey`] keys and type-erased
+//! [`CacheEntry`] values — the typed wrapping is handled by [`LanceCache`].
+//! See the [`backend`] module for details.
 
-mod backend;
-mod keys;
+pub mod backend;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry};
-pub use keys::{CacheKey, InternalCacheKey, UnsizedCacheKey};
+pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
 pub use moka::MokaCacheBackend;
 
+use std::borrow::Cow;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -31,6 +33,62 @@ use futures::{Future, FutureExt};
 use crate::Result;
 
 pub use deepsize::{Context, DeepSizeOf};
+
+// ---------------------------------------------------------------------------
+// CacheKey / UnsizedCacheKey — typed key traits for cache users
+// ---------------------------------------------------------------------------
+
+/// Typed cache key for sized value types.
+///
+/// Implement this trait to define a new type of cached entry. [`LanceCache`]
+/// uses the key string and type name to construct an [`InternalCacheKey`]
+/// for the backend.
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyKey { id: u64 }
+///
+/// impl CacheKey for MyKey {
+///     type ValueType = MyData;
+///     fn key(&self) -> Cow<'_, str> { self.id.to_string().into() }
+///     fn type_name() -> &'static str { "MyData" }
+/// }
+/// ```
+pub trait CacheKey {
+    type ValueType: 'static;
+
+    fn key(&self) -> Cow<'_, str>;
+
+    /// Short, stable string identifying this value type.
+    ///
+    /// Two `CacheKey` impls that store different `ValueType`s **must** return
+    /// different type names; if they collide, gets will silently return `None`
+    /// due to failed downcasts.
+    ///
+    /// Use a short literal (e.g. `"Vec<IndexMetadata>"`), not
+    /// `std::any::type_name` — the latter is not guaranteed stable across
+    /// compiler versions or build configurations.
+    fn type_name() -> &'static str;
+}
+
+/// Like [`CacheKey`] but for unsized value types (e.g. `dyn Trait`).
+///
+/// The cache wraps values in an extra `Arc` layer internally; callers pass
+/// and receive `Arc<T>` where `T: ?Sized`.
+pub trait UnsizedCacheKey {
+    type ValueType: 'static + ?Sized;
+
+    fn key(&self) -> Cow<'_, str>;
+
+    /// Short, stable string identifying this value type.
+    /// See [`CacheKey::type_name`] for requirements.
+    fn type_name() -> &'static str;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 /// Size of a cached `Arc<T>`, accounting for the Arc overhead (two atomic counters).
 fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
@@ -682,7 +740,7 @@ mod tests {
                 }
             }
             async fn invalidate_prefix(&self, prefix: &str) {
-                self.map.lock().await.retain(|k, _| !k.has_prefix(prefix));
+                self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
             }
             async fn clear(&self) {
                 self.map.lock().await.clear();
