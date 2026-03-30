@@ -1079,7 +1079,10 @@ impl DirectoryNamespace {
             .as_ref()
             .map(|properties| (**properties).clone())
             .unwrap_or_default();
-        properties.insert("uuid".to_string(), transaction.uuid.clone());
+        properties.insert(
+            "uuid".to_string(),
+            transaction.uuid.hyphenated().to_string(),
+        );
         properties.insert("version".to_string(), version.to_string());
         properties.insert(
             "read_version".to_string(),
@@ -1171,7 +1174,7 @@ impl DirectoryNamespace {
                         ),
                     })
                 })?
-                && transaction.uuid == id
+                && transaction.uuid.hyphenated().to_string() == id
             {
                 return Ok((version.version, transaction));
             }
@@ -2491,7 +2494,7 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 })
             })?
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
 
         Ok(CreateTableIndexResponse { transaction_id })
     }
@@ -2721,7 +2724,7 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 })
             })?
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
 
         Ok(DropTableIndexResponse { transaction_id })
     }
@@ -3068,7 +3071,7 @@ mod tests {
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(transaction_id, expected_transaction_id);
         let indices = dataset.load_indices().await.unwrap();
         assert!(indices.iter().any(|index| index.name == "users_id_idx"));
@@ -3097,7 +3100,7 @@ mod tests {
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(transaction_id, expected_transaction_id);
         let indices = dataset.load_indices().await.unwrap();
         assert!(indices.iter().any(|index| index.name == "vector_idx"));
@@ -3139,7 +3142,7 @@ mod tests {
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(transaction_id, expected_transaction_id);
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(
@@ -3205,7 +3208,7 @@ mod tests {
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(transaction_id, expected_transaction_id);
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("users_id_idx").await.unwrap()).unwrap();
@@ -3228,7 +3231,7 @@ mod tests {
             transaction_id,
             latest_transaction
                 .as_ref()
-                .map(|transaction| transaction.uuid.clone())
+                .map(|transaction| transaction.uuid.hyphenated().to_string())
         );
 
         if let Some(transaction_id) = transaction_id {
@@ -3286,13 +3289,13 @@ mod tests {
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(create_transaction_id, previous_transaction_id);
         let expected_drop_transaction_id = dataset
             .read_transaction()
             .await
             .unwrap()
-            .map(|transaction| transaction.uuid);
+            .map(|transaction| transaction.uuid.hyphenated().to_string());
         assert_eq!(drop_transaction_id, expected_drop_transaction_id);
         let indices = dataset.load_indices().await.unwrap();
         assert!(!indices.iter().any(|index| index.name == "users_id_idx"));

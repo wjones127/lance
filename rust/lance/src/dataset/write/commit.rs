@@ -433,7 +433,7 @@ impl<'a> CommitBuilder<'a> {
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
 
         let merged = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            uuid: uuid::Uuid::new_v4(),
             operation: Operation::Append {
                 fragments: transactions
                     .iter()
@@ -503,7 +503,7 @@ mod tests {
 
     fn sample_transaction(read_version: u64) -> Transaction {
         Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            uuid: uuid::Uuid::new_v4(),
             operation: Operation::Append {
                 fragments: vec![sample_fragment()],
             },
@@ -744,7 +744,7 @@ mod tests {
 
         // Attempting to commit update gives error
         let update_transaction = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            uuid: uuid::Uuid::new_v4(),
             operation: Operation::Update {
                 updated_fragments: vec![],
                 new_fragments: vec![],

@@ -49,15 +49,25 @@ use uuid::Uuid;
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
     pub read_version: u64,
-    pub uuid: String,
+    pub uuid: Uuid,
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+}
+
+impl DeepSizeOf for Transaction {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // Uuid is a fixed-size type with no heap allocation, so no children to count.
+        self.read_version.deep_size_of_children(context)
+            + self.operation.deep_size_of_children(context)
+            + self.tag.deep_size_of_children(context)
+            + self.transaction_properties.deep_size_of_children(context)
+    }
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -1393,7 +1403,7 @@ impl From<&pb::transaction::UpdateMap> for UpdateMap {
 pub struct TransactionBuilder {
     read_version: u64,
     // uuid is optional for builder since it can autogenerate
-    uuid: Option<String>,
+    uuid: Option<Uuid>,
     operation: Operation,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
@@ -1410,7 +1420,7 @@ impl TransactionBuilder {
         }
     }
 
-    pub fn uuid(mut self, uuid: String) -> Self {
+    pub fn uuid(mut self, uuid: Uuid) -> Self {
         self.uuid = Some(uuid);
         self
     }
@@ -1429,9 +1439,7 @@ impl TransactionBuilder {
     }
 
     pub fn build(self) -> Transaction {
-        let uuid = self
-            .uuid
-            .unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
+        let uuid = self.uuid.unwrap_or_else(Uuid::new_v4);
         Transaction {
             read_version: self.read_version,
             uuid,
@@ -2994,9 +3002,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ));
             }
         };
+        let uuid = Uuid::parse_str(&message.uuid)
+            .map_err(|e| Error::invalid_input(format!("Transaction uuid is not valid: {e}")))?;
         Ok(Self {
             read_version: message.read_version,
-            uuid: message.uuid.clone(),
+            uuid,
             operation,
             tag: if message.tag.is_empty() {
                 None
@@ -3271,7 +3281,7 @@ impl From<&Transaction> for pb::Transaction {
             .unwrap_or_default();
         Self {
             read_version: value.read_version,
-            uuid: value.uuid.clone(),
+            uuid: value.uuid.hyphenated().to_string(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
