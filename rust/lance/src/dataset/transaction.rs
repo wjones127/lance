@@ -3281,7 +3281,7 @@ impl From<&Transaction> for pb::Transaction {
             .unwrap_or_default();
         Self {
             read_version: value.read_version,
-            uuid: value.uuid.hyphenated().to_string(),
+            uuid: value.uuid.to_string(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,

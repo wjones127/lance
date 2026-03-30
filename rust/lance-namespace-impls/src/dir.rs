@@ -1079,10 +1079,7 @@ impl DirectoryNamespace {
             .as_ref()
             .map(|properties| (**properties).clone())
             .unwrap_or_default();
-        properties.insert(
-            "uuid".to_string(),
-            transaction.uuid.hyphenated().to_string(),
-        );
+        properties.insert("uuid".to_string(), transaction.uuid.to_string());
         properties.insert("version".to_string(), version.to_string());
         properties.insert(
             "read_version".to_string(),
@@ -1174,7 +1171,7 @@ impl DirectoryNamespace {
                         ),
                     })
                 })?
-                && transaction.uuid.hyphenated().to_string() == id
+                && transaction.uuid.to_string() == id
             {
                 return Ok((version.version, transaction));
             }
@@ -2494,7 +2491,7 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 })
             })?
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
+            .map(|transaction| transaction.uuid.to_string());
 
         Ok(CreateTableIndexResponse { transaction_id })
     }
@@ -2724,7 +2721,7 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 })
             })?
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
+            .map(|transaction| transaction.uuid.to_string());
 
         Ok(DropTableIndexResponse { transaction_id })
     }
@@ -2747,6 +2744,7 @@ mod tests {
     use lance_namespace::schema::convert_json_arrow_schema;
     use std::io::Cursor;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     /// Helper to create a test DirectoryNamespace with a temporary directory
     async fn create_test_namespace() -> (DirectoryNamespace, TempStdDir) {
@@ -3067,12 +3065,12 @@ mod tests {
 
         let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
         let dataset = open_dataset(&namespace, "users").await;
-        let expected_transaction_id = dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(transaction_id, expected_transaction_id);
+        assert_eq!(
+            transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            dataset.read_transaction().await.unwrap().map(|t| t.uuid)
+        );
         let indices = dataset.load_indices().await.unwrap();
         assert!(indices.iter().any(|index| index.name == "users_id_idx"));
     }
@@ -3096,12 +3094,12 @@ mod tests {
             .transaction_id;
 
         let dataset = open_dataset(&namespace, "vectors").await;
-        let expected_transaction_id = dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(transaction_id, expected_transaction_id);
+        assert_eq!(
+            transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            dataset.read_transaction().await.unwrap().map(|t| t.uuid)
+        );
         let indices = dataset.load_indices().await.unwrap();
         assert!(indices.iter().any(|index| index.name == "vector_idx"));
     }
@@ -3138,12 +3136,12 @@ mod tests {
         assert_eq!(users_id_idx.status, "SUCCEEDED");
 
         let dataset = open_dataset(&namespace, "users").await;
-        let expected_transaction_id = dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(transaction_id, expected_transaction_id);
+        assert_eq!(
+            transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            dataset.read_transaction().await.unwrap().map(|t| t.uuid)
+        );
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(
             indices
@@ -3204,12 +3202,12 @@ mod tests {
         assert_eq!(response.num_unindexed_rows, Some(0));
 
         let dataset = open_dataset(&namespace, "users").await;
-        let expected_transaction_id = dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(transaction_id, expected_transaction_id);
+        assert_eq!(
+            transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            dataset.read_transaction().await.unwrap().map(|t| t.uuid)
+        );
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("users_id_idx").await.unwrap()).unwrap();
         assert_eq!(stats["index_type"], "BTree");
@@ -3228,10 +3226,10 @@ mod tests {
         let dataset = open_dataset(&namespace, "users").await;
         let latest_transaction = dataset.read_transaction().await.unwrap();
         assert_eq!(
-            transaction_id,
-            latest_transaction
-                .as_ref()
-                .map(|transaction| transaction.uuid.hyphenated().to_string())
+            transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            latest_transaction.as_ref().map(|t| t.uuid)
         );
 
         if let Some(transaction_id) = transaction_id {
@@ -3285,18 +3283,22 @@ mod tests {
             .checkout_version(dataset.version().version - 1)
             .await
             .unwrap();
-        let previous_transaction_id = previous_dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(create_transaction_id, previous_transaction_id);
-        let expected_drop_transaction_id = dataset
-            .read_transaction()
-            .await
-            .unwrap()
-            .map(|transaction| transaction.uuid.hyphenated().to_string());
-        assert_eq!(drop_transaction_id, expected_drop_transaction_id);
+        assert_eq!(
+            create_transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            previous_dataset
+                .read_transaction()
+                .await
+                .unwrap()
+                .map(|t| t.uuid)
+        );
+        assert_eq!(
+            drop_transaction_id
+                .as_deref()
+                .map(|s| Uuid::parse_str(s).unwrap()),
+            dataset.read_transaction().await.unwrap().map(|t| t.uuid)
+        );
         let indices = dataset.load_indices().await.unwrap();
         assert!(!indices.iter().any(|index| index.name == "users_id_idx"));
 

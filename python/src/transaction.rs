@@ -614,7 +614,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
             .expect("Failed to import lance module");
 
         let read_version = self.0.read_version;
-        let uuid = self.0.uuid.hyphenated().to_string();
+        let uuid = self.0.uuid.to_string();
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
 
         let cls = namespace
