@@ -309,7 +309,7 @@ pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
-    let uuid = env.new_string(transaction.uuid)?;
+    let uuid = env.new_string(transaction.uuid.to_string())?;
     let tag = match transaction.tag {
         Some(tag) => JObject::from(env.new_string(tag)?),
         None => JObject::null(),
@@ -809,6 +809,8 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
+    let uuid = Uuid::parse_str(&uuid)
+        .map_err(|e| Error::input_error(format!("Invalid transaction uuid: {e}")))?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
         .tag(tag)
