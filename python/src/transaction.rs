@@ -585,7 +585,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
 impl FromPyObject<'_> for PyLance<Transaction> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
         let read_version = ob.getattr("read_version")?.extract()?;
-        let uuid = ob.getattr("uuid")?.extract()?;
+        let uuid_str: String = ob.getattr("uuid")?.extract()?;
+        let uuid = Uuid::parse_str(&uuid_str).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let operation = ob.getattr("operation")?.extract::<PyLance<Operation>>()?.0;
         let transaction_properties = ob
             .getattr("transaction_properties")?
@@ -613,7 +614,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
             .expect("Failed to import lance module");
 
         let read_version = self.0.read_version;
-        let uuid = &self.0.uuid;
+        let uuid = self.0.uuid.hyphenated().to_string();
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
 
         let cls = namespace
