@@ -93,7 +93,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
-use super::{WriteMode, WriteParams, write_fragments_internal};
+use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -1264,26 +1264,37 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let row_addrs = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx
-            .try_recv()
-            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-        let row_addrs = captured_ids.row_addrs(None).into_owned();
-        let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-        row_addrs.serialize_into(&mut serialized)?;
-        Some(serialized)
-    } else {
-        if dataset.manifest.uses_stable_row_ids() {
-            log::info!("Compaction task {}: rechunking stable row ids", task_id);
-            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-            recalc_versions_for_rewritten_fragments(
-                dataset.as_ref(),
-                &mut new_fragments,
-                &fragments,
-            )
-            .await?;
+    let row_addrs_result: Result<Option<Vec<u8>>> = async {
+        if let Some(row_ids_rx) = row_ids_rx {
+            let captured_ids = row_ids_rx
+                .try_recv()
+                .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
+            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut serialized)?;
+            Ok(Some(serialized))
+        } else {
+            if dataset.manifest.uses_stable_row_ids() {
+                log::info!("Compaction task {}: rechunking stable row ids", task_id);
+                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+                recalc_versions_for_rewritten_fragments(
+                    dataset.as_ref(),
+                    &mut new_fragments,
+                    &fragments,
+                )
+                .await?;
+            }
+            Ok(None)
         }
-        None
+    }
+    .await;
+
+    let row_addrs = match row_addrs_result {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, &new_fragments).await;
+            return Err(e);
+        }
     };
 
     metrics.files_removed = task
@@ -1605,6 +1616,13 @@ pub async fn commit_compaction(
         None
     };
 
+    // Collect new fragment paths before moving rewrite_groups into the transaction,
+    // so we can clean them up if the commit fails.
+    let all_new_fragments: Vec<Fragment> = rewrite_groups
+        .iter()
+        .flat_map(|g| g.new_fragments.iter().cloned())
+        .collect();
+
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -1623,9 +1641,13 @@ pub async fn commit_compaction(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    dataset
+    if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
+        .await
+    {
+        cleanup_data_fragments(&dataset.object_store, &dataset.base, &all_new_fragments).await;
+        return Err(e);
+    }
 
     Ok(metrics)
 }
