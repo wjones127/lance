@@ -21,23 +21,28 @@ use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+use lance_index::vector::quantizer::{
+    QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
+};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
@@ -59,6 +64,58 @@ use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
+
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+    fn type_name() -> &'static str {
+        "CachedFileMetadata"
+    }
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
+    }
+}
+
+/// Open a FileReader, reusing cached file metadata if available.
+async fn open_reader_cached(
+    scheduler: &Arc<ScanScheduler>,
+    path: &Path,
+    cache: &LanceCache,
+    known_file_size: u64,
+) -> Result<FileReader> {
+    let file_cache = cache.with_key_prefix(path.as_ref());
+    let cached_size = if known_file_size > 0 {
+        CachedFileSize::new(known_file_size)
+    } else {
+        CachedFileSize::unknown()
+    };
+
+    if let Some(cached_meta) = file_cache.get_with_key(&FileMetadataCacheKey).await {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        let encodings_io = Arc::new(LanceEncodingsIo::new(file_scheduler));
+        FileReader::try_open_with_file_metadata(
+            encodings_io,
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cached_meta,
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    } else {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    }
+}
 
 #[derive(Debug, DeepSizeOf)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
@@ -102,12 +159,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
         // types, so the monomorphized pointer is consistent.
         std::any::type_name::<PartitionEntry<S, Q>>()
     }
+
+    fn codec() -> Option<CacheCodec> {
+        super::partition_serde::partition_entry_codec::<S, Q>()
+    }
 }
 
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    /// Local display path (via `to_local_path`), used for statistics.
     uri: String,
+    /// Object-store path to the index file (forward-slash separated).
+    /// Used by `cacheable_state()` for cross-platform reconstruction.
+    index_path: String,
     uuid: String,
 
     /// Ivf model
@@ -131,6 +196,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.uri.deep_size_of_children(context)
+            + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
@@ -216,9 +282,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let storage =
             IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
 
+        // Cache file metadata so reconstructions from IvfIndexState can skip
+        // footer reads.
+        file_metadata_cache
+            .with_key_prefix(uri.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
+            .await;
+        let aux_path = index_dir
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        file_metadata_cache
+            .with_key_prefix(aux_path.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
+            .await;
+
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
+            index_path: uri.as_ref().to_string(),
             uuid,
             ivf,
             reader: index_reader,
@@ -230,6 +311,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             _marker: PhantomData,
         })
+    }
+
+    /// Reconstruct an IVFIndex from pre-parsed state without any I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_cached_state(
+        uri: String,
+        index_path: String,
+        uuid: String,
+        ivf: IvfModel,
+        reader: FileReader,
+        storage: IvfQuantizationStorage<Q>,
+        sub_index_metadata: Vec<String>,
+        distance_type: DistanceType,
+        index_cache: LanceCache,
+        io_parallelism: usize,
+    ) -> Self {
+        let num_partitions = ivf.num_partitions();
+        Self {
+            uri,
+            index_path,
+            uuid,
+            ivf,
+            reader,
+            storage,
+            partition_locks: PartitionLoadLock::new(num_partitions),
+            sub_index_metadata,
+            distance_type,
+            index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
+            _marker: PhantomData,
+        }
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -358,13 +470,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
-            (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
+            (SubIndexType::Flat, QuantizationType::Flat)
+            | (SubIndexType::Flat, QuantizationType::FlatBin) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-            (SubIndexType::Hnsw, QuantizationType::Flat) => IndexType::IvfHnswFlat,
+            (SubIndexType::Hnsw, QuantizationType::Flat)
+            | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
             (sub_index_type, quantization_type) => {
                 unimplemented!(
                     "unsupported index type: {}, {}",
@@ -399,10 +513,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
-            sub_index_stats.insert(
-                "index_type".to_string(),
-                Q::quantization_type().to_string().into(),
-            );
+            let qt_label = match Q::quantization_type() {
+                // FlatBin is the Hamming variant of Flat; report as "FLAT".
+                QuantizationType::FlatBin => "FLAT".to_string(),
+                other => other.to_string(),
+            };
+            sub_index_stats.insert("index_type".to_string(), qt_label.into());
         } else {
             sub_index_stats.insert("index_type".to_string(), S::name().into());
         }
@@ -602,12 +718,202 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
+
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
+        let quantizer_metadata_json = serde_json::to_string(self.storage.metadata()).ok()?;
+        let quantizer_extra_data = self
+            .storage
+            .metadata()
+            .extra_metadata()
+            .ok()?
+            .map(|b| b.to_vec());
+        let (sub_index_type, quantization_type) = self.sub_index_type();
+        Some(Box::new(IvfIndexState {
+            index_file_path: self.index_path.clone(),
+            uuid: self.uuid.clone(),
+            ivf: self.ivf.clone(),
+            aux_ivf: self.storage.ivf().clone(),
+            distance_type: self.distance_type,
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+            cache_key_prefix: self.index_cache.prefix().to_string(),
+            index_file_size: self.reader.metadata().file_size(),
+            aux_file_size: self.storage.reader().metadata().file_size(),
+        }))
+    }
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+
+/// Reconstruct a live [`VectorIndex`] from a cached [`IvfIndexState`].
+///
+/// Re-opens FileReaders (using cached file metadata when warm) and rebuilds the
+/// storage layer from the pre-parsed quantizer metadata. No global buffers are
+/// re-read from object storage.
+pub async fn reconstruct_vector_index(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>> {
+    match (state.sub_index_type, state.quantization_type) {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            reconstruct_typed::<FlatIndex, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            reconstruct_typed::<FlatIndex, FlatBinQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            reconstruct_typed::<FlatIndex, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            reconstruct_typed::<FlatIndex, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            reconstruct_typed::<FlatIndex, RabitQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            reconstruct_typed::<HNSW, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            reconstruct_typed::<HNSW, FlatBinQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            reconstruct_typed::<HNSW, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            reconstruct_typed::<HNSW, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (sub, quant) => Err(Error::index(format!(
+            "unsupported index type combination for reconstruction: ({sub}, {quant})"
+        ))),
+    }
+}
+
+async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>>
+where
+    <Q::Storage as QuantizerStorage>::Metadata: serde::de::DeserializeOwned,
+{
+    let io_parallelism = object_store.io_parallelism();
+    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+
+    let index_path = Path::parse(&state.index_file_path)
+        .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
+    let index_reader = open_reader_cached(
+        &scheduler,
+        &index_path,
+        file_metadata_cache,
+        state.index_file_size,
+    )
+    .await?;
+
+    // Derive aux path from the index path's parent directory.
+    let mut parts: Vec<_> = index_path.parts().collect();
+    parts.pop();
+    let dir: Path = parts.into_iter().collect();
+    let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_reader = open_reader_cached(
+        &scheduler,
+        &aux_path,
+        file_metadata_cache,
+        state.aux_file_size,
+    )
+    .await?;
+
+    let mut metadata: <<Q as Quantization>::Storage as QuantizerStorage>::Metadata =
+        serde_json::from_str(&state.quantizer_metadata_json)?;
+    if let Some(extra) = state.quantizer_extra_data {
+        metadata.parse_buffer(extra.into())?;
+    }
+
+    let storage = IvfQuantizationStorage::from_cached(
+        aux_reader,
+        state.aux_ivf.clone(),
+        metadata,
+        state.distance_type,
+        None,
+    );
+
+    let index = IVFIndex::<S, Q>::from_cached_state(
+        to_local_path(&index_path),
+        index_path.to_string(),
+        state.uuid,
+        state.ivf,
+        index_reader,
+        storage,
+        state.sub_index_metadata,
+        state.distance_type,
+        index_cache,
+        io_parallelism,
+    );
+    Ok(Arc::new(index))
+}
 
 #[cfg(test)]
 mod tests {
@@ -676,7 +982,6 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
     use lance_table::format::IndexMetadata;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
-    use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
@@ -2398,10 +2703,10 @@ mod tests {
             && matches!(params.version, IndexFileVersion::V3)
             && params.index_type() == IndexType::IvfPq
         {
-            let index = dataset.load_indices().await.unwrap();
-            assert_eq!(index.len(), 1);
-            let index_path = dataset.indices_dir().child(index[0].uuid.to_string());
-            rewrite_pq_storage(index_path).await.unwrap();
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            let old_meta = indices[0].clone();
+            rewrite_pq_storage(&mut dataset, &old_meta).await.unwrap();
             // do the test again
             test_recall::<T>(
                 params,
@@ -3375,17 +3680,36 @@ mod tests {
         );
     }
 
-    async fn rewrite_pq_storage(dir: Path) -> Result<()> {
+    /// Rewrite the auxiliary storage file to the legacy PQ format (codebook
+    /// embedded in schema metadata rather than stored as a global buffer), then
+    /// commit a `CreateIndex` transaction so the manifest records the correct
+    /// new file size.
+    /// Rewrite the auxiliary PQ storage file with the codebook inlined into
+    /// schema metadata (legacy format). Uses a new UUID to avoid cache key
+    /// collisions with the original index.
+    async fn rewrite_pq_storage(dataset: &mut Dataset, old_meta: &IndexMetadata) -> Result<()> {
+        use crate::dataset::transaction::{Operation, Transaction};
+
         let obj_store = Arc::new(ObjectStore::local());
-        let store_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let copied_path = dir.child(format!("{}.original", INDEX_AUXILIARY_FILE_NAME));
-        obj_store.copy(&store_path, &copied_path).await?;
-        obj_store.delete(&store_path).await?;
+        let old_dir = dataset.indices_dir().child(old_meta.uuid.to_string());
+        let new_uuid = uuid::Uuid::new_v4();
+        let new_dir = dataset.indices_dir().child(new_uuid.to_string());
+
+        // Copy the main index file to the new directory unchanged.
+        obj_store
+            .copy(
+                &old_dir.child(super::INDEX_FILE_NAME),
+                &new_dir.child(super::INDEX_FILE_NAME),
+            )
+            .await?;
+
+        // Read the original auxiliary file.
+        let old_aux_path = old_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let scheduler =
             ScanScheduler::new(obj_store.clone(), SchedulerConfig::default_for_testing());
         let reader = FileReader::try_open(
             scheduler
-                .open_file(&copied_path, &CachedFileSize::unknown())
+                .open_file(&old_aux_path, &CachedFileSize::unknown())
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -3394,21 +3718,21 @@ mod tests {
         )
         .await?;
 
+        // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
         let batch = reader
             .read_range(0..reader.num_rows() as usize, None)
             .await?;
+        let new_aux_path = new_dir.child(INDEX_AUXILIARY_FILE_NAME);
         let mut writer = FileWriter::try_new(
-            obj_store.create(&store_path).await?,
+            obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
             Default::default(),
         )?;
         writer.write_batch(&batch).await?;
-        // write the IVF
         writer
             .add_global_buffer(reader.read_global_buffer(1).await?)
             .await?;
-        // rewrite the PQ to legacy format
         let codebook = reader.read_global_buffer(2).await?;
         let pq_metadata: Vec<String> = serde_json::from_str(&metadata[STORAGE_METADATA_KEY])?;
         let mut pq_metadata: ProductQuantizationMetadata = serde_json::from_str(&pq_metadata[0])?;
@@ -3420,7 +3744,26 @@ mod tests {
             serde_json::to_string(&vec![pq_metadata])?,
         );
         writer.finish_with_metadata(metadata).await?;
-        obj_store.delete(&copied_path).await?;
+
+        // Build new IndexMetadata with the new UUID and file sizes.
+        let new_files =
+            lance_table::format::list_index_files_with_sizes(&obj_store, &new_dir).await?;
+        let mut new_meta = old_meta.clone();
+        new_meta.uuid = new_uuid;
+        new_meta.files = Some(new_files);
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_meta],
+                removed_indices: vec![old_meta.clone()],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
         Ok(())
     }
 
@@ -4286,5 +4629,209 @@ mod tests {
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    /// A cache backend that serializes entries to bytes on insert and
+    /// deserializes on get. Entries without a codec are stored in-memory
+    /// as-is. This simulates a disk or remote cache backend.
+    type SerializedEntry = (Vec<u8>, lance_core::cache::CacheCodec, usize);
+
+    #[derive(Debug)]
+    struct SerializingBackend {
+        /// Serialized entries: key -> (bytes, codec, size).
+        serialized: tokio::sync::Mutex<
+            std::collections::HashMap<lance_core::cache::InternalCacheKey, SerializedEntry>,
+        >,
+        /// Fallback for entries without a codec.
+        passthrough: lance_core::cache::MokaCacheBackend,
+    }
+
+    impl SerializingBackend {
+        fn new() -> Self {
+            Self {
+                serialized: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                passthrough: lance_core::cache::MokaCacheBackend::with_capacity(256 * 1024 * 1024),
+            }
+        }
+
+        async fn serialized_entry_count(&self) -> usize {
+            self.serialized.lock().await.len()
+        }
+
+        async fn passthrough_entry_count(&self) -> usize {
+            use lance_core::cache::CacheBackend;
+            self.passthrough.num_entries().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl lance_core::cache::CacheBackend for SerializingBackend {
+        async fn get(
+            &self,
+            key: &lance_core::cache::InternalCacheKey,
+            codec: Option<lance_core::cache::CacheCodec>,
+        ) -> Option<lance_core::cache::CacheEntry> {
+            // Try serialized store first
+            let guard = self.serialized.lock().await;
+            if let Some((bytes, stored_codec, _)) = guard.get(key) {
+                return Some(
+                    stored_codec
+                        .deserialize(&mut bytes.as_slice())
+                        .expect("deserialization should succeed"),
+                );
+            }
+            drop(guard);
+            // Fall through to passthrough
+            self.passthrough.get(key, codec).await
+        }
+
+        async fn insert(
+            &self,
+            key: &lance_core::cache::InternalCacheKey,
+            entry: lance_core::cache::CacheEntry,
+            size_bytes: usize,
+            codec: Option<lance_core::cache::CacheCodec>,
+        ) {
+            if let Some(codec) = codec {
+                let mut bytes = Vec::new();
+                codec
+                    .serialize(&entry, &mut bytes)
+                    .expect("serialization should succeed");
+                self.serialized
+                    .lock()
+                    .await
+                    .insert(key.clone(), (bytes, codec, size_bytes));
+            } else {
+                self.passthrough.insert(key, entry, size_bytes, None).await;
+            }
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &lance_core::cache::InternalCacheKey,
+            loader: std::pin::Pin<
+                Box<
+                    dyn futures::Future<Output = Result<(lance_core::cache::CacheEntry, usize)>>
+                        + Send
+                        + 'a,
+                >,
+            >,
+            codec: Option<lance_core::cache::CacheCodec>,
+        ) -> Result<(lance_core::cache::CacheEntry, bool)> {
+            if let Some(entry) = self.get(key, codec).await {
+                return Ok((entry, true));
+            }
+            let (entry, size) = loader.await?;
+            self.insert(key, entry.clone(), size, codec).await;
+            Ok((entry, false))
+        }
+
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.serialized
+                .lock()
+                .await
+                .retain(|k, _| !k.starts_with(prefix));
+            self.passthrough.invalidate_prefix(prefix).await;
+        }
+
+        async fn clear(&self) {
+            self.serialized.lock().await.clear();
+            self.passthrough.clear().await;
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.serialized.lock().await.len() + self.passthrough.num_entries().await
+        }
+
+        async fn size_bytes(&self) -> usize {
+            let serialized: usize = self
+                .serialized
+                .lock()
+                .await
+                .values()
+                .map(|(_, _, s)| *s)
+                .sum();
+            serialized + self.passthrough.size_bytes().await
+        }
+    }
+
+    /// Integration test: create a vector index, prewarm it through a
+    /// serializing cache backend, then query. Verifies that entries are
+    /// serialized to bytes and that queries produce correct results after
+    /// deserialization.
+    #[tokio::test]
+    async fn test_prewarm_and_query_with_serializing_backend() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        // Create dataset with vector index using default cache
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("serde_idx".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Re-open with the serializing backend
+        let backend = Arc::new(SerializingBackend::new());
+        let session = Arc::new(crate::session::Session::with_index_cache_backend(
+            backend.clone(),
+            128 * 1024 * 1024,
+            Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+        ));
+        let dataset = crate::DatasetBuilder::from_uri(test_uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        // Prewarm — this should serialize entries into the backend
+        dataset.prewarm_index("serde_idx").await.unwrap();
+        let serialized = backend.serialized_entry_count().await;
+        let passthrough = backend.passthrough_entry_count().await;
+        assert!(
+            serialized > 0,
+            "prewarm should have serialized entries into the backend"
+        );
+        assert_eq!(
+            passthrough, 0,
+            "all index cache entries should have codecs (nothing in passthrough), \
+             but found {passthrough} passthrough entries"
+        );
+
+        // Query — the backend will deserialize entries from bytes.
+        // After prewarm, all entries are in serialized form, so every
+        // cache hit involves a deserialization round-trip.
+        let q = Float32Array::from_iter_values(repeat_n(0.5, DIM));
+        let results = dataset
+            .scan()
+            .nearest("vector", &q, 10)
+            .unwrap()
+            .nprobes(4)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 10, "should return 10 nearest neighbors");
+
+        // Verify distances are sorted (ascending for L2)
+        let distances: Vec<f32> = results
+            .column_by_name("_distance")
+            .unwrap()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        for w in distances.windows(2) {
+            assert!(w[1] >= w[0], "distances should be sorted ascending");
+        }
     }
 }

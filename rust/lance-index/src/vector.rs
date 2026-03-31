@@ -6,6 +6,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::io::{Read, Write};
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
@@ -14,9 +15,12 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
+use lance_arrow::ipc::{read_len_prefixed_bytes, write_len_prefixed_bytes};
+use lance_core::cache::CacheCodecImpl;
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
+use prost::Message;
 use quantizer::{QuantizationType, Quantizer};
 use std::sync::LazyLock;
 use v3::subindex::SubIndexType;
@@ -137,6 +141,184 @@ impl From<DistanceType> for pb::VectorMetricType {
             DistanceType::Dot => Self::Dot,
             DistanceType::Hamming => Self::Hamming,
         }
+    }
+}
+
+/// Serializable snapshot of a vector index, suitable for caching.
+///
+/// Implementations must be cheaply reconstructable into a live
+/// [`VectorIndex`] given an ObjectStore, file metadata cache, and partition
+/// cache. The reconstruction cost should be dominated by re-opening
+/// `FileReader`s, which is cheap when the file metadata cache is warm.
+pub trait VectorIndexData: DeepSizeOf + std::fmt::Debug + Send + Sync {
+    /// Downcast to `&dyn Any` for concrete type access during reconstruction.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Serializable state of an IVF index, sufficient to reconstruct the index
+/// without re-reading global buffers from object storage.
+///
+/// Produced by [`VectorIndex::cacheable_state`] and consumed by
+/// `reconstruct_vector_index` in the `lance` crate. All fields are `pub`
+/// because the type is shared across crate boundaries; they are **not**
+/// considered stable public API and may change between releases.
+#[derive(Debug, Clone)]
+pub struct IvfIndexState {
+    /// Object-store path to the index file (before `to_local_path` conversion).
+    pub index_file_path: String,
+    pub uuid: String,
+    /// IvfModel for the index file (sub-index row layout).
+    pub ivf: IvfModel,
+    /// IvfModel for the auxiliary/storage file (quantizer row layout).
+    /// The index and aux files have independent row layouts, so we must store
+    /// both to avoid using wrong row offsets during reconstruction.
+    pub aux_ivf: IvfModel,
+    pub distance_type: DistanceType,
+    pub sub_index_metadata: Vec<String>,
+    /// JSON serialization of `Q::Metadata` (quantizer-specific metadata).
+    pub quantizer_metadata_json: String,
+    /// Large quantizer data (PQ codebook, RQ rotation matrix) from `extra_metadata()`.
+    pub quantizer_extra_data: Option<Vec<u8>>,
+    pub sub_index_type: SubIndexType,
+    pub quantization_type: QuantizationType,
+    /// The cache key prefix used by the original index's WeakLanceCache.
+    /// Needed to reconnect the reconstructed index to the shared cache backend.
+    pub cache_key_prefix: String,
+    /// File sizes for the index and auxiliary files, used to avoid HEAD requests
+    /// when reconstructing from cache.
+    pub index_file_size: u64,
+    pub aux_file_size: u64,
+}
+
+/// Serialization header for [`IvfIndexState`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IvfIndexStateHeader {
+    index_file_path: String,
+    uuid: String,
+    distance_type: String,
+    sub_index_metadata: Vec<String>,
+    sub_index_type: String,
+    quantization_type: String,
+    quantizer_metadata_json: String,
+    #[serde(default)]
+    cache_key_prefix: String,
+    #[serde(default)]
+    index_file_size: u64,
+    #[serde(default)]
+    aux_file_size: u64,
+}
+
+/// Wire format:
+/// `[header_json_len: u64 LE][header JSON][ivf_pb_len: u64 LE][ivf protobuf]
+///  [extra_len: u64 LE][extra bytes][aux_ivf_pb_len: u64 LE][aux_ivf protobuf]`
+impl CacheCodecImpl for IvfIndexState {
+    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
+        let header = IvfIndexStateHeader {
+            index_file_path: self.index_file_path.clone(),
+            uuid: self.uuid.clone(),
+            distance_type: self.distance_type.to_string(),
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_type: self.sub_index_type.to_string(),
+            quantization_type: self.quantization_type.to_string(),
+            quantizer_metadata_json: self.quantizer_metadata_json.clone(),
+            cache_key_prefix: self.cache_key_prefix.clone(),
+            index_file_size: self.index_file_size,
+            aux_file_size: self.aux_file_size,
+        };
+        let header_json = serde_json::to_vec(&header)
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+
+        let ivf_bytes = pb::Ivf::try_from(&self.ivf)?.encode_to_vec();
+        let extra = self.quantizer_extra_data.as_deref().unwrap_or(&[]);
+        let aux_ivf_bytes = pb::Ivf::try_from(&self.aux_ivf)?.encode_to_vec();
+
+        write_len_prefixed_bytes(writer, &header_json)?;
+        write_len_prefixed_bytes(writer, &ivf_bytes)?;
+        write_len_prefixed_bytes(writer, extra)?;
+        write_len_prefixed_bytes(writer, &aux_ivf_bytes)?;
+        Ok(())
+    }
+
+    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
+        let header_bytes = read_len_prefixed_bytes(reader)?;
+        let header: IvfIndexStateHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
+
+        let ivf_bytes = read_len_prefixed_bytes(reader)?;
+        let ivf_pb = pb::Ivf::decode(ivf_bytes.as_slice())
+            .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?;
+        let ivf = IvfModel::try_from(ivf_pb)?;
+
+        let extra_bytes = read_len_prefixed_bytes(reader)?;
+        let quantizer_extra_data = if extra_bytes.is_empty() {
+            None
+        } else {
+            Some(extra_bytes)
+        };
+
+        // aux_ivf was added after initial deployment; fall back to ivf only on
+        // clean EOF (legacy format), not on real I/O errors.
+        let aux_ivf = {
+            let mut buf = [0u8; 8];
+            match reader.read_exact(&mut buf) {
+                Ok(()) => {
+                    let aux_ivf_len = u64::from_le_bytes(buf) as usize;
+                    let mut aux_ivf_bytes = vec![0u8; aux_ivf_len];
+                    reader
+                        .read_exact(&mut aux_ivf_bytes)
+                        .map_err(|e| lance_core::Error::io(e.to_string()))?;
+                    let aux_ivf_pb = pb::Ivf::decode(aux_ivf_bytes.as_slice()).map_err(|e| {
+                        lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
+                    })?;
+                    IvfModel::try_from(aux_ivf_pb)?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => ivf.clone(),
+                Err(e) => return Err(lance_core::Error::io(e.to_string())),
+            }
+        };
+
+        let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
+        let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
+        let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
+
+        Ok(Self {
+            index_file_path: header.index_file_path,
+            uuid: header.uuid,
+            ivf,
+            aux_ivf,
+            distance_type,
+            sub_index_metadata: header.sub_index_metadata,
+            quantizer_metadata_json: header.quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+            cache_key_prefix: header.cache_key_prefix,
+            index_file_size: header.index_file_size,
+            aux_file_size: header.aux_file_size,
+        })
+    }
+}
+
+impl DeepSizeOf for IvfIndexState {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.index_file_path.deep_size_of_children(context)
+            + self.uuid.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
+            + self.aux_ivf.deep_size_of_children(context)
+            + self.sub_index_metadata.deep_size_of_children(context)
+            + self.quantizer_metadata_json.deep_size_of_children(context)
+            + self
+                .quantizer_extra_data
+                .as_ref()
+                .map(|v| v.deep_size_of_children(context))
+                .unwrap_or(0)
+            + self.cache_key_prefix.deep_size_of_children(context)
+    }
+}
+
+impl VectorIndexData for IvfIndexState {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -264,6 +446,12 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+
+    /// Export the index state needed for reconstruction from a disk cache.
+    /// Returns `None` if this index type doesn't support persistent caching.
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
+        None
+    }
 }
 
 // it can be an IVF index or a partition of IVF index

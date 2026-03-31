@@ -106,6 +106,7 @@ use crate::index::{IndexSegment, IndexSegmentPlan};
 
 pub mod builder;
 pub mod io;
+mod partition_serde;
 pub mod v2;
 
 // Cache wrapper for vector index trait objects
@@ -1571,6 +1572,13 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
@@ -1578,22 +1586,18 @@ pub(crate) async fn remap_index_file_v3(
             .remap(mapping)
             .await
         }
-        (SubIndexType::Hnsw, QuantizationType::Flat) => match element_type {
-            DataType::UInt8 => {
-                IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
                 .remap(mapping)
                 .await
-            }
-            _ => {
-                IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(
-                    dataset, column, index_dir, index,
-                )?
-                .remap(mapping)
-                .await
-            }
-        },
+        }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
+                dataset, column, index_dir, index,
+            )?
+            .remap(mapping)
+            .await
+        }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
