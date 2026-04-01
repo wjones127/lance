@@ -1001,7 +1001,7 @@ mod tests {
 
     #[test]
     fn test_ivf_index_state_roundtrip() {
-        use lance_index::vector::IvfIndexState;
+        use crate::index::vector::ivf::v2::IvfIndexState;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::quantizer::QuantizationType;
         use lance_index::vector::v3::subindex::SubIndexType;
