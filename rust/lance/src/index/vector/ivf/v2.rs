@@ -4631,9 +4631,6 @@ mod tests {
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
-    /// A cache backend that serializes entries to bytes on insert and
-    /// deserializes on get. Entries without a codec are stored in-memory
-    /// as-is. This simulates a disk or remote cache backend.
     type SerializedEntry = (Vec<u8>, lance_core::cache::CacheCodec, usize);
 
     #[derive(Debug)]

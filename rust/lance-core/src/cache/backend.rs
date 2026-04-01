@@ -24,7 +24,7 @@ pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
 /// Structured cache key passed to [`CacheBackend`] methods.
 ///
-/// Backend authors receive these ready-made from [`LanceCache`](super::LanceCache)
+/// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
 /// — you do not construct them yourself. Composed of three parts:
 /// - **prefix**: scopes the key to a dataset or index (e.g. `"s3://bucket/dataset/"`)
 /// - **key**: identifies the specific entry (e.g. `"42"` for a version number)
