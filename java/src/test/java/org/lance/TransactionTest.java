@@ -175,7 +175,7 @@ public class TransactionTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
 
-        String customUuid = "custom-uuid-12345";
+        String customUuid = "550e8400-e29b-41d4-a716-446655440000";
         try (Transaction txn =
             new Transaction.Builder()
                 .readVersion(dataset.version())
