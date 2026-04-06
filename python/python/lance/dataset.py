@@ -4361,7 +4361,7 @@ class BulkCommitResult(TypedDict):
 class Transaction:
     read_version: int
     operation: LanceOperation.BaseOperation
-    uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
+    uuid: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )

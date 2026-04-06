@@ -5027,7 +5027,7 @@ def test_update_config_transaction(tmp_path: Path):
     )
 
     transaction = lance.Transaction(
-        read_version=ds.version, operation=update_config_op, uuid=str(uuid.uuid4())
+        read_version=ds.version, operation=update_config_op, uuid=uuid.uuid4()
     )
 
     # Commit transaction
@@ -5051,7 +5051,7 @@ def test_update_config_transaction(tmp_path: Path):
     )
 
     transaction2 = lance.Transaction(
-        read_version=ds_v2.version, operation=update_config_op2, uuid=str(uuid.uuid4())
+        read_version=ds_v2.version, operation=update_config_op2, uuid=uuid.uuid4()
     )
 
     ds_v3 = lance.LanceDataset.commit(tmp_path, transaction2)
@@ -5073,7 +5073,7 @@ def test_update_config_transaction(tmp_path: Path):
     )
 
     transaction3 = lance.Transaction(
-        read_version=ds_v3.version, operation=update_config_op3, uuid=str(uuid.uuid4())
+        read_version=ds_v3.version, operation=update_config_op3, uuid=uuid.uuid4()
     )
 
     ds_v4 = lance.LanceDataset.commit(tmp_path, transaction3)
@@ -5102,7 +5102,7 @@ def test_update_config_transaction(tmp_path: Path):
     )
 
     transaction4 = lance.Transaction(
-        read_version=ds_v4.version, operation=update_config_op4, uuid=str(uuid.uuid4())
+        read_version=ds_v4.version, operation=update_config_op4, uuid=uuid.uuid4()
     )
 
     ds_v5 = lance.LanceDataset.commit(tmp_path, transaction4)
@@ -5147,7 +5147,7 @@ def test_update_config_transaction(tmp_path: Path):
     transaction5 = lance.Transaction(
         read_version=ds_v6.version,  # Use the actual latest version
         operation=update_config_op5,
-        uuid=str(uuid.uuid4()),
+        uuid=uuid.uuid4(),
     )
 
     ds_v7 = lance.LanceDataset.commit(tmp_path, transaction5)
