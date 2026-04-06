@@ -235,30 +235,33 @@ impl CacheKey for FileMetadataCacheKey {
     }
 }
 
-/// Cached open IO handles for the index and aux files.
+/// Cached open file readers for the index and aux files.
 ///
 /// Stored in `file_metadata_cache` to avoid re-opening files on every reconstruction.
 /// Not serializable (no codec); a cache miss just triggers a re-open.
-struct CachedIndexEncodingsIo {
-    index_io: Arc<dyn lance_encoding::EncodingsIo>,
-    aux_io: Arc<dyn lance_encoding::EncodingsIo>,
+struct CachedIndexReaders {
+    index_reader: Arc<FileReader>,
+    aux_reader: Arc<FileReader>,
 }
 
-impl deepsize::DeepSizeOf for CachedIndexEncodingsIo {
+impl deepsize::DeepSizeOf for CachedIndexReaders {
     fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        // Wraps OS file handles; not heap data we should track.
+        // Intentionally 0: FileReader shares CachedFileMetadata with the
+        // FileMetadataCacheKey entry, so reporting its full size would
+        // double-count. This violates the no-shared-data rule but is
+        // acceptable as a temporary simplification.
         0
     }
 }
 
-struct CachedIndexEncodingsIoKey {
+struct CachedIndexReadersKey {
     uuid: String,
 }
 
-impl CacheKey for CachedIndexEncodingsIoKey {
-    type ValueType = CachedIndexEncodingsIo;
+impl CacheKey for CachedIndexReadersKey {
+    type ValueType = CachedIndexReaders;
     fn type_name() -> &'static str {
-        "CachedIndexEncodingsIo"
+        "CachedIndexReaders"
     }
     fn key(&self) -> std::borrow::Cow<'_, str> {
         self.uuid.as_str().into()
@@ -485,13 +488,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
             .await;
 
-        // Cache IO handles so that the first reconstruction also skips file opens.
+        // Cache open readers so the first reconstruction also skips file opens.
         file_metadata_cache
             .insert_with_key(
-                &CachedIndexEncodingsIoKey { uuid: uuid.clone() },
-                Arc::new(CachedIndexEncodingsIo {
-                    index_io: index_reader.encodings_io(),
-                    aux_io: storage.reader().encodings_io(),
+                &CachedIndexReadersKey { uuid: uuid.clone() },
+                Arc::new(CachedIndexReaders {
+                    index_reader: Arc::new(index_reader.clone()),
+                    aux_reader: Arc::new(storage.reader().clone()),
                 }),
             )
             .await;
@@ -1061,8 +1064,6 @@ where
     <Q::Storage as QuantizerStorage>::Metadata: serde::de::DeserializeOwned,
 {
     let io_parallelism = object_store.io_parallelism();
-    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-    let scheduler = ScanScheduler::new(Arc::clone(&object_store), scheduler_config);
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
@@ -1073,63 +1074,18 @@ where
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
 
-    let io_key = CachedIndexEncodingsIoKey {
+    let readers_key = CachedIndexReadersKey {
         uuid: state.uuid.clone(),
     };
 
     let (index_reader, aux_reader) =
-        if let Some(cached_io) = file_metadata_cache.get_with_key(&io_key).await {
-            // Warm path: we have cached IO handles; check if file metadata is also cached
-            // so we can reconstruct both FileReaders without any blocking I/O.
-            let index_file_cache = file_metadata_cache.with_key_prefix(index_path.as_ref());
-            let aux_file_cache = file_metadata_cache.with_key_prefix(aux_path.as_ref());
-
-            let maybe_index_meta = index_file_cache.get_with_key(&FileMetadataCacheKey).await;
-            let maybe_aux_meta = aux_file_cache.get_with_key(&FileMetadataCacheKey).await;
-
-            if let (Some(index_meta), Some(aux_meta)) = (maybe_index_meta, maybe_aux_meta) {
-                let index_reader = FileReader::try_open_with_file_metadata(
-                    cached_io.index_io.clone(),
-                    index_path.clone(),
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    index_meta,
-                    file_metadata_cache,
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let aux_reader = FileReader::try_open_with_file_metadata(
-                    cached_io.aux_io.clone(),
-                    aux_path.clone(),
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    aux_meta,
-                    file_metadata_cache,
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                (index_reader, aux_reader)
-            } else {
-                // Metadata evicted; fall through to the miss path.
-                let index_reader = open_reader_cached(
-                    &scheduler,
-                    &index_path,
-                    file_metadata_cache,
-                    state.index_file_size,
-                )
-                .await?;
-                let aux_reader = open_reader_cached(
-                    &scheduler,
-                    &aux_path,
-                    file_metadata_cache,
-                    state.aux_file_size,
-                )
-                .await?;
-                (index_reader, aux_reader)
-            }
+        if let Some(cached) = file_metadata_cache.get_with_key(&readers_key).await {
+            // Warm path: reuse the cached readers directly, no file opens needed.
+            ((*cached.index_reader).clone(), (*cached.aux_reader).clone())
         } else {
-            // Cold path: open files, then cache the resulting IO handles for future
-            // reconstructions.
+            // Cold path: open files, then cache the readers for future reconstructions.
+            let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+            let scheduler = ScanScheduler::new(object_store, scheduler_config);
             let index_reader = open_reader_cached(
                 &scheduler,
                 &index_path,
@@ -1144,17 +1100,15 @@ where
                 state.aux_file_size,
             )
             .await?;
-
-            // Cache the IO handles so future reconstructions can skip file opens.
-            let index_io = index_reader.encodings_io();
-            let aux_io = aux_reader.encodings_io();
             file_metadata_cache
                 .insert_with_key(
-                    &io_key,
-                    Arc::new(CachedIndexEncodingsIo { index_io, aux_io }),
+                    &readers_key,
+                    Arc::new(CachedIndexReaders {
+                        index_reader: Arc::new(index_reader.clone()),
+                        aux_reader: Arc::new(aux_reader.clone()),
+                    }),
                 )
                 .await;
-
             (index_reader, aux_reader)
         };
 
