@@ -8,10 +8,7 @@ use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
-use crate::index::{
-    PreFilter,
-    vector::{VectorIndex, utils::PartitionLoadLock},
-};
+use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
@@ -374,8 +371,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     sub_index_metadata: Vec<String>,
     storage: IvfQuantizationStorage<Q>,
 
-    partition_locks: PartitionLoadLock,
-
     distance_type: DistanceType,
 
     index_cache: WeakLanceCache,
@@ -507,7 +502,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             ivf,
             reader: index_reader,
             storage,
-            partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
@@ -530,7 +524,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
     ) -> Self {
-        let num_partitions = ivf.num_partitions();
         Self {
             uri,
             index_path,
@@ -538,7 +531,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             ivf,
             reader,
             storage,
-            partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
@@ -554,71 +546,69 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         write_cache: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndexCacheEntry>> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::index(format!(
+                "partition id {} is out of range of {} partitions",
+                partition_id,
+                self.ivf.num_partitions()
+            )));
+        }
+
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
-        let part_entry = if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
-            part_idx
+
+        if write_cache {
+            let entry = self
+                .index_cache
+                .get_or_insert_with_key(cache_key, || async {
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+                    metrics.record_part_load();
+                    self.load_partition_entry(partition_id).await
+                })
+                .await?;
+            Ok(entry as Arc<dyn VectorIndexCacheEntry>)
         } else {
-            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=cache_key.key().as_ref());
-            metrics.record_part_load();
-            if partition_id >= self.ivf.num_partitions() {
-                return Err(Error::index(format!(
-                    "partition id {} is out of range of {} partitions",
-                    partition_id,
-                    self.ivf.num_partitions()
-                )));
-            }
-
-            let mtx = self.partition_locks.get_partition_mutex(partition_id);
-            let _guard = mtx.lock().await;
-
-            // check the cache again, as the partition may have been loaded by another
-            // thread that held the lock on loading the partition
             if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
-                part_idx
-            } else {
-                let schema = Arc::new(self.reader.schema().as_ref().into());
-                let batch = match self.reader.metadata().num_rows {
-                    0 => RecordBatch::new_empty(schema),
-                    _ => {
-                        let row_range = self.ivf.row_range(partition_id);
-                        if row_range.is_empty() {
-                            RecordBatch::new_empty(schema)
-                        } else {
-                            let batches = self
-                                .reader
-                                .read_stream(
-                                    ReadBatchParams::Range(row_range),
-                                    u32::MAX,
-                                    1,
-                                    FilterExpression::no_filter(),
-                                )?
-                                .try_collect::<Vec<_>>()
-                                .await?;
-                            concat_batches(&schema, batches.iter())?
-                        }
-                    }
-                };
-                let batch = batch.add_metadata(
-                    S::metadata_key().to_owned(),
-                    self.sub_index_metadata[partition_id].clone(),
-                )?;
-                let idx = S::load(batch)?;
-                let storage = self.load_partition_storage(partition_id).await?;
-                let partition_entry = Arc::new(PartitionEntry::<S, Q> {
-                    index: idx,
-                    storage,
-                });
-                if write_cache {
-                    self.index_cache
-                        .insert_with_key(&cache_key, partition_entry.clone())
-                        .await;
-                }
+                return Ok(part_idx);
+            }
+            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
+            metrics.record_part_load();
+            Ok(Arc::new(self.load_partition_entry(partition_id).await?))
+        }
+    }
 
-                partition_entry
+    async fn load_partition_entry(&self, partition_id: usize) -> Result<PartitionEntry<S, Q>> {
+        let schema = Arc::new(self.reader.schema().as_ref().into());
+        let batch = match self.reader.metadata().num_rows {
+            0 => RecordBatch::new_empty(schema),
+            _ => {
+                let row_range = self.ivf.row_range(partition_id);
+                if row_range.is_empty() {
+                    RecordBatch::new_empty(schema)
+                } else {
+                    let batches = self
+                        .reader
+                        .read_stream(
+                            ReadBatchParams::Range(row_range),
+                            u32::MAX,
+                            1,
+                            FilterExpression::no_filter(),
+                        )?
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    concat_batches(&schema, batches.iter())?
+                }
             }
         };
-
-        Ok(part_entry)
+        let batch = batch.add_metadata(
+            S::metadata_key().to_owned(),
+            self.sub_index_metadata[partition_id].clone(),
+        )?;
+        let idx = S::load(batch)?;
+        let storage = self.load_partition_storage(partition_id).await?;
+        Ok(PartitionEntry {
+            index: idx,
+            storage,
+        })
     }
 
     pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
