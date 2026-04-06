@@ -28,6 +28,14 @@ impl LanceEncodingsIo {
     }
 }
 
+impl deepsize::DeepSizeOf for LanceEncodingsIo {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // Wraps a FileScheduler which wraps Arc<dyn Reader> (a file handle).
+        // OS file handles are not heap data we should track.
+        0
+    }
+}
+
 impl EncodingsIo for LanceEncodingsIo {
     fn submit_request(
         &self,

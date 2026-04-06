@@ -235,6 +235,37 @@ impl CacheKey for FileMetadataCacheKey {
     }
 }
 
+/// Cached open IO handles for the index and aux files.
+///
+/// Stored in `file_metadata_cache` to avoid re-opening files on every reconstruction.
+/// Not serializable (no codec); a cache miss just triggers a re-open.
+struct CachedIndexEncodingsIo {
+    index_io: Arc<dyn lance_encoding::EncodingsIo>,
+    aux_io: Arc<dyn lance_encoding::EncodingsIo>,
+}
+
+impl deepsize::DeepSizeOf for CachedIndexEncodingsIo {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // Wraps OS file handles; not heap data we should track.
+        0
+    }
+}
+
+struct CachedIndexEncodingsIoKey {
+    uuid: String,
+}
+
+impl CacheKey for CachedIndexEncodingsIoKey {
+    type ValueType = CachedIndexEncodingsIo;
+    fn type_name() -> &'static str {
+        "CachedIndexEncodingsIo"
+    }
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.uuid.as_str().into()
+    }
+    // No codec() override → in-memory only
+}
+
 /// Open a FileReader, reusing cached file metadata if available.
 async fn open_reader_cached(
     scheduler: &Arc<ScanScheduler>,
@@ -452,6 +483,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
+            .await;
+
+        // Cache IO handles so that the first reconstruction also skips file opens.
+        file_metadata_cache
+            .insert_with_key(
+                &CachedIndexEncodingsIoKey { uuid: uuid.clone() },
+                Arc::new(CachedIndexEncodingsIo {
+                    index_io: index_reader.encodings_io(),
+                    aux_io: storage.reader().encodings_io(),
+                }),
+            )
             .await;
 
         let num_partitions = ivf.num_partitions();
@@ -1020,30 +1062,101 @@ where
 {
     let io_parallelism = object_store.io_parallelism();
     let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+    let scheduler = ScanScheduler::new(Arc::clone(&object_store), scheduler_config);
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
-    let index_reader = open_reader_cached(
-        &scheduler,
-        &index_path,
-        file_metadata_cache,
-        state.index_file_size,
-    )
-    .await?;
 
     // Derive aux path from the index path's parent directory.
     let mut parts: Vec<_> = index_path.parts().collect();
     parts.pop();
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
-    let aux_reader = open_reader_cached(
-        &scheduler,
-        &aux_path,
-        file_metadata_cache,
-        state.aux_file_size,
-    )
-    .await?;
+
+    let io_key = CachedIndexEncodingsIoKey {
+        uuid: state.uuid.clone(),
+    };
+
+    let (index_reader, aux_reader) =
+        if let Some(cached_io) = file_metadata_cache.get_with_key(&io_key).await {
+            // Warm path: we have cached IO handles; check if file metadata is also cached
+            // so we can reconstruct both FileReaders without any blocking I/O.
+            let index_file_cache = file_metadata_cache.with_key_prefix(index_path.as_ref());
+            let aux_file_cache = file_metadata_cache.with_key_prefix(aux_path.as_ref());
+
+            let maybe_index_meta = index_file_cache.get_with_key(&FileMetadataCacheKey).await;
+            let maybe_aux_meta = aux_file_cache.get_with_key(&FileMetadataCacheKey).await;
+
+            if let (Some(index_meta), Some(aux_meta)) = (maybe_index_meta, maybe_aux_meta) {
+                let index_reader = FileReader::try_open_with_file_metadata(
+                    cached_io.index_io.clone(),
+                    index_path.clone(),
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    index_meta,
+                    file_metadata_cache,
+                    FileReaderOptions::default(),
+                )
+                .await?;
+                let aux_reader = FileReader::try_open_with_file_metadata(
+                    cached_io.aux_io.clone(),
+                    aux_path.clone(),
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    aux_meta,
+                    file_metadata_cache,
+                    FileReaderOptions::default(),
+                )
+                .await?;
+                (index_reader, aux_reader)
+            } else {
+                // Metadata evicted; fall through to the miss path.
+                let index_reader = open_reader_cached(
+                    &scheduler,
+                    &index_path,
+                    file_metadata_cache,
+                    state.index_file_size,
+                )
+                .await?;
+                let aux_reader = open_reader_cached(
+                    &scheduler,
+                    &aux_path,
+                    file_metadata_cache,
+                    state.aux_file_size,
+                )
+                .await?;
+                (index_reader, aux_reader)
+            }
+        } else {
+            // Cold path: open files, then cache the resulting IO handles for future
+            // reconstructions.
+            let index_reader = open_reader_cached(
+                &scheduler,
+                &index_path,
+                file_metadata_cache,
+                state.index_file_size,
+            )
+            .await?;
+            let aux_reader = open_reader_cached(
+                &scheduler,
+                &aux_path,
+                file_metadata_cache,
+                state.aux_file_size,
+            )
+            .await?;
+
+            // Cache the IO handles so future reconstructions can skip file opens.
+            let index_io = index_reader.encodings_io();
+            let aux_io = aux_reader.encodings_io();
+            file_metadata_cache
+                .insert_with_key(
+                    &io_key,
+                    Arc::new(CachedIndexEncodingsIo { index_io, aux_io }),
+                )
+                .await;
+
+            (index_reader, aux_reader)
+        };
 
     let mut metadata: <<Q as Quantization>::Storage as QuantizerStorage>::Metadata =
         serde_json::from_str(&state.quantizer_metadata_json)?;

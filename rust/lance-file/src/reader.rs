@@ -394,6 +394,15 @@ impl FileReader {
         }
     }
 
+    /// Returns the underlying IO scheduler used by this reader.
+    ///
+    /// Callers can cache this and pass it back into
+    /// [`Self::try_open_with_file_metadata`] to reconstruct a reader without
+    /// any additional I/O.
+    pub fn encodings_io(&self) -> Arc<dyn EncodingsIo> {
+        self.scheduler.clone()
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.num_rows
     }
