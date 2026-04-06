@@ -34,7 +34,7 @@ import java.util.UUID;
 public class Transaction implements AutoCloseable {
 
   private final long readVersion;
-  private final String uuid;
+  private final UUID uuid;
   private final Operation operation;
   private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
@@ -50,7 +50,7 @@ public class Transaction implements AutoCloseable {
    */
   private Transaction(
       long readVersion,
-      String uuid,
+      UUID uuid,
       Operation operation,
       String tag,
       Map<String, String> transactionProperties) {
@@ -69,14 +69,14 @@ public class Transaction implements AutoCloseable {
    * @param operation the operation to perform
    */
   public Transaction(long readVersion, Operation operation) {
-    this(readVersion, UUID.randomUUID().toString(), operation, null, null);
+    this(readVersion, UUID.randomUUID(), operation, null, null);
   }
 
   public long readVersion() {
     return readVersion;
   }
 
-  public String uuid() {
+  public UUID uuid() {
     return uuid;
   }
 
@@ -133,14 +133,14 @@ public class Transaction implements AutoCloseable {
 
   /** Builder for constructing {@link Transaction} instances. */
   public static class Builder {
-    private String uuid;
+    private UUID uuid;
     private long readVersion;
     private Operation operation;
     private String tag;
     private Map<String, String> transactionProperties;
 
     public Builder() {
-      this.uuid = UUID.randomUUID().toString();
+      this.uuid = UUID.randomUUID();
     }
 
     public Builder readVersion(long readVersion) {
@@ -148,7 +148,7 @@ public class Transaction implements AutoCloseable {
       return this;
     }
 
-    public Builder uuid(String uuid) {
+    public Builder uuid(UUID uuid) {
       this.uuid = uuid;
       return this;
     }

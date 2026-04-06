@@ -19,6 +19,7 @@ import org.apache.arrow.util.Preconditions;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * A convenience wrapper that pairs a {@link Transaction} with a {@link Dataset}, providing a simple
@@ -59,7 +60,7 @@ public class SourcedTransaction implements AutoCloseable {
   }
 
   /** Delegates to {@link Transaction#uuid()}. */
-  public String uuid() {
+  public UUID uuid() {
     return transaction.uuid();
   }
 

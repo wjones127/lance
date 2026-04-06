@@ -309,7 +309,7 @@ pub(crate) fn convert_to_java_transaction<'local>(
     env: &mut JNIEnv<'local>,
     transaction: Transaction,
 ) -> Result<JObject<'local>> {
-    let uuid = env.new_string(transaction.uuid.to_string())?;
+    let uuid = transaction.uuid.into_java(env)?;
     let tag = match transaction.tag {
         Some(tag) => JObject::from(env.new_string(tag)?),
         None => JObject::null(),
@@ -322,7 +322,7 @@ pub(crate) fn convert_to_java_transaction<'local>(
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
+        "(JLjava/util/UUID;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
         &[
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
@@ -785,7 +785,10 @@ fn convert_to_rust_transaction(
     dataset: Option<&mut BlockingDataset>,
 ) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
-    let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
+    let uuid = env
+        .call_method(&java_transaction, "uuid", "()Ljava/util/UUID;", &[])?
+        .l()?
+        .extract_object(env)?;
     let op = env
         .call_method(
             &java_transaction,
@@ -809,8 +812,6 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    let uuid = Uuid::parse_str(&uuid)
-        .map_err(|e| Error::input_error(format!("Invalid transaction uuid: {e}")))?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
         .tag(tag)

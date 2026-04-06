@@ -30,6 +30,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -175,7 +176,7 @@ public class TransactionTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         FragmentMetadata fragmentMeta = testDataset.createNewFragment(10);
 
-        String customUuid = "550e8400-e29b-41d4-a716-446655440000";
+        UUID customUuid = UUID.fromString("550e8400-e29b-41d4-a716-446655440000");
         try (Transaction txn =
             new Transaction.Builder()
                 .readVersion(dataset.version())
