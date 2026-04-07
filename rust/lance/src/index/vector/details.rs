@@ -26,6 +26,12 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use serde::Serialize;
 
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
+
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
@@ -251,6 +257,87 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
     {
         params.skip_transpose = true;
     }
+}
+
+/// Reconstruct `VectorIndexParams` from a stored `VectorIndexDetails` proto.
+///
+/// Returns `None` for legacy indices (empty details) or if the proto is malformed.
+/// Runtime hints are applied on top of the reconstructed spec.
+pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIndexParams> {
+    if details.value.is_empty() {
+        return None;
+    }
+    let d = details.to_msg::<VectorIndexDetails>().ok()?;
+
+    let metric = DistanceType::from(VectorMetricType::try_from(d.metric_type).ok()?);
+
+    let mut ivf = IvfBuildParams::default();
+    if d.target_partition_size > 0 {
+        ivf.target_partition_size = Some(d.target_partition_size as usize);
+    }
+
+    let hnsw = d.hnsw_index_config.map(|h| HnswBuildParams {
+        m: h.max_connections as usize,
+        ef_construction: h.construction_ef as usize,
+        max_level: h.max_level as u16,
+        ..Default::default()
+    });
+
+    let mut params = match (hnsw, d.compression) {
+        (None, Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_pq_params(
+            metric,
+            ivf,
+            PQBuildParams {
+                num_bits: pq.num_bits as usize,
+                num_sub_vectors: pq.num_sub_vectors as usize,
+                ..Default::default()
+            },
+        ),
+        (None, Some(Compression::Sq(sq))) => VectorIndexParams::with_ivf_sq_params(
+            metric,
+            ivf,
+            SQBuildParams {
+                num_bits: sq.num_bits as u16,
+                ..Default::default()
+            },
+        ),
+        (None, Some(Compression::Rq(rq))) => {
+            let rotation_type =
+                match rabit_quantization::RotationType::try_from(rq.rotation_type).ok()? {
+                    rabit_quantization::RotationType::Matrix => RQRotationType::Matrix,
+                    rabit_quantization::RotationType::Fast => RQRotationType::Fast,
+                };
+            VectorIndexParams::with_ivf_rq_params(
+                metric,
+                ivf,
+                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type),
+            )
+        }
+        (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
+            metric,
+            ivf,
+            hnsw,
+            PQBuildParams {
+                num_bits: pq.num_bits as usize,
+                num_sub_vectors: pq.num_sub_vectors as usize,
+                ..Default::default()
+            },
+        ),
+        (Some(hnsw), Some(Compression::Sq(sq))) => VectorIndexParams::with_ivf_hnsw_sq_params(
+            metric,
+            ivf,
+            hnsw,
+            SQBuildParams {
+                num_bits: sq.num_bits as u16,
+                ..Default::default()
+            },
+        ),
+        (Some(hnsw), _) => VectorIndexParams::ivf_hnsw(metric, ivf, hnsw),
+        _ => VectorIndexParams::with_ivf_flat_params(metric, ivf),
+    };
+
+    apply_runtime_hints(&d.runtime_hints, &mut params);
+    Some(params)
 }
 
 /// Extract metric type from index metadata without opening the index file.

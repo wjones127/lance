@@ -66,7 +66,9 @@ use uuid::Uuid;
 use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
 };
-pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
+pub(crate) use vector::details::{
+    vector_index_details, vector_index_details_default, vector_params_from_details,
+};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 

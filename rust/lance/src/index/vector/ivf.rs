@@ -17,7 +17,10 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
-    index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
+    index::{
+        INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions,
+        vector_params_from_details,
+    },
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::datatypes::UInt8Type;
@@ -385,12 +388,22 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
+        // Restore skip_transpose from stored details so incremental rebuilds
+        // honour the original preference rather than silently reverting to false.
+        let skip_transpose = logical_index
+            .segments()
+            .next()
+            .and_then(|(meta, _)| meta.index_details.as_deref())
+            .and_then(|d| vector_params_from_details(d))
+            .map(|p| p.skip_transpose)
+            .unwrap_or(false);
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
             vector_column,
             &existing_indices,
             options,
+            skip_transpose,
         )
         .await;
     }
@@ -461,6 +474,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
+    skip_transpose: bool,
 ) -> Result<(Uuid, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -503,6 +517,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_transpose(!skip_transpose)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -521,6 +536,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_transpose(!skip_transpose)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -542,6 +558,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_transpose(!skip_transpose)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -562,6 +579,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_transpose(!skip_transpose)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -581,6 +599,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_transpose(!skip_transpose)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -602,6 +621,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_transpose(!skip_transpose)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -620,6 +640,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_transpose(!skip_transpose)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -641,6 +662,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_transpose(!skip_transpose)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -661,6 +683,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_transpose(!skip_transpose)
             .shuffle_data(unindexed)
             .await?
             .build()
