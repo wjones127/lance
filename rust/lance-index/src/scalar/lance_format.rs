@@ -7,6 +7,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{Error, Result, cache::LanceCache};
@@ -126,6 +127,10 @@ impl IndexWriter for current_writer::FileWriter {
         Ok(offset)
     }
 
+    async fn add_global_buffer(&mut self, data: Bytes) -> Result<u32> {
+        Self::add_global_buffer(self, data).await
+    }
+
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
@@ -177,6 +182,10 @@ impl IndexReader for current_reader::FileReader {
         let end = start + batch_size;
         let end = end.min(self.num_rows());
         self.read_range(start as usize..end as usize, None).await
+    }
+
+    async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
+        Self::read_global_buffer(self, n).await
     }
 
     async fn read_range(
@@ -345,7 +354,7 @@ impl IndexStore for LanceIndexStore {
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use std::{collections::HashMap, ops::Bound};
 
@@ -371,6 +380,7 @@ pub mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
@@ -424,6 +434,28 @@ pub mod tests {
     fn default_details<T: prost::Message + prost::Name + std::default::Default>() -> prost_types::Any
     {
         prost_types::Any::from_msg(&T::default()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_global_buffer_round_trip() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        let mut writer = index_store
+            .new_index_file("global-buffer.lance", Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        let expected = bytes::Bytes::from_static(b"scalar-global-buffer");
+        let buffer_idx = writer.add_global_buffer(expected.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = index_store
+            .open_index_file("global-buffer.lance")
+            .await
+            .unwrap();
+        let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -955,13 +987,37 @@ pub mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        // Sort the data by value column (nulls first) to match the production
+        // scanner behavior (TrainingOrdering::Values).
+        let schema = data.schema();
+        let batches: Vec<_> = data
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let combined = arrow::compute::concat_batches(&schema, &batches).unwrap();
+        let options = arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: true,
+        };
+        let indices =
+            arrow::compute::sort_to_indices(combined.column(0), Some(options), None).unwrap();
+        let sorted_columns: Vec<_> = combined
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
+            .collect();
+        let sorted_batch = RecordBatch::try_new(schema.clone(), sorted_columns).unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(sorted_batch) }),
+        ));
+
         let request = BitmapIndexPlugin
             .new_training_request("{}", &Field::new(VALUE_COLUMN_NAME, DataType::Int32, false))
             .unwrap();
         BitmapIndexPlugin
             .train_index(
-                data,
+                stream,
                 index_store.as_ref(),
                 request,
                 None,
@@ -1646,6 +1702,59 @@ pub mod tests {
                     row_ids.null_rows().is_empty(),
                     "null_row_ids should be empty when null elements are ignored"
                 );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_label_list_bitmap_only_layout_is_compatible() {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+
+        // Simulate an older released layout that only had the bitmap lookup file.
+        let values = arrow_array::UInt8Array::from(vec![1, 2]);
+        let row_ids = UInt64Array::from(vec![0, 2]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::UInt8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
+            .unwrap();
+
+        BitmapIndexPlugin::train_bitmap_index(
+            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                schema,
+            ))),
+            index_store.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let index = LabelListIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::LabelListIndexDetails>(),
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::UInt8(Some(1))]);
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match result {
+            SearchResult::Exact(row_ids) => {
+                assert!(row_ids.null_rows().is_empty());
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![0]);
             }
             _ => panic!("Expected Exact search result"),
         }

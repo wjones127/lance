@@ -8,8 +8,7 @@ from .builder import IndexConfig, IndicesBuilder
 from .ivf import IvfModel
 from .pq import PqModel
 
-IndexSegment = _lance.indices.IndexSegment
-IndexSegmentPlan = _lance.indices.IndexSegmentPlan
+IndexSegmentDescription = _lance.indices.IndexSegmentDescription
 
 __all__ = [
     "IndicesBuilder",
@@ -17,8 +16,7 @@ __all__ = [
     "PqModel",
     "IvfModel",
     "IndexFileVersion",
-    "IndexSegment",
-    "IndexSegmentPlan",
+    "IndexSegmentDescription",
 ]
 
 
@@ -31,9 +29,11 @@ class SupportedDistributedIndices(str, Enum):
     # Scalar index types
     BTREE = "BTREE"
     INVERTED = "INVERTED"
+
     # Precise vector index types supported by distributed merge
     IVF_FLAT = "IVF_FLAT"
     IVF_PQ = "IVF_PQ"
     IVF_SQ = "IVF_SQ"
+
     # Deprecated generic placeholder (kept for backward compatibility)
     VECTOR = "VECTOR"

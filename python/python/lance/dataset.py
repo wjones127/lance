@@ -47,7 +47,7 @@ from .dependencies import (
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
-from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
+from .indices import IndexConfig, SupportedDistributedIndices
 from .lance import (
     CleanupStats,
     Compaction,
@@ -78,9 +78,8 @@ if TYPE_CHECKING:
     from lance.namespace import LanceNamespace
 
     from .commit import CommitLock
-    from .io import StorageOptionsProvider
     from .lance.indices import IndexDescription
-    from .progress import FragmentWriteProgress
+    from .progress import FragmentWriteProgress, IndexProgress
     from .types import ReaderLike
 
     QueryVectorLike = Union[
@@ -430,14 +429,13 @@ class LanceDataset(pa.dataset.Dataset):
         index_cache_size_bytes: Optional[int] = None,
         read_params: Optional[Dict[str, Any]] = None,
         session: Optional[Session] = None,
-        storage_options_provider: Optional[Any] = None,
-        namespace: Optional[Any] = None,
+        namespace_client: Optional[Any] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_managed_versioning: bool = False,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._storage_options = storage_options
-        self._storage_options_provider = storage_options_provider
 
         # Handle deprecation warning for index_cache_size
         if index_cache_size is not None:
@@ -449,6 +447,13 @@ class LanceDataset(pa.dataset.Dataset):
                 stacklevel=2,
             )
 
+        # Store namespace_client and table_id for credential refresh in file operations
+        self._namespace_client = namespace_client
+        self._table_id = table_id
+        self._namespace_client_managed_versioning = namespace_client_managed_versioning
+
+        # Storage options provider is automatically created in Rust when
+        # namespace_client and table_id are provided
         self._ds = _Dataset(
             uri,
             version,
@@ -462,9 +467,9 @@ class LanceDataset(pa.dataset.Dataset):
             index_cache_size_bytes=index_cache_size_bytes,
             read_params=read_params,
             session=session,
-            storage_options_provider=storage_options_provider,
-            namespace=namespace,
+            namespace_client=namespace_client,
             table_id=table_id,
+            namespace_client_managed_versioning=namespace_client_managed_versioning,
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
@@ -529,13 +534,19 @@ class LanceDataset(pa.dataset.Dataset):
         )
         self._default_scan_options = default_scan_options
         self._read_params = read_params
-        self._storage_options_provider = None
+        self._namespace_client = None
+        self._table_id = None
+        self._namespace_client_managed_versioning = False
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
         ds._storage_options = self._storage_options
-        ds._storage_options_provider = self._storage_options_provider
+        ds._namespace_client = self._namespace_client
+        ds._table_id = self._table_id
+        ds._namespace_client_managed_versioning = (
+            self._namespace_client_managed_versioning
+        )
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params.copy() if self._read_params else None
@@ -630,7 +641,8 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = self._storage_options
-        ds._storage_options_provider = self._storage_options_provider
+        ds._namespace_client = self._namespace_client
+        ds._table_id = self._table_id
         ds._default_scan_options = self._default_scan_options
         ds._read_params = self._read_params
         return ds
@@ -641,12 +653,13 @@ class LanceDataset(pa.dataset.Dataset):
 
     def list_indices(self) -> List[Index]:
         """
-        Returns index information for all indices in the dataset.
+        Returns physical index segment information for all indices in the dataset.
 
         This method is deprecated as it requires loading the statistics for each index
-        which can be a very expensive operation.  Instead use describe_indices() to
-        list index information and index_statistics() to get the statistics for
-        individual indexes of interest.
+        which can be a very expensive operation.  It also exposes physical index
+        segments directly.  Instead use describe_indices() for logical index
+        descriptions and index_statistics() to get the statistics for individual
+        indexes of interest.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -657,7 +670,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.load_indices()
 
     def describe_indices(self) -> List[IndexDescription]:
-        """Returns index information for all indices in the dataset."""
+        """Returns logical index information aggregated across all segments."""
         return self._ds.describe_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
@@ -2348,7 +2361,8 @@ class LanceDataset(pa.dataset.Dataset):
         return LanceFileSession(
             base_path=self._uri,
             storage_options=self.latest_storage_options(),
-            storage_options_provider=self._storage_options_provider,
+            namespace_client=self._namespace_client,
+            table_id=self._table_id,
         )
 
     def checkout_version(
@@ -2498,6 +2512,7 @@ class LanceDataset(pa.dataset.Dataset):
         train: bool = True,
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -2591,14 +2606,17 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
-            method returns an IndexMetadata object but does not commit the index
-            to the dataset. The index can be committed later using the commit API.
+            method returns metadata for one segment but does not commit
+            the index to the dataset. The segment can be planned, merged, and
+            committed later using the segment builder and commit APIs.
             This parameter is passed via kwargs internally.
         index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing
-            multiple fragment-level indices need to share UUID for later merging.
-            If not provided, a new UUID will be generated. This parameter is passed via
-            kwargs internally.
+            A UUID to use for the segment written by this call.
+            If not provided, a new UUID will be generated. This parameter is
+            passed via kwargs internally.
+        progress_callback : callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            the index is being built.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -2782,6 +2800,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["fragment_ids"] = fragment_ids
         if index_uuid is not None:
             kwargs["index_uuid"] = index_uuid
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
@@ -3186,6 +3206,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         target_partition_size: Optional[int] = None,
         skip_transpose: bool = False,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -3258,13 +3279,16 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
-            method creates temporary index metadata but does not commit the index
-            to the dataset. The index can be committed later using
-            merge_index_metadata(index_uuid, "VECTOR", column=..., index_name=...).
+            method creates one segment but does not commit the index
+            to the dataset. The returned metadata can be passed to
+            optionally merged with ``merge_existing_index_segments(...)``
+            and then committed with ``commit_existing_index_segments(...)``.
         index_uuid : str, optional
-            A UUID to use for fragment-level distributed indexing. Multiple
-            fragment-level indices need to share UUID for later merging.
+            A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated.
+        progress_callback : callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            the index is being built.
         target_partition_size: int, optional
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
@@ -3366,6 +3390,8 @@ class LanceDataset(pa.dataset.Dataset):
           <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
+        if progress_callback is not None:
+            kwargs["progress_callback"] = progress_callback
         self._create_index_impl(
             column,
             index_type,
@@ -3426,33 +3452,33 @@ class LanceDataset(pa.dataset.Dataset):
         **kwargs,
     ) -> Index:
         """
-        Create one uncommitted partial index and return its metadata.
+        Create one segment without publishing it and return its metadata.
 
-        This is the public shard-build API for distributed index construction.
-        Unlike :meth:`create_index`, this method does not publish the index into
-        the dataset manifest. Instead, it writes one partial index under the
-        staging UUID and returns the resulting :class:`Index` metadata.
+        This is the public distributed-build API for vector index
+        construction. Unlike :meth:`create_index`, this method does not publish
+        the index into the dataset manifest. Instead, it writes one segment
+        under ``_indices/<segment_uuid>/`` and returns the resulting
+        :class:`Index` metadata.
 
         Callers should:
 
-        1. run :meth:`create_index_uncommitted` on each worker with the worker's
-           assigned ``fragment_ids`` and a shared ``index_uuid``
+        1. run :meth:`create_index_uncommitted` on each worker with that worker's
+           assigned ``fragment_ids``
         2. collect the returned :class:`Index` objects
-        3. pass them to :meth:`IndexSegmentBuilder.with_partial_indices`
-        4. build one or more segments and commit them with
+        3. optionally merge one or more caller-defined groups with
+           :meth:`merge_existing_index_segments`
+        4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        Parameters are the same as :meth:`create_index`, with two additional
-        requirements for distributed shard build:
+        Parameters are the same as :meth:`create_index`, with one additional
+        requirement:
 
         - ``fragment_ids`` must be provided
-        - workers that belong to the same distributed build must share the same
-          ``index_uuid``
 
         Returns
         -------
         Index
-            Metadata for the partial index that was written by this call.
+            Metadata for the segment that was written by this call.
         """
         return self._create_index_impl(
             column,
@@ -3512,18 +3538,20 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: str,
         index_type: str,
         batch_readhead: Optional[int] = None,
+        progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ):
         """
-        Merge distributed index metadata for supported scalar
-        and vector index types.
+        Merge distributed scalar index metadata.
 
-        This method supports all index types defined in
-        :class:`lance.indices.SupportedDistributedIndices`,
-        including scalar indices and precise vector index types.
+        Vector distributed indexing no longer uses this API. For vector indices,
+        build segments with :meth:`create_index_uncommitted`, optionally merge
+        caller-defined groups with :meth:`merge_existing_index_segments`, and
+        publish them with :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
-        This API merges temporary index files (e.g., per-fragment partials).
+        This API merges temporary scalar index files (for example per-fragment
+        BTree or inverted index outputs).
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
@@ -3531,13 +3559,16 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         index_uuid: str
-            The shared UUID used when building fragment-level indices.
+            The shared UUID used when building fragment-level scalar indices.
         index_type: str
             Index type name. Must be one of the enum values in
             :class:`lance.indices.SupportedDistributedIndices`
-            (for example ``"IVF_PQ"``).
+            supported by scalar distributed merge.
         batch_readhead: int, optional
             Prefetch concurrency used by BTREE merge reader. Default: 1.
+        progress_callback: callable, optional
+            A callback that receives :class:`lance.progress.IndexProgress` events while
+            metadata is being merged.
         """
         # Normalize type
         t = index_type.upper()
@@ -3549,22 +3580,17 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         # Merge physical index files at the index directory
-        self._ds.merge_index_metadata(index_uuid, t, batch_readhead)
+        self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
 
-    def create_index_segment_builder(self, staging_index_uuid: str):
+    def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """
-        Create a builder for turning partial index outputs into committed segments.
-
-        The caller should pass the shared index UUID used during
-        :meth:`create_index` with ``fragment_ids=...`` and ``index_uuid=...``.
-        Then provide the returned partial index metadata through
-        :meth:`IndexSegmentBuilder.with_partial_indices`.
+        Merge one caller-defined group of existing uncommitted segments.
         """
-        return self._ds.create_index_segment_builder(staging_index_uuid)
+        return self._ds.merge_existing_index_segments(segments)
 
     def commit_existing_index_segments(
-        self, index_name: str, column: str, segments: List[IndexSegment]
+        self, index_name: str, column: str, segments: List[Index]
     ) -> LanceDataset:
         """
         Commit built index segments as one logical index.
@@ -3598,15 +3624,15 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
         *,
         commit_message: Optional[str] = None,
         enable_stable_row_ids: Optional[bool] = None,
-        namespace: Optional["LanceNamespace"] = None,
+        namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        namespace_client_managed_versioning: bool = False,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -3646,8 +3672,6 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : StorageOptionsProvider, optional
-            A provider for dynamic storage options with automatic credential refresh.
         enable_v2_manifest_paths : bool, optional
             If True, and this is a new dataset, uses the new V2 manifest paths.
             These paths provide more efficient opening of datasets with many
@@ -3673,12 +3697,12 @@ class LanceDataset(pa.dataset.Dataset):
             row IDs assign each row a monotonically increasing id that persists
             across compaction and other maintenance operations.  This option is
             ignored for existing datasets.
-        namespace : LanceNamespace, optional
-            A namespace instance. Must be provided together with table_id.
+        namespace_client : LanceNamespace, optional
+            A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
         table_id : List[str], optional
             The table identifier within the namespace (e.g., ["workspace", "table"]).
-            Must be provided together with namespace.
+            Must be provided together with namespace_client.
 
         Returns
         -------
@@ -3732,6 +3756,9 @@ class LanceDataset(pa.dataset.Dataset):
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
+
+        # Storage options provider is automatically created in Rust when
+        # namespace_client and table_id are provided
         if isinstance(operation, Transaction):
             if commit_message is not None:
                 raise ValueError(
@@ -3744,13 +3771,13 @@ class LanceDataset(pa.dataset.Dataset):
                 operation,
                 commit_lock,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
                 enable_stable_row_ids=enable_stable_row_ids,
-                namespace=namespace,
+                namespace_client=namespace_client,
                 table_id=table_id,
+                namespace_client_managed_versioning=namespace_client_managed_versioning,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -3759,14 +3786,14 @@ class LanceDataset(pa.dataset.Dataset):
                 read_version,
                 commit_lock,
                 storage_options=storage_options,
-                storage_options_provider=storage_options_provider,
                 enable_v2_manifest_paths=enable_v2_manifest_paths,
                 detached=detached,
                 max_retries=max_retries,
                 commit_message=commit_message,
                 enable_stable_row_ids=enable_stable_row_ids,
-                namespace=namespace,
+                namespace_client=namespace_client,
                 table_id=table_id,
+                namespace_client_managed_versioning=namespace_client_managed_versioning,
             )
         else:
             raise TypeError(
@@ -3776,7 +3803,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
-        ds._storage_options_provider = storage_options_provider
+        ds._namespace_client = namespace_client
+        ds._table_id = table_id
+        ds._namespace_client_managed_versioning = namespace_client_managed_versioning
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
@@ -3789,7 +3818,6 @@ class LanceDataset(pa.dataset.Dataset):
         transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        storage_options_provider: Optional["StorageOptionsProvider"] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
         max_retries: int = 20,
@@ -3818,8 +3846,6 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        storage_options_provider : StorageOptionsProvider, optional
-            A provider for dynamic storage options with automatic credential refresh.
         enable_v2_manifest_paths : bool, optional
             If True, and this is a new dataset, uses the new V2 manifest paths.
             These paths provide more efficient opening of datasets with many
@@ -3866,7 +3892,6 @@ class LanceDataset(pa.dataset.Dataset):
             transactions,
             commit_lock,
             storage_options=storage_options,
-            storage_options_provider=storage_options_provider,
             enable_v2_manifest_paths=enable_v2_manifest_paths,
             detached=detached,
             max_retries=max_retries,
@@ -3875,7 +3900,8 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._storage_options = storage_options
-        ds._storage_options_provider = storage_options_provider
+        ds._namespace_client = None
+        ds._table_id = None
         ds._default_scan_options = None
         ds._read_params = None
         return BulkCommitResult(
@@ -4375,6 +4401,7 @@ class Tag(TypedDict):
 
 class Branch(TypedDict):
     parent_branch: Optional[str]
+    branch_identifier: List[Tuple[int, str]]
     parent_version: int
     create_at: int
     manifest_size: int
@@ -4428,6 +4455,7 @@ class Index:
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
+    index_details: Optional[tuple[str, bytes]] = None
 
 
 class AutoCleanupConfig(TypedDict):
@@ -5932,8 +5960,9 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
-    namespace: Optional[LanceNamespace] = None,
+    namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
@@ -5947,7 +5976,7 @@ def write_dataset(
     uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,
         the session will be reused.
-        Either `uri` or (`namespace` + `table_id`) must be provided, but not both.
+        Either `uri` or (`namespace_client` + `table_id`) must be provided.
     schema: Schema, optional
         If specified and the input is a pandas DataFrame, use this schema
         instead of the default pandas to arrow table conversion.
@@ -6027,48 +6056,55 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    external_blob_mode: {"reference", "ingest"}, default "reference"
+        How external blob URIs are handled on write.
+
+        - ``"reference"`` stores the URI as an external blob reference.
+        - ``"ingest"`` reads the external bytes during write and stores them in
+          Lance-managed storage using the normal inline / packed / dedicated
+          thresholds.
     allow_external_blob_outside_bases: bool, default False
         If False, external blob URIs must map to the dataset root or a registered
         base path. If True, external blob URIs outside registered bases are allowed.
-    namespace : optional, LanceNamespace
-        A namespace instance from which to fetch table location and storage options.
+        This option only applies when ``external_blob_mode="reference"``.
+    namespace_client : optional, LanceNamespace
+        A namespace client from which to fetch table location and storage options.
         Must be provided together with `table_id`. Cannot be used with `uri`.
         When provided, the table location will be fetched automatically from the
         namespace via describe_table(). Storage options will be automatically refreshed
         before they expire.
     table_id : optional, List[str]
         The table identifier when using a namespace (e.g., ["my_table"]).
-        Must be provided together with `namespace`. Cannot be used with `uri`.
+        Must be provided together with `namespace_client`. Cannot be used with `uri`.
 
     Notes
     -----
-    When using `namespace` and `table_id`:
+    When using `namespace_client` and `table_id`:
     - The `uri` parameter is optional and will be fetched from the namespace
     - Storage options from describe_table() will be used automatically
-    - A `LanceNamespaceStorageOptionsProvider` will be created automatically for
-      storage options refresh
+    - Storage options provider will be created automatically for credential refresh
     - Initial storage options from describe_table() will be merged with
       any provided `storage_options`
     """
-    # Validate that user provides either uri OR (namespace + table_id), not both
+    # Validate that user provides either uri OR (namespace_client + table_id), not both
     has_uri = uri is not None
-    has_namespace = namespace is not None or table_id is not None
+    has_namespace = namespace_client is not None or table_id is not None
 
     if has_uri and has_namespace:
         raise ValueError(
-            "Cannot specify both 'uri' and 'namespace/table_id'. "
-            "Please provide either 'uri' or both 'namespace' and 'table_id'."
+            "Cannot specify both 'uri' and 'namespace_client/table_id'. "
+            "Please provide either 'uri' or both 'namespace_client' and 'table_id'."
         )
     elif not has_uri and not has_namespace:
         raise ValueError(
-            "Must specify either 'uri' or both 'namespace' and 'table_id'."
+            "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
         )
 
     # Handle namespace-based dataset writing
-    if namespace is not None:
+    if namespace_client is not None:
         if table_id is None:
             raise ValueError(
-                "Both 'namespace' and 'table_id' must be provided together."
+                "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
         # Implement write_into_namespace logic in Python
@@ -6080,16 +6116,15 @@ def write_dataset(
         from .namespace import (
             DeclareTableRequest,
             DescribeTableRequest,
-            LanceNamespaceStorageOptionsProvider,
         )
 
         # Determine which namespace method to call based on mode
         if mode == "create":
             declare_request = DeclareTableRequest(id=table_id, location=None)
-            response = namespace.declare_table(declare_request)
+            response = namespace_client.declare_table(declare_request)
         elif mode in ("append", "overwrite"):
             request = DescribeTableRequest(id=table_id, version=None)
-            response = namespace.describe_table(request)
+            response = namespace_client.describe_table(request)
         else:
             raise ValueError(f"Invalid mode: {mode}")
 
@@ -6101,33 +6136,29 @@ def write_dataset(
             )
 
         # Check if namespace manages versioning (commits go through namespace API)
-        managed_versioning = getattr(response, "managed_versioning", None) is True
+        namespace_client_managed_versioning = (
+            getattr(response, "managed_versioning", None) is True
+        )
 
         # Use namespace storage options
         namespace_storage_options = response.storage_options
 
-        # Set up storage options and provider
-        if namespace_storage_options:
-            # Create the storage options provider for automatic refresh
-            storage_options_provider = LanceNamespaceStorageOptionsProvider(
-                namespace=namespace, table_id=table_id
-            )
-
-            # Merge namespace storage options with any existing options
-            # Namespace options take precedence (same as Rust implementation)
+        # Merge namespace storage options with any existing options
+        # Namespace options take precedence (same as Rust implementation)
+        # Storage options provider will be created automatically in Rust
+        if namespace_storage_options is not None:
             if storage_options is None:
                 storage_options = dict(namespace_storage_options)
             else:
                 merged_options = dict(storage_options)
                 merged_options.update(namespace_storage_options)
                 storage_options = merged_options
-        else:
-            storage_options_provider = None
     elif table_id is not None:
-        raise ValueError("Both 'namespace' and 'table_id' must be provided together.")
+        raise ValueError(
+            "Both 'namespace_client' and 'table_id' must be provided together."
+        )
     else:
-        storage_options_provider = None
-        managed_versioning = False
+        namespace_client_managed_versioning = False
 
     if use_legacy_format is not None:
         warnings.warn(
@@ -6162,17 +6193,18 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
     }
 
-    # Add storage_options_provider if created from namespace
-    if storage_options_provider is not None:
-        params["storage_options_provider"] = storage_options_provider
-
-    # Add namespace and table_id for managed versioning (external manifest store)
-    if managed_versioning and namespace is not None and table_id is not None:
-        params["namespace"] = namespace
+    # Add namespace_client and table_id for storage options provider and managed
+    # versioning. The storage options provider will be created automatically in Rust.
+    if namespace_client is not None and table_id is not None:
+        params["namespace_client"] = namespace_client
         params["table_id"] = table_id
+        params["namespace_client_managed_versioning"] = (
+            namespace_client_managed_versioning
+        )
 
     if commit_lock:
         if not callable(commit_lock):
@@ -6190,7 +6222,9 @@ def write_dataset(
 
     ds = LanceDataset.__new__(LanceDataset)
     ds._storage_options = storage_options
-    ds._storage_options_provider = None
+    ds._namespace_client = namespace_client
+    ds._table_id = table_id
+    ds._namespace_client_managed_versioning = namespace_client_managed_versioning
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
