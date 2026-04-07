@@ -24,8 +24,8 @@ use std::sync::Arc;
 use arrow_array::{FixedSizeListArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::ipc::{
-    read_ipc_stream, read_ipc_stream_single, read_len_prefixed_bytes, write_ipc_stream,
-    write_ipc_stream_batches, write_len_prefixed_bytes,
+    read_ipc_stream, read_ipc_stream_single, read_ipc_stream_to_bytes, read_len_prefixed_bytes,
+    write_ipc_stream, write_ipc_stream_batches, write_len_prefixed_bytes,
 };
 use lance_core::cache::CacheCodecImpl;
 use lance_core::{Error, Result};
@@ -164,6 +164,22 @@ fn read_json_header<T: serde::de::DeserializeOwned>(reader: &mut dyn Read) -> Re
     serde_json::from_slice(&bytes).map_err(|e| Error::io(e.to_string()))
 }
 
+/// Read one IPC stream from `reader` and return a single [`RecordBatch`].
+///
+/// Buffers the stream bytes into memory (one copy), then decodes zero-copy.
+fn read_single_batch(reader: &mut dyn Read) -> Result<RecordBatch> {
+    let bytes = read_ipc_stream_to_bytes(reader).map_err(|e| Error::io(e.to_string()))?;
+    read_ipc_stream_single(&bytes).map_err(|e| Error::io(e.to_string()))
+}
+
+/// Read one IPC stream from `reader` and return all [`RecordBatch`]es in it.
+///
+/// Buffers the stream bytes into memory (one copy), then decodes zero-copy.
+fn read_batches(reader: &mut dyn Read) -> Result<Vec<RecordBatch>> {
+    let bytes = read_ipc_stream_to_bytes(reader).map_err(|e| Error::io(e.to_string()))?;
+    read_ipc_stream(&bytes).map_err(|e| Error::io(e.to_string()))
+}
+
 /// Wrap a `FixedSizeListArray` in a single-column `RecordBatch` with the given
 /// column name.
 fn fsl_to_batch(arr: &FixedSizeListArray, name: &str) -> Result<RecordBatch> {
@@ -239,9 +255,9 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
         let header: PqPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_ipc_stream_single(reader)?;
-        let codebook_batch = read_ipc_stream_single(reader)?;
-        let storage_batch = read_ipc_stream_single(reader)?;
+        let sub_index_batch = read_single_batch(reader)?;
+        let codebook_batch = read_single_batch(reader)?;
+        let storage_batch = read_single_batch(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let codebook = batch_to_codebook(&codebook_batch)?;
@@ -298,8 +314,8 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
         let header: FlatPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_ipc_stream_single(reader)?;
-        let storage_batch = read_ipc_stream_single(reader)?;
+        let sub_index_batch = read_single_batch(reader)?;
+        let storage_batch = read_single_batch(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = FlatMetadata { dim: header.dim };
@@ -339,8 +355,8 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
         let header: FlatPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_ipc_stream_single(reader)?;
-        let storage_batch = read_ipc_stream_single(reader)?;
+        let sub_index_batch = read_single_batch(reader)?;
+        let storage_batch = read_single_batch(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = FlatMetadata { dim: header.dim };
@@ -393,8 +409,8 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
         let header: SqPartitionHeader = read_json_header(reader)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_ipc_stream_single(reader)?;
-        let storage_batches = read_ipc_stream(reader)?;
+        let sub_index_batch = read_single_batch(reader)?;
+        let storage_batches = read_batches(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = ScalarQuantizationMetadata {
@@ -467,16 +483,16 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
         let distance_type = u8_to_distance_type(header.distance_type)?;
         let rotation_type = u8_to_rotation_type(header.rotation_type)?;
 
-        let sub_index_batch = read_ipc_stream_single(reader)?;
+        let sub_index_batch = read_single_batch(reader)?;
 
         let rotate_mat = if rotation_type == RQRotationType::Matrix {
-            let mat_batch = read_ipc_stream_single(reader)?;
+            let mat_batch = read_single_batch(reader)?;
             Some(batch_to_fsl(&mat_batch)?)
         } else {
             None
         };
 
-        let storage_batch = read_ipc_stream_single(reader)?;
+        let storage_batch = read_single_batch(reader)?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = RabitQuantizationMetadata {

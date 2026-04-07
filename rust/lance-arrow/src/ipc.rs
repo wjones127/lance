@@ -13,22 +13,23 @@
 //!
 //! # Zero-copy reads
 //!
-//! [`read_ipc_stream`] and [`read_ipc_stream_single`] use [`FileDecoder`]
-//! rather than `StreamDecoder`, which lets Arrow reuse the per-message
-//! [`Buffer`] allocated during reading for the batch's array data. Each
-//! message is read into a fresh aligned [`MutableBuffer`]; the body data is
-//! not copied again during decoding.
+//! [`read_ipc_stream`] and [`read_ipc_stream_single`] take `&Bytes` and use
+//! [`Bytes::slice`] to produce each message buffer. Because `Bytes::slice`
+//! increments a reference count rather than copying, the resulting
+//! [`Buffer`]s — and the array data decoded from them by [`FileDecoder`] —
+//! are all backed by the same allocation as the input.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_buffer::{Buffer, MutableBuffer};
+use arrow_buffer::Buffer;
 use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::root_as_message;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::ArrowError;
+use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
 // Length-prefixed byte utilities
@@ -98,68 +99,70 @@ where
     sw.finish()
 }
 
-/// Read one complete Arrow IPC stream message from `reader` into a contiguous
-/// [`Buffer`].
+/// Read one complete Arrow IPC stream message from `data` as a zero-copy [`Buffer`].
 ///
-/// Returns `None` on EOS (size field == 0) or clean EOF. The returned buffer
-/// contains the raw message bytes in the same layout as written, suitable for
-/// passing to [`FileDecoder`] for zero-copy decoding.
-pub fn read_one_ipc_message(reader: &mut dyn Read) -> Result<Option<Buffer>, ArrowError> {
-    // Read the first 4 bytes: either a continuation marker or the size directly
-    // (legacy IPC format).
-    let mut first4 = [0u8; 4];
-    match reader.read_exact(&mut first4) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(ArrowError::IoError(e.to_string(), e)),
+/// Parses the first message starting at byte 0 of `data`. Returns `None` on
+/// EOS (size field == 0) or empty input. The returned [`Buffer`] is backed by
+/// `data`'s allocation — no bytes are copied.
+///
+/// The caller should advance its position by `buf.len()` after each call.
+pub fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
+    let bytes = data.as_ref();
+
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() < 4 {
+        return Err(ArrowError::IoError(
+            "IPC: truncated header".into(),
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated IPC header"),
+        ));
     }
 
-    let has_continuation = first4 == IPC_CONTINUATION;
-    let size_bytes: [u8; 4] = if has_continuation {
-        let mut sb = [0u8; 4];
-        reader
-            .read_exact(&mut sb)
-            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-        sb
+    let has_continuation = bytes[..4] == IPC_CONTINUATION;
+    let (size_bytes, prefix_len): ([u8; 4], usize) = if has_continuation {
+        if bytes.len() < 8 {
+            return Err(ArrowError::IoError(
+                "IPC: truncated header after continuation".into(),
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated after continuation",
+                ),
+            ));
+        }
+        (bytes[4..8].try_into().unwrap(), 8)
     } else {
-        first4
+        (bytes[..4].try_into().unwrap(), 4)
     };
-    let meta_size = u32::from_le_bytes(size_bytes) as usize;
 
+    let meta_size = u32::from_le_bytes(size_bytes) as usize;
     if meta_size == 0 {
         return Ok(None); // EOS
     }
 
-    let mut meta = vec![0u8; meta_size];
-    reader
-        .read_exact(&mut meta)
-        .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+    let meta_end = prefix_len + meta_size;
+    if bytes.len() < meta_end {
+        return Err(ArrowError::IoError(
+            "IPC: truncated metadata".into(),
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated IPC metadata"),
+        ));
+    }
 
-    let msg = root_as_message(&meta)
+    let msg = root_as_message(&bytes[prefix_len..meta_end])
         .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
     let body_len = msg.bodyLength() as usize;
 
-    // Build one contiguous buffer in the same layout as written.
-    // Use MutableBuffer (Arrow's 64-byte-aligned allocator) so that the body
-    // data is properly aligned for SIMD operations during decoding.
-    //   [continuation: 4 (if present)] [size: 4] [metadata: meta_size] [body: body_len]
-    let prefix_len = if has_continuation { 8 } else { 4 };
-    let total = prefix_len + meta_size + body_len;
-    let mut buf = MutableBuffer::from_len_zeroed(total);
-    if has_continuation {
-        buf[..4].copy_from_slice(&IPC_CONTINUATION);
-        buf[4..8].copy_from_slice(&size_bytes);
-    } else {
-        buf[..4].copy_from_slice(&size_bytes);
-    }
-    buf[prefix_len..prefix_len + meta_size].copy_from_slice(&meta);
-    if body_len > 0 {
-        reader
-            .read_exact(&mut buf[prefix_len + meta_size..])
-            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+    let total = meta_end + body_len;
+    if bytes.len() < total {
+        return Err(ArrowError::IoError(
+            "IPC: truncated body".into(),
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated IPC body"),
+        ));
     }
 
-    Ok(Some(buf.into()))
+    // Zero-copy: Bytes::slice shares the backing allocation; Buffer::from
+    // wraps it without copying.
+    Ok(Some(Buffer::from(data.slice(0..total))))
 }
 
 /// Extract the prefix length and metadata size from a raw IPC message buffer.
@@ -187,19 +190,21 @@ pub fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowErr
     }
 }
 
-/// Read all [`RecordBatch`]es from one Arrow IPC stream at the current reader
-/// position, until the EOS marker.
+/// Read all [`RecordBatch`]es from one Arrow IPC stream.
 ///
-/// Zero-copy: each batch's array data is backed by per-message [`Buffer`]s
-/// allocated during reading rather than copied into a central buffer.
+/// Zero-copy: each batch's array data buffers are borrowed from the input
+/// message buffer(s) and not copied during decoding.
 ///
 /// Uses [`FileDecoder`] directly (rather than `StreamDecoder`) to avoid a
 /// known edge case where `StreamDecoder` does not produce a batch for messages
 /// with a zero-length body when the message exactly fills the decode buffer.
-pub fn read_ipc_stream(reader: &mut dyn Read) -> Result<Vec<RecordBatch>, ArrowError> {
-    let schema_buf = read_one_ipc_message(reader)?.ok_or_else(|| {
+pub fn read_ipc_stream(data: &Bytes) -> Result<Vec<RecordBatch>, ArrowError> {
+    let mut offset = 0usize;
+
+    let schema_buf = read_one_ipc_message(&data.slice(offset..))?.ok_or_else(|| {
         ArrowError::ParseError("IPC stream: expected schema message, got EOS".into())
     })?;
+    offset += schema_buf.len();
 
     let (prefix_len, meta_size) = parse_ipc_message_prefix(&schema_buf)?;
     let schema_msg = root_as_message(&schema_buf[prefix_len..prefix_len + meta_size])
@@ -212,9 +217,10 @@ pub fn read_ipc_stream(reader: &mut dyn Read) -> Result<Vec<RecordBatch>, ArrowE
     let mut batches = Vec::new();
 
     loop {
-        let Some(buf) = read_one_ipc_message(reader)? else {
+        let Some(buf) = read_one_ipc_message(&data.slice(offset..))? else {
             break;
         };
+        offset += buf.len();
 
         let (prefix_len, meta_size) = parse_ipc_message_prefix(&buf)?;
         let msg = root_as_message(&buf[prefix_len..prefix_len + meta_size])
@@ -242,12 +248,119 @@ pub fn read_ipc_stream(reader: &mut dyn Read) -> Result<Vec<RecordBatch>, ArrowE
 }
 
 /// Read exactly one [`RecordBatch`] from one Arrow IPC stream.
-pub fn read_ipc_stream_single(reader: &mut dyn Read) -> Result<RecordBatch, ArrowError> {
-    let mut batches = read_ipc_stream(reader)?;
+pub fn read_ipc_stream_single(data: &Bytes) -> Result<RecordBatch, ArrowError> {
+    let mut batches = read_ipc_stream(data)?;
     match batches.len() {
         1 => Ok(batches.remove(0)),
         n => Err(ArrowError::ParseError(format!(
             "expected exactly 1 IPC record batch, got {n}"
         ))),
+    }
+}
+
+/// Read one complete Arrow IPC stream from a [`Read`] source into a [`Bytes`].
+///
+/// Reads messages one at a time (one copy into memory) until the EOS marker,
+/// then returns all consumed bytes as a `Bytes`. The result can be passed to
+/// [`read_ipc_stream`] or [`read_ipc_stream_single`] for zero-copy decoding.
+///
+/// Use this when the data is arriving from a streaming source (`dyn Read`)
+/// rather than being already available as a `Bytes`.
+pub fn read_ipc_stream_to_bytes(reader: &mut dyn Read) -> Result<Bytes, ArrowError> {
+    let mut buf = Vec::new();
+
+    loop {
+        let mut first4 = [0u8; 4];
+        match reader.read_exact(&mut first4) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(ArrowError::IoError(e.to_string(), e)),
+        }
+        buf.extend_from_slice(&first4);
+
+        let has_continuation = first4 == IPC_CONTINUATION;
+        let size_bytes: [u8; 4] = if has_continuation {
+            let mut sb = [0u8; 4];
+            reader
+                .read_exact(&mut sb)
+                .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+            buf.extend_from_slice(&sb);
+            sb
+        } else {
+            first4
+        };
+
+        let meta_size = u32::from_le_bytes(size_bytes) as usize;
+        if meta_size == 0 {
+            // EOS marker — already appended; stream is complete.
+            break;
+        }
+
+        let meta_start = buf.len();
+        buf.resize(meta_start + meta_size, 0);
+        reader
+            .read_exact(&mut buf[meta_start..])
+            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+
+        let msg = root_as_message(&buf[meta_start..])
+            .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
+        let body_len = msg.bodyLength() as usize;
+
+        if body_len > 0 {
+            let body_start = buf.len();
+            buf.resize(body_start + body_len, 0);
+            reader
+                .read_exact(&mut buf[body_start..])
+                .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
+        }
+    }
+
+    Ok(Bytes::from(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, record_batch};
+
+    use super::*;
+
+    #[test]
+    fn test_ipc_roundtrip() {
+        let batch1 = record_batch!(
+            ("int", Int32, [1, 2, 3]),
+            ("str", Utf8, ["foo", "bar", "baz"])
+        )
+        .unwrap();
+        let batch2 = record_batch!(("int", Int32, [4, 5]), ("str", Utf8, ["qux", "quux"])).unwrap();
+        let batches = vec![batch1.clone(), batch2.clone()];
+
+        let mut buf = Vec::new();
+        write_ipc_stream_batches(batches.clone(), &mut buf).unwrap();
+
+        let data = Bytes::from(buf);
+
+        let batches = read_ipc_stream(&data).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], batch1);
+        assert_eq!(batches[1], batch2);
+
+        let data_base = data.as_ptr() as usize;
+        let data_end = data_base + data.len();
+        let assert_col_zero_copy = |array: &ArrayRef| {
+            for buffer in array.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= data_base && ptr < data_end,
+                    "buffer at {ptr:#x} is not backed by the input Bytes allocation \
+                     [{data_base:#x}..{data_end:#x})"
+                );
+            }
+        };
+
+        for batch in &batches {
+            assert_eq!(batch.schema(), batch1.schema());
+            assert_col_zero_copy(batch.column(0));
+            assert_col_zero_copy(batch.column(1));
+        }
     }
 }
