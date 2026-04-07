@@ -358,66 +358,6 @@ pub fn read_ipc_stream_single(data: &Bytes) -> Result<RecordBatch, ArrowError> {
     }
 }
 
-/// Read one complete Arrow IPC stream from a [`Read`] source into a [`Bytes`].
-///
-/// Reads messages one at a time (one copy into memory) until the EOS marker,
-/// then returns all consumed bytes as a `Bytes`. The result can be passed to
-/// [`read_ipc_stream`] or [`read_ipc_stream_single`] for zero-copy decoding.
-///
-/// Use this when the data is arriving from a streaming source (`dyn Read`)
-/// rather than being already available as a `Bytes`.
-pub fn read_ipc_stream_to_bytes(reader: &mut dyn Read) -> Result<Bytes, ArrowError> {
-    let mut buf = Vec::new();
-
-    loop {
-        let mut first4 = [0u8; 4];
-        match reader.read_exact(&mut first4) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(ArrowError::IoError(e.to_string(), e)),
-        }
-        buf.extend_from_slice(&first4);
-
-        let has_continuation = first4 == IPC_CONTINUATION;
-        let size_bytes: [u8; 4] = if has_continuation {
-            let mut sb = [0u8; 4];
-            reader
-                .read_exact(&mut sb)
-                .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-            buf.extend_from_slice(&sb);
-            sb
-        } else {
-            first4
-        };
-
-        let meta_size = u32::from_le_bytes(size_bytes) as usize;
-        if meta_size == 0 {
-            // EOS marker — already appended; stream is complete.
-            break;
-        }
-
-        let meta_start = buf.len();
-        buf.resize(meta_start + meta_size, 0);
-        reader
-            .read_exact(&mut buf[meta_start..])
-            .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-
-        let msg = root_as_message(&buf[meta_start..])
-            .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
-        let body_len = msg.bodyLength() as usize;
-
-        if body_len > 0 {
-            let body_start = buf.len();
-            buf.resize(body_start + body_len, 0);
-            reader
-                .read_exact(&mut buf[body_start..])
-                .map_err(|e| ArrowError::IoError(e.to_string(), e))?;
-        }
-    }
-
-    Ok(Bytes::from(buf))
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, record_batch};
