@@ -18,7 +18,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
-use futures::{FutureExt as _, StreamExt, TryFutureExt};
+use futures::{StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
@@ -224,7 +224,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 serde_json::from_str(&header.quantizer_metadata_json)
                     .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
             if !extra_bytes.is_empty() {
-                metadata.parse_buffer(extra_bytes.into())?;
+                metadata.parse_buffer(extra_bytes)?;
             }
             Ok(IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
                 index_file_path: header.index_file_path,
@@ -353,10 +353,6 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                     )
                     .await
                 }
-                _ => Err(Error::index(format!(
-                    "unsupported sub-index type for reconstruction: {}",
-                    self.sub_index_type
-                ))),
             }
         })
     }
@@ -637,7 +633,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             )
             .await;
 
-        let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),

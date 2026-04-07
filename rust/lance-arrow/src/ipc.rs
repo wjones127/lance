@@ -106,7 +106,7 @@ where
 /// `data`'s allocation — no bytes are copied.
 ///
 /// The caller should advance its position by `buf.len()` after each call.
-pub fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
+fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
     let bytes = data.as_ref();
 
     if bytes.is_empty() {
@@ -269,7 +269,7 @@ pub fn read_ipc_stream_single_at(
 ///
 /// Modern IPC streams have an 8-byte prefix `[continuation: 4][size: 4]`.
 /// Legacy streams have a 4-byte prefix `[size: 4]`. Returns `(prefix_len, meta_size)`.
-pub fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowError> {
+fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowError> {
     let has_continuation = buf.len() >= 4 && buf[..4] == [0xff; 4];
     if has_continuation {
         if buf.len() < 8 {
@@ -375,7 +375,7 @@ mod tests {
         let batches = vec![batch1.clone(), batch2.clone()];
 
         let mut buf = Vec::new();
-        write_ipc_stream_batches(batches.clone(), &mut buf).unwrap();
+        write_ipc_stream_batches(batches, &mut buf).unwrap();
 
         let data = Bytes::from(buf);
 
