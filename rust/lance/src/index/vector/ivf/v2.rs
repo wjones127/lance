@@ -390,12 +390,15 @@ struct CachedIndexReaders {
 }
 
 impl deepsize::DeepSizeOf for CachedIndexReaders {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        // Intentionally 0: FileReader shares CachedFileMetadata with the
-        // FileMetadataCacheKey entry, so reporting its full size would
-        // double-count. This violates the no-shared-data rule but is
-        // acceptable as a temporary simplification.
-        0
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        // FileReader doesn't impl DeepSizeOf. We approximate by counting the
+        // fixed struct size for each reader plus the Arc<CachedFileMetadata>
+        // heap contents. The metadata Arcs are also held by FileMetadataCacheKey
+        // entries, so this may over-count across cache entries, but
+        // over-counting is safer than under-counting for eviction purposes.
+        std::mem::size_of::<FileReader>() * 2
+            + self.index_reader.metadata().deep_size_of_children(context)
+            + self.aux_reader.metadata().deep_size_of_children(context)
     }
 }
 
@@ -422,11 +425,9 @@ async fn open_reader_cached(
     known_file_size: u64,
 ) -> Result<FileReader> {
     let file_cache = cache.with_key_prefix(path.as_ref());
-    let cached_size = if known_file_size > 0 {
-        CachedFileSize::new(known_file_size)
-    } else {
-        CachedFileSize::unknown()
-    };
+    // CachedFileSize::new(0) == CachedFileSize::unknown(); passing the raw
+    // hint directly is safe — the type already encodes 0 as "unknown".
+    let cached_size = CachedFileSize::new(known_file_size);
 
     if let Some(cached_meta) = file_cache.get_with_key(&FileMetadataCacheKey).await {
         let file_scheduler = scheduler.open_file(path, &cached_size).await?;
