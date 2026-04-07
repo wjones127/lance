@@ -3,7 +3,7 @@
 
 //! IVF - Inverted File index.
 
-use std::io::{Read as IoRead, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::marker::PhantomData;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{FutureExt as _, StreamExt, TryFutureExt};
 use lance_arrow::RecordBatchExt;
-use lance_arrow::ipc::{read_len_prefixed_bytes, write_len_prefixed_bytes};
+use lance_arrow::ipc::write_len_prefixed_bytes;
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -172,39 +172,33 @@ impl CacheCodecImpl for IvfStateEntryBox {
         self.0.serialize_state(writer)
     }
 
-    fn deserialize(reader: &mut dyn IoRead) -> Result<Self> {
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        use lance_arrow::ipc::read_len_prefixed_bytes_at;
+
         // Parse the common wire format, then dispatch on quantization_type to
         // construct the right IvfIndexState<Q>.
-        let header_bytes = read_len_prefixed_bytes(reader)?;
+        let mut offset = 0;
+        let header_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
         let header: IvfIndexStateHeader = serde_json::from_slice(&header_bytes)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState header: {e}")))?;
 
-        let ivf_bytes = read_len_prefixed_bytes(reader)?;
+        let ivf_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
         let ivf = IvfModel::try_from(
-            pb::Ivf::decode(ivf_bytes.as_slice())
+            pb::Ivf::decode(ivf_bytes.as_ref())
                 .map_err(|e| lance_core::Error::io(format!("IvfIndexState IVF decode: {e}")))?,
         )?;
 
-        let extra_bytes = read_len_prefixed_bytes(reader)?;
+        let extra_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
 
-        // aux_ivf was added after initial deployment; fall back to ivf only on
-        // clean EOF (legacy format), not on real I/O errors.
-        let aux_ivf = {
-            let mut buf = [0u8; 8];
-            match reader.read_exact(&mut buf) {
-                Ok(()) => {
-                    let aux_ivf_len = u64::from_le_bytes(buf) as usize;
-                    let mut aux_ivf_bytes = vec![0u8; aux_ivf_len];
-                    reader
-                        .read_exact(&mut aux_ivf_bytes)
-                        .map_err(|e| lance_core::Error::io(e.to_string()))?;
-                    IvfModel::try_from(pb::Ivf::decode(aux_ivf_bytes.as_slice()).map_err(|e| {
-                        lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
-                    })?)?
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => ivf.clone(),
-                Err(e) => return Err(lance_core::Error::io(e.to_string())),
-            }
+        // aux_ivf was added after initial deployment; fall back to ivf on
+        // clean EOF (legacy format without the field).
+        let aux_ivf = if offset + 8 <= data.len() {
+            let aux_ivf_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+            IvfModel::try_from(pb::Ivf::decode(aux_ivf_bytes.as_ref()).map_err(|e| {
+                lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
+            })?)?
+        } else {
+            ivf.clone()
         };
 
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
@@ -217,7 +211,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
             header: IvfIndexStateHeader,
             ivf: IvfModel,
             aux_ivf: IvfModel,
-            extra_bytes: Vec<u8>,
+            extra_bytes: bytes::Bytes,
             distance_type: DistanceType,
             sub_index_type: SubIndexType,
             quantization_type: QuantizationType,
@@ -4922,7 +4916,7 @@ mod tests {
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
                 return Some(
                     stored_codec
-                        .deserialize(&mut bytes.as_slice())
+                        .deserialize(&bytes::Bytes::copy_from_slice(bytes))
                         .expect("deserialization should succeed"),
                 );
             }

@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::Result;
 
 // ---------------------------------------------------------------------------
@@ -26,7 +28,7 @@ use crate::Result;
 /// ```ignore
 /// impl CacheCodecImpl for MyData {
 ///     fn serialize(&self, w: &mut dyn Write) -> Result<()> { /* ... */ }
-///     fn deserialize(r: &mut dyn Read) -> Result<Self> { /* ... */ }
+///     fn deserialize(data: &Bytes) -> Result<Self> { /* ... */ }
 /// }
 ///
 /// impl CacheKey for MyDataKey {
@@ -40,7 +42,7 @@ use crate::Result;
 pub trait CacheCodecImpl: Send + Sync {
     fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()>;
 
-    fn deserialize(reader: &mut dyn std::io::Read) -> Result<Self>
+    fn deserialize(data: &Bytes) -> Result<Self>
     where
         Self: Sized;
 }
@@ -60,7 +62,7 @@ pub(crate) type ArcAny = Arc<dyn std::any::Any + Send + Sync>;
 #[derive(Copy, Clone)]
 pub struct CacheCodec {
     pub(crate) serialize: fn(&ArcAny, &mut dyn std::io::Write) -> Result<()>,
-    pub(crate) deserialize: fn(&mut dyn std::io::Read) -> Result<ArcAny>,
+    pub(crate) deserialize: fn(&Bytes) -> Result<ArcAny>,
 }
 
 impl std::fmt::Debug for CacheCodec {
@@ -79,10 +81,8 @@ fn serialize_via_impl<T: CacheCodecImpl + 'static>(
     val.serialize(writer)
 }
 
-fn deserialize_via_impl<T: CacheCodecImpl + 'static>(
-    reader: &mut dyn std::io::Read,
-) -> Result<ArcAny> {
-    let val = T::deserialize(reader)?;
+fn deserialize_via_impl<T: CacheCodecImpl + 'static>(data: &Bytes) -> Result<ArcAny> {
+    let val = T::deserialize(data)?;
     Ok(Arc::new(val) as ArcAny)
 }
 
@@ -94,7 +94,7 @@ impl CacheCodec {
     /// possible (e.g. orphan rule prevents it).
     pub fn new(
         serialize: fn(&ArcAny, &mut dyn std::io::Write) -> Result<()>,
-        deserialize: fn(&mut dyn std::io::Read) -> Result<ArcAny>,
+        deserialize: fn(&Bytes) -> Result<ArcAny>,
     ) -> Self {
         Self {
             serialize,
@@ -118,7 +118,7 @@ impl CacheCodec {
         (self.serialize)(value, writer)
     }
 
-    pub fn deserialize(&self, reader: &mut dyn std::io::Read) -> Result<ArcAny> {
-        (self.deserialize)(reader)
+    pub fn deserialize(&self, data: &Bytes) -> Result<ArcAny> {
+        (self.deserialize)(data)
     }
 }

@@ -18,14 +18,15 @@
 //! deserialization, each message is read into a per-message buffer and zero-copy
 //! decoded via [`lance_arrow::ipc`].
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use bytes::Bytes;
 use lance_arrow::ipc::{
-    read_ipc_stream, read_ipc_stream_single, read_ipc_stream_to_bytes, read_len_prefixed_bytes,
-    write_ipc_stream, write_ipc_stream_batches, write_len_prefixed_bytes,
+    read_ipc_stream_at, read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
+    write_ipc_stream_batches, write_len_prefixed_bytes,
 };
 use lance_core::cache::CacheCodecImpl;
 use lance_core::{Error, Result};
@@ -80,14 +81,14 @@ where
     concrete.serialize(writer)
 }
 
-fn deserialize_partition_entry<S, Q, Concrete>(reader: &mut dyn Read) -> lance_core::Result<ArcAny>
+fn deserialize_partition_entry<S, Q, Concrete>(data: &Bytes) -> lance_core::Result<ArcAny>
 where
     S: IvfSubIndex + 'static,
     Q: Quantization + 'static,
     Concrete: Quantization + 'static,
     PartitionEntry<S, Concrete>: CacheCodecImpl,
 {
-    let concrete = PartitionEntry::<S, Concrete>::deserialize(reader)?;
+    let concrete = PartitionEntry::<S, Concrete>::deserialize(data)?;
     let any: ArcAny = Arc::new(concrete);
     Ok(any
         .downcast::<PartitionEntry<S, Q>>()
@@ -159,25 +160,9 @@ fn write_json_header(writer: &mut dyn Write, header: &impl Serialize) -> Result<
 }
 
 /// Read a JSON header written by [`write_json_header`].
-fn read_json_header<T: serde::de::DeserializeOwned>(reader: &mut dyn Read) -> Result<T> {
-    let bytes = read_len_prefixed_bytes(reader)?;
+fn read_json_header<T: serde::de::DeserializeOwned>(data: &Bytes, offset: &mut usize) -> Result<T> {
+    let bytes = read_len_prefixed_bytes_at(data, offset).map_err(|e| Error::io(e.to_string()))?;
     serde_json::from_slice(&bytes).map_err(|e| Error::io(e.to_string()))
-}
-
-/// Read one IPC stream from `reader` and return a single [`RecordBatch`].
-///
-/// Buffers the stream bytes into memory (one copy), then decodes zero-copy.
-fn read_single_batch(reader: &mut dyn Read) -> Result<RecordBatch> {
-    let bytes = read_ipc_stream_to_bytes(reader).map_err(|e| Error::io(e.to_string()))?;
-    read_ipc_stream_single(&bytes).map_err(|e| Error::io(e.to_string()))
-}
-
-/// Read one IPC stream from `reader` and return all [`RecordBatch`]es in it.
-///
-/// Buffers the stream bytes into memory (one copy), then decodes zero-copy.
-fn read_batches(reader: &mut dyn Read) -> Result<Vec<RecordBatch>> {
-    let bytes = read_ipc_stream_to_bytes(reader).map_err(|e| Error::io(e.to_string()))?;
-    read_ipc_stream(&bytes).map_err(|e| Error::io(e.to_string()))
 }
 
 /// Wrap a `FixedSizeListArray` in a single-column `RecordBatch` with the given
@@ -251,13 +236,17 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
         Ok(())
     }
 
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let header: PqPartitionHeader = read_json_header(reader)?;
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header: PqPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_single_batch(reader)?;
-        let codebook_batch = read_single_batch(reader)?;
-        let storage_batch = read_single_batch(reader)?;
+        let sub_index_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
+        let codebook_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
+        let storage_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let index = S::load(sub_index_batch)?;
         let codebook = batch_to_codebook(&codebook_batch)?;
@@ -310,12 +299,15 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
         Ok(())
     }
 
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let header: FlatPartitionHeader = read_json_header(reader)?;
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header: FlatPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_single_batch(reader)?;
-        let storage_batch = read_single_batch(reader)?;
+        let sub_index_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
+        let storage_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = FlatMetadata { dim: header.dim };
@@ -351,12 +343,15 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
         Ok(())
     }
 
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let header: FlatPartitionHeader = read_json_header(reader)?;
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header: FlatPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_single_batch(reader)?;
-        let storage_batch = read_single_batch(reader)?;
+        let sub_index_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
+        let storage_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = FlatMetadata { dim: header.dim };
@@ -405,12 +400,15 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
         Ok(())
     }
 
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let header: SqPartitionHeader = read_json_header(reader)?;
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header: SqPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
 
-        let sub_index_batch = read_single_batch(reader)?;
-        let storage_batches = read_batches(reader)?;
+        let sub_index_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
+        let storage_batches =
+            read_ipc_stream_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = ScalarQuantizationMetadata {
@@ -478,21 +476,25 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
         Ok(())
     }
 
-    fn deserialize(reader: &mut dyn Read) -> Result<Self> {
-        let header: RabitPartitionHeader = read_json_header(reader)?;
+    fn deserialize(data: &Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header: RabitPartitionHeader = read_json_header(data, &mut offset)?;
         let distance_type = u8_to_distance_type(header.distance_type)?;
         let rotation_type = u8_to_rotation_type(header.rotation_type)?;
 
-        let sub_index_batch = read_single_batch(reader)?;
+        let sub_index_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let rotate_mat = if rotation_type == RQRotationType::Matrix {
-            let mat_batch = read_single_batch(reader)?;
+            let mat_batch = read_ipc_stream_single_at(data, &mut offset)
+                .map_err(|e| Error::io(e.to_string()))?;
             Some(batch_to_fsl(&mat_batch)?)
         } else {
             None
         };
 
-        let storage_batch = read_single_batch(reader)?;
+        let storage_batch =
+            read_ipc_stream_single_at(data, &mut offset).map_err(|e| Error::io(e.to_string()))?;
 
         let index = S::load(sub_index_batch)?;
         let metadata = RabitQuantizationMetadata {
@@ -523,7 +525,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
@@ -610,7 +612,7 @@ mod tests {
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
         let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
-            &mut Cursor::new(serialized),
+            &bytes::Bytes::from(serialized),
         )
         .unwrap();
 
@@ -662,9 +664,10 @@ mod tests {
 
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&mut Cursor::new(bytes))
-                    .unwrap();
+            let restored = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
+                &bytes::Bytes::from(bytes),
+            )
+            .unwrap();
             assert_eq!(
                 restored.storage.distance_type(),
                 entry.storage.distance_type()
@@ -685,7 +688,7 @@ mod tests {
         let mut serialized = Vec::new();
         entry.serialize(&mut serialized).unwrap();
         let deserialized = PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(
-            &mut Cursor::new(serialized),
+            &bytes::Bytes::from(serialized),
         )
         .unwrap();
         assert_eq!(entry.storage, deserialized.storage);
@@ -704,7 +707,7 @@ mod tests {
         entry.serialize(&mut bytes).unwrap();
         bytes.truncate(3);
         assert!(
-            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&mut Cursor::new(bytes))
+            PartitionEntry::<FlatIndex, ProductQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                 .is_err()
         );
     }
@@ -731,7 +734,7 @@ mod tests {
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
         let restored =
-            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&mut Cursor::new(bytes))
+            PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                 .unwrap();
 
         assert_eq!(
@@ -761,7 +764,7 @@ mod tests {
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
             let restored =
-                PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&mut Cursor::new(bytes))
+                PartitionEntry::<FlatIndex, FlatQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                     .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
@@ -809,7 +812,7 @@ mod tests {
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
         let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                 .unwrap();
 
         let m = entry.storage.metadata();
@@ -838,9 +841,10 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
-                    .unwrap();
+            let restored = PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(
+                &bytes::Bytes::from(bytes),
+            )
+            .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
@@ -884,7 +888,7 @@ mod tests {
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
         let restored =
-            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&mut Cursor::new(bytes))
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                 .unwrap();
 
         assert_eq!(restored.storage.len(), 30);
@@ -968,7 +972,7 @@ mod tests {
         let mut bytes = Vec::new();
         entry.serialize(&mut bytes).unwrap();
         let restored =
-            PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&mut Cursor::new(bytes))
+            PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&bytes::Bytes::from(bytes))
                 .unwrap();
 
         let m = entry.storage.metadata();
@@ -1008,16 +1012,17 @@ mod tests {
             };
             let mut bytes = Vec::new();
             entry.serialize(&mut bytes).unwrap();
-            let restored =
-                PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(&mut Cursor::new(bytes))
-                    .unwrap();
+            let restored = PartitionEntry::<FlatIndex, RabitQuantizer>::deserialize(
+                &bytes::Bytes::from(bytes),
+            )
+            .unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
         }
     }
 
     #[test]
     fn test_ivf_index_state_roundtrip() {
-        use crate::index::vector::ivf::v2::{IvfIndexState, IvfStateEntry, IvfStateEntryBox};
+        use crate::index::vector::ivf::v2::{IvfIndexState, IvfStateEntryBox};
         use lance_index::vector::flat::index::FlatQuantizer;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::quantizer::QuantizationType;
@@ -1050,7 +1055,7 @@ mod tests {
         CacheCodecImpl::serialize(&entry, &mut bytes).unwrap();
 
         let restored =
-            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&mut Cursor::new(bytes)).unwrap();
+            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&bytes::Bytes::from(bytes)).unwrap();
         let restored = restored
             .0
             .as_any()

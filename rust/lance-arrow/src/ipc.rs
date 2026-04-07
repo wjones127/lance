@@ -165,6 +165,106 @@ pub fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> 
     Ok(Some(Buffer::from(data.slice(0..total))))
 }
 
+/// Read a length-prefixed byte slice at `offset` in `data`, advancing `offset`.
+///
+/// Reads an 8-byte little-endian length, then slices exactly that many bytes
+/// from `data`. The returned [`Bytes`] is zero-copy (shares `data`'s allocation).
+pub fn read_len_prefixed_bytes_at(data: &Bytes, offset: &mut usize) -> Result<Bytes, ArrowError> {
+    let bytes = data.as_ref();
+    let len_end = offset
+        .checked_add(8)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| {
+            ArrowError::IoError(
+                "length-prefixed bytes: truncated length field".into(),
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated length"),
+            )
+        })?;
+    let len = u64::from_le_bytes(bytes[*offset..len_end].try_into().unwrap()) as usize;
+    *offset = len_end;
+    let data_end = offset
+        .checked_add(len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| {
+            ArrowError::IoError(
+                "length-prefixed bytes: truncated data".into(),
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated data"),
+            )
+        })?;
+    let result = data.slice(*offset..data_end);
+    *offset = data_end;
+    Ok(result)
+}
+
+/// Read all [`RecordBatch`]es from one Arrow IPC stream starting at `offset`,
+/// advancing `offset` past the stream (including the EOS marker).
+///
+/// Zero-copy: array buffers borrow from `data`'s allocation.
+pub fn read_ipc_stream_at(
+    data: &Bytes,
+    offset: &mut usize,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let batches = read_ipc_stream(&data.slice(*offset..))?;
+
+    // Recompute how many bytes were consumed by re-parsing message sizes.
+    // We can't get this from read_ipc_stream directly, so we re-walk the
+    // message headers (metadata only, no body re-read) to sum up lengths.
+    let slice = &data.as_ref()[*offset..];
+    let mut consumed = 0usize;
+    loop {
+        let rem = &slice[consumed..];
+        if rem.is_empty() {
+            break;
+        }
+        let has_cont = rem.len() >= 4 && rem[..4] == IPC_CONTINUATION;
+        let (size_bytes, prefix_len): ([u8; 4], usize) = if has_cont {
+            if rem.len() < 8 {
+                break;
+            }
+            (rem[4..8].try_into().unwrap(), 8)
+        } else {
+            if rem.len() < 4 {
+                break;
+            }
+            (rem[..4].try_into().unwrap(), 4)
+        };
+        let meta_size = u32::from_le_bytes(size_bytes) as usize;
+        if meta_size == 0 {
+            // EOS — consume it and stop.
+            consumed += prefix_len;
+            break;
+        }
+        let meta_end = prefix_len + meta_size;
+        if rem.len() < meta_end {
+            break;
+        }
+        let msg = root_as_message(&rem[prefix_len..meta_end])
+            .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
+        let body_len = msg.bodyLength() as usize;
+        consumed += meta_end + body_len;
+    }
+    *offset += consumed;
+
+    Ok(batches)
+}
+
+/// Read exactly one [`RecordBatch`] from one Arrow IPC stream starting at `offset`,
+/// advancing `offset` past the stream (including the EOS marker).
+///
+/// Zero-copy: array buffers borrow from `data`'s allocation.
+pub fn read_ipc_stream_single_at(
+    data: &Bytes,
+    offset: &mut usize,
+) -> Result<RecordBatch, ArrowError> {
+    let mut batches = read_ipc_stream_at(data, offset)?;
+    match batches.len() {
+        1 => Ok(batches.remove(0)),
+        n => Err(ArrowError::ParseError(format!(
+            "expected exactly 1 IPC record batch, got {n}"
+        ))),
+    }
+}
+
 /// Extract the prefix length and metadata size from a raw IPC message buffer.
 ///
 /// Modern IPC streams have an 8-byte prefix `[continuation: 4][size: 4]`.

@@ -15,7 +15,7 @@
 //! ```ignore
 //! impl CacheCodecImpl for MyData {
 //!     fn serialize(&self, w: &mut dyn Write) -> Result<()> { /* ... */ }
-//!     fn deserialize(r: &mut dyn Read) -> Result<Self> { /* ... */ }
+//!     fn deserialize(data: &Bytes) -> Result<Self> { /* ... */ }
 //! }
 //!
 //! impl CacheKey for MyDataKey {

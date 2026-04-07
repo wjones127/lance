@@ -250,11 +250,9 @@ fn serialize_index_metadata(
     Ok(())
 }
 
-fn deserialize_index_metadata(reader: &mut dyn std::io::Read) -> lance_core::Result<ArcAny> {
+fn deserialize_index_metadata(data: &bytes::Bytes) -> lance_core::Result<ArcAny> {
     use prost::Message;
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-    let section = pb::IndexSection::decode(bytes.as_slice())?;
+    let section = pb::IndexSection::decode(data.as_ref())?;
     let indices: Vec<IndexMetadata> = section
         .indices
         .into_iter()
@@ -348,7 +346,9 @@ mod tests {
 
         // Deserialize from the store
         let bytes = store.get(&key).unwrap();
-        let recovered = codec.deserialize(&mut bytes.as_slice()).unwrap();
+        let recovered = codec
+            .deserialize(&bytes::Bytes::copy_from_slice(bytes))
+            .unwrap();
         let recovered = recovered
             .downcast::<Vec<IndexMetadata>>()
             .expect("downcast should succeed");
