@@ -394,7 +394,7 @@ pub(crate) async fn optimize_vector_indices(
             .segments()
             .next()
             .and_then(|(meta, _)| meta.index_details.as_deref())
-            .and_then(|d| vector_params_from_details(d))
+            .and_then(vector_params_from_details)
             .map(|p| p.skip_transpose)
             .unwrap_or(false);
         return optimize_vector_indices_v2(
