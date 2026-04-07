@@ -1001,7 +1001,8 @@ mod tests {
 
     #[test]
     fn test_ivf_index_state_roundtrip() {
-        use crate::index::vector::ivf::v2::IvfIndexState;
+        use crate::index::vector::ivf::v2::{IvfIndexState, IvfStateEntry, IvfStateEntryBox};
+        use lance_index::vector::flat::index::FlatQuantizer;
         use lance_index::vector::ivf::storage::IvfModel;
         use lance_index::vector::quantizer::QuantizationType;
         use lance_index::vector::v3::subindex::SubIndexType;
@@ -1012,38 +1013,47 @@ mod tests {
                 .unwrap();
         let ivf = IvfModel::new(centroids, None);
 
-        let state = IvfIndexState {
+        let state = IvfIndexState::<FlatQuantizer> {
             index_file_path: "my/index.lance".to_string(),
             uuid: "test-uuid-1234".to_string(),
             ivf: ivf.clone(),
             aux_ivf: ivf,
             distance_type: DistanceType::L2,
             sub_index_metadata: vec!["meta1".to_string()],
-            quantizer_metadata_json: r#"{"nbits":8}"#.to_string(),
-            quantizer_extra_data: Some(vec![1, 2, 3, 4]),
+            metadata: lance_index::vector::flat::index::FlatMetadata { dim: 2 },
             sub_index_type: SubIndexType::Flat,
-            quantization_type: QuantizationType::Product,
+            quantization_type: QuantizationType::Flat,
             cache_key_prefix: "prefix/".to_string(),
             index_file_size: 1024,
             aux_file_size: 512,
         };
 
+        let entry = IvfStateEntryBox(Arc::new(state));
+
         let mut bytes = Vec::new();
-        CacheCodecImpl::serialize(&state, &mut bytes).unwrap();
+        CacheCodecImpl::serialize(&entry, &mut bytes).unwrap();
 
         let restored =
-            <IvfIndexState as CacheCodecImpl>::deserialize(&mut Cursor::new(bytes)).unwrap();
-        assert_eq!(restored.index_file_path, state.index_file_path);
-        assert_eq!(restored.uuid, state.uuid);
-        assert_eq!(restored.distance_type, state.distance_type);
-        assert_eq!(restored.sub_index_metadata, state.sub_index_metadata);
+            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&mut Cursor::new(bytes)).unwrap();
+        let restored = restored
+            .0
+            .as_any()
+            .downcast_ref::<IvfIndexState<FlatQuantizer>>()
+            .expect("expected IvfIndexState<FlatQuantizer>");
         assert_eq!(
-            restored.quantizer_metadata_json,
-            state.quantizer_metadata_json
+            restored.index_file_path,
+            entry
+                .0
+                .as_any()
+                .downcast_ref::<IvfIndexState<FlatQuantizer>>()
+                .unwrap()
+                .index_file_path
         );
-        assert_eq!(restored.quantizer_extra_data, state.quantizer_extra_data);
-        assert_eq!(restored.cache_key_prefix, state.cache_key_prefix);
-        assert_eq!(restored.index_file_size, state.index_file_size);
-        assert_eq!(restored.aux_file_size, state.aux_file_size);
+        assert_eq!(restored.uuid, "test-uuid-1234");
+        assert_eq!(restored.distance_type, DistanceType::L2);
+        assert_eq!(restored.sub_index_metadata, vec!["meta1".to_string()]);
+        assert_eq!(restored.cache_key_prefix, "prefix/");
+        assert_eq!(restored.index_file_size, 1024);
+        assert_eq!(restored.aux_file_size, 512);
     }
 }

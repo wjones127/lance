@@ -64,7 +64,7 @@ use scalar::index_matches_criteria;
 use serde_json::json;
 use tracing::{info, instrument};
 use uuid::Uuid;
-use vector::ivf::v2::{IVFIndex, IvfIndexState};
+use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -226,7 +226,7 @@ impl<'a> IvfIndexStateCacheKey<'a> {
 }
 
 impl CacheKey for IvfIndexStateCacheKey<'_> {
-    type ValueType = IvfIndexState;
+    type ValueType = IvfStateEntryBox;
 
     fn type_name() -> &'static str {
         "IvfIndexState"
@@ -241,7 +241,7 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_core::cache::CacheCodec::from_impl::<IvfIndexState>())
+        Some(lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>())
     }
 }
 
@@ -1522,16 +1522,17 @@ impl DatasetIndexInternalExt for Dataset {
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(state) = self.index_cache.get_with_key(&state_key).await {
+        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
-            return vector::ivf::v2::reconstruct_vector_index(
-                state.as_ref().clone(),
-                self.object_store.clone(),
-                self.metadata_cache.as_ref(),
-                partition_cache,
-            )
-            .await;
+            return entry
+                .0
+                .reconstruct(
+                    self.object_store.clone(),
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                )
+                .await;
         }
 
         // Fallback: in-memory cache for legacy indices.
@@ -1558,14 +1559,14 @@ impl DatasetIndexInternalExt for Dataset {
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             ivf: IVFIndex<S, Q>,
-        ) -> (Arc<dyn VectorIndex>, Option<IvfIndexState>) {
-            let state = ivf.to_ivf_index_state();
-            (Arc::new(ivf), state)
+        ) -> (Arc<dyn VectorIndex>, Option<IvfStateEntryBox>) {
+            let entry = ivf.to_state_entry();
+            (Arc::new(ivf), Some(entry))
         }
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        let result: Result<(Arc<dyn VectorIndex>, Option<IvfIndexState>)> = match (
+        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
             major_version,
             minor_version,
         ) {
@@ -1583,7 +1584,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                         )
                         .await?;
-                        Ok((idx, None))
+                        Ok((idx, None::<IvfStateEntryBox>))
                     }
                     None => Err(Error::internal(
                         "Index proto was missing implementation field",
@@ -1606,7 +1607,7 @@ impl DatasetIndexInternalExt for Dataset {
                     frag_reuse_index,
                 )
                 .await?;
-                Ok((idx, None))
+                Ok((idx, None::<IvfStateEntryBox>))
             }
 
             (0, 3) | (2, _) => {
@@ -1787,12 +1788,12 @@ impl DatasetIndexInternalExt for Dataset {
                 "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
             )),
         };
-        let (index, ivf_state) = result?;
+        let (index, ivf_entry) = result?;
         metrics.record_index_load();
-        if let Some(ivf_state) = ivf_state {
+        if let Some(ivf_entry) = ivf_entry {
             let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
             self.index_cache
-                .insert_with_key(&state_key, Arc::new(ivf_state))
+                .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
         } else {
             self.index_cache
