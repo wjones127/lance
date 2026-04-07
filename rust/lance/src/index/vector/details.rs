@@ -10,6 +10,7 @@
 //! - Inferring details from index files on disk (fallback for legacy indices)
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lance_file::reader::FileReaderOptions;
@@ -43,6 +44,8 @@ struct VectorDetailsJson {
     hnsw: Option<HnswDetailsJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compression: Option<CompressionDetailsJson>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    runtime_hints: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -85,27 +88,86 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     let mut target_partition_size = 0u64;
     let mut hnsw_index_config = None;
     let mut compression = None;
+    let mut runtime_hints: HashMap<String, String> = params.runtime_hints.clone();
 
+    // Only write hints that differ from their defaults, keeping the map minimal.
+    // Absence of a key means "use your default".
     for stage in &params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
                 if let Some(tps) = ivf.target_partition_size {
                     target_partition_size = tps as u64;
                 }
+                if ivf.max_iters != 50 {
+                    runtime_hints
+                        .insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
+                }
+                if ivf.sample_rate != 256 {
+                    runtime_hints.insert(
+                        "lance.ivf.sample_rate".to_string(),
+                        ivf.sample_rate.to_string(),
+                    );
+                }
+                if ivf.shuffle_partition_batches != 1024 * 10 {
+                    runtime_hints.insert(
+                        "lance.ivf.shuffle_partition_batches".to_string(),
+                        ivf.shuffle_partition_batches.to_string(),
+                    );
+                }
+                if ivf.shuffle_partition_concurrency != 2 {
+                    runtime_hints.insert(
+                        "lance.ivf.shuffle_partition_concurrency".to_string(),
+                        ivf.shuffle_partition_concurrency.to_string(),
+                    );
+                }
             }
             StageParams::Hnsw(hnsw) => {
                 hnsw_index_config = Some(hnsw.into());
+                let default_prefetch: Option<usize> = Some(2);
+                if hnsw.prefetch_distance != default_prefetch {
+                    let val = match hnsw.prefetch_distance {
+                        Some(v) => v.to_string(),
+                        None => "none".to_string(),
+                    };
+                    runtime_hints.insert("lance.hnsw.prefetch_distance".to_string(), val);
+                }
             }
             StageParams::PQ(pq) => {
                 compression = Some(Compression::Pq(pq.into()));
+                if pq.max_iters != 50 {
+                    runtime_hints
+                        .insert("lance.pq.max_iters".to_string(), pq.max_iters.to_string());
+                }
+                if pq.sample_rate != 256 {
+                    runtime_hints.insert(
+                        "lance.pq.sample_rate".to_string(),
+                        pq.sample_rate.to_string(),
+                    );
+                }
+                if pq.kmeans_redos != 1 {
+                    runtime_hints.insert(
+                        "lance.pq.kmeans_redos".to_string(),
+                        pq.kmeans_redos.to_string(),
+                    );
+                }
             }
             StageParams::SQ(sq) => {
                 compression = Some(Compression::Sq(sq.into()));
+                if sq.sample_rate != 256 {
+                    runtime_hints.insert(
+                        "lance.sq.sample_rate".to_string(),
+                        sq.sample_rate.to_string(),
+                    );
+                }
             }
             StageParams::RQ(rq) => {
                 compression = Some(Compression::Rq(rq.into()));
             }
         }
+    }
+
+    if params.skip_transpose {
+        runtime_hints.insert("lance.skip_transpose".to_string(), "true".to_string());
     }
 
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
@@ -117,6 +179,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         index_version,
+        runtime_hints,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -124,6 +187,70 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
 pub fn vector_index_details_default() -> prost_types::Any {
     let details = lance_index::pb::VectorIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
+}
+
+/// Apply stored runtime hints from `VectorIndexDetails` back into build params.
+///
+/// Known `lance.*` keys are parsed and applied to the appropriate stage. Unknown
+/// keys (e.g., from other runtimes) are silently ignored. Malformed values are
+/// also silently ignored — the stage keeps its existing default.
+pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorIndexParams) {
+    fn parse<T: FromStr>(hints: &HashMap<String, String>, key: &str) -> Option<T> {
+        hints.get(key)?.parse().ok()
+    }
+
+    for stage in &mut params.stages {
+        match stage {
+            StageParams::Ivf(ivf) => {
+                if let Some(v) = parse(hints, "lance.ivf.max_iters") {
+                    ivf.max_iters = v;
+                }
+                if let Some(v) = parse(hints, "lance.ivf.sample_rate") {
+                    ivf.sample_rate = v;
+                }
+                if let Some(v) = parse(hints, "lance.ivf.shuffle_partition_batches") {
+                    ivf.shuffle_partition_batches = v;
+                }
+                if let Some(v) = parse(hints, "lance.ivf.shuffle_partition_concurrency") {
+                    ivf.shuffle_partition_concurrency = v;
+                }
+            }
+            StageParams::Hnsw(hnsw) => {
+                if let Some(raw) = hints.get("lance.hnsw.prefetch_distance") {
+                    hnsw.prefetch_distance = if raw == "none" {
+                        None
+                    } else {
+                        raw.parse().ok()
+                    };
+                }
+            }
+            StageParams::PQ(pq) => {
+                if let Some(v) = parse(hints, "lance.pq.max_iters") {
+                    pq.max_iters = v;
+                }
+                if let Some(v) = parse(hints, "lance.pq.sample_rate") {
+                    pq.sample_rate = v;
+                }
+                if let Some(v) = parse(hints, "lance.pq.kmeans_redos") {
+                    pq.kmeans_redos = v;
+                }
+            }
+            StageParams::SQ(sq) => {
+                if let Some(v) = parse(hints, "lance.sq.sample_rate") {
+                    sq.sample_rate = v;
+                }
+            }
+            StageParams::RQ(_) => {}
+        }
+    }
+
+    if hints
+        .get("lance.skip_transpose")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        params.skip_transpose = true;
+    }
 }
 
 /// Extract metric type from index metadata without opening the index file.
@@ -295,6 +422,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         },
         hnsw,
         compression,
+        runtime_hints: d.runtime_hints,
     };
 
     serde_json::to_string(&json).map_err(|e| Error::index(format!("Failed to serialize: {}", e)))
@@ -356,6 +484,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         index_version: 0,
+        runtime_hints: Default::default(),
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -451,6 +580,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         index_version: 0,
+        runtime_hints: Default::default(),
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -472,6 +602,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             index_version: 0,
+            runtime_hints: Default::default(),
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -621,6 +752,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 index_version: 0,
+                runtime_hints: Default::default(),
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
@@ -748,5 +880,188 @@ mod tests {
             let metric = metric_type_from_index_metadata(&index);
             assert_eq!(metric, Some(*expected_distance));
         }
+    }
+
+    #[test]
+    fn test_runtime_hints_roundtrip() {
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        // Non-default values for IVF and PQ hints
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                max_iters: 100,
+                sample_rate: 512,
+                shuffle_partition_batches: 2048,
+                shuffle_partition_concurrency: 4,
+                ..Default::default()
+            },
+            PQBuildParams {
+                num_sub_vectors: 8,
+                num_bits: 8,
+                max_iters: 75,
+                kmeans_redos: 3,
+                sample_rate: 128,
+                ..Default::default()
+            },
+        );
+
+        let any = vector_index_details(&params);
+        let details = any.to_msg::<VectorIndexDetails>().unwrap();
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.ivf.max_iters")
+                .map(|s| s.as_str()),
+            Some("100")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.ivf.sample_rate")
+                .map(|s| s.as_str()),
+            Some("512")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.ivf.shuffle_partition_batches")
+                .map(|s| s.as_str()),
+            Some("2048")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.ivf.shuffle_partition_concurrency")
+                .map(|s| s.as_str()),
+            Some("4")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.pq.max_iters")
+                .map(|s| s.as_str()),
+            Some("75")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.pq.sample_rate")
+                .map(|s| s.as_str()),
+            Some("128")
+        );
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.pq.kmeans_redos")
+                .map(|s| s.as_str()),
+            Some("3")
+        );
+        // Default values should not appear in the map
+        assert!(
+            !details
+                .runtime_hints
+                .contains_key("lance.hnsw.prefetch_distance")
+        );
+        assert!(!details.runtime_hints.contains_key("lance.skip_transpose"));
+
+        // Roundtrip: apply hints back to a fresh params struct
+        let mut restored = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::default(),
+            PQBuildParams {
+                num_sub_vectors: 8,
+                num_bits: 8,
+                ..Default::default()
+            },
+        );
+        apply_runtime_hints(&details.runtime_hints, &mut restored);
+        let StageParams::Ivf(ivf) = &restored.stages[0] else {
+            panic!()
+        };
+        assert_eq!(ivf.max_iters, 100);
+        assert_eq!(ivf.sample_rate, 512);
+        assert_eq!(ivf.shuffle_partition_batches, 2048);
+        assert_eq!(ivf.shuffle_partition_concurrency, 4);
+        let StageParams::PQ(pq) = &restored.stages[1] else {
+            panic!()
+        };
+        assert_eq!(pq.max_iters, 75);
+        assert_eq!(pq.sample_rate, 128);
+        assert_eq!(pq.kmeans_redos, 3);
+    }
+
+    #[test]
+    fn test_runtime_hints_defaults_omitted() {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        // All defaults — hints map should be empty
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::default(),
+            PQBuildParams {
+                num_sub_vectors: 8,
+                num_bits: 8,
+                ..Default::default()
+            },
+        );
+        let any = vector_index_details(&params);
+        let details = any.to_msg::<VectorIndexDetails>().unwrap();
+        assert!(details.runtime_hints.is_empty());
+    }
+
+    #[test]
+    fn test_runtime_hints_in_json() {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                max_iters: 100,
+                ..Default::default()
+            },
+            PQBuildParams {
+                num_sub_vectors: 8,
+                num_bits: 8,
+                ..Default::default()
+            },
+        );
+        let any = vector_index_details(&params);
+        let json = vector_details_as_json(&any).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
+    }
+
+    #[test]
+    fn test_apply_runtime_hints_ignores_unknown_keys() {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        let hints: HashMap<String, String> = [
+            ("lancedb.accelerator".to_string(), "cuda".to_string()),
+            ("unknown.vendor.key".to_string(), "value".to_string()),
+            ("lance.ivf.max_iters".to_string(), "99".to_string()),
+        ]
+        .into();
+
+        let mut params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::default());
+        apply_runtime_hints(&hints, &mut params);
+
+        let StageParams::Ivf(ivf) = &params.stages[0] else {
+            panic!()
+        };
+        assert_eq!(ivf.max_iters, 99);
+        // Unknown keys silently ignored — no panic
     }
 }

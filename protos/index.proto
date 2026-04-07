@@ -225,6 +225,11 @@ message VectorIndexDetails {
   // compatibility when introducing breaking changes to the index format.
   // 0 means unset (legacy index).
   uint32 index_version = 7;
+
+  // Runtime hints: optional build preferences that don't affect index structure.
+  // Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
+  // Unrecognized keys must be silently ignored by all runtimes.
+  map<string, string> runtime_hints = 9;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

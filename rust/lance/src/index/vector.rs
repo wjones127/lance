@@ -111,6 +111,11 @@ pub struct VectorIndexParams {
 
     /// Skip transpose / packing for PQ and RQ storage.
     pub skip_transpose: bool,
+
+    /// Runtime hints: optional build preferences stored in the index manifest.
+    /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
+    /// Populated by the build path and merged into VectorIndexDetails at creation time.
+    pub runtime_hints: HashMap<String, String>,
 }
 
 impl VectorIndexParams {
@@ -132,6 +137,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -142,6 +148,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -176,6 +183,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -202,6 +210,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -217,6 +226,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -231,6 +241,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -245,6 +256,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -259,6 +271,7 @@ impl VectorIndexParams {
             metric_type: distance_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -280,6 +293,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
@@ -301,6 +315,7 @@ impl VectorIndexParams {
             metric_type,
             version: IndexFileVersion::V3,
             skip_transpose: false,
+            runtime_hints: HashMap::new(),
         }
     }
 
