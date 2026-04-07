@@ -138,8 +138,6 @@ struct IvfIndexStateHeader {
 /// wrapper lets the cache infrastructure work with a sized type while the
 /// hot paths call `reconstruct` without knowing `Q`.
 pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
-    fn as_any(&self) -> &dyn std::any::Any;
-
     fn serialize_state(&self, writer: &mut dyn IoWrite) -> Result<()>;
 
     fn reconstruct<'a>(
@@ -293,10 +291,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
 }
 
 impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn serialize_state(&self, writer: &mut dyn IoWrite) -> Result<()> {
         let quantizer_metadata_json = serde_json::to_string(&self.metadata)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;

@@ -1055,26 +1055,13 @@ mod tests {
         CacheCodecImpl::serialize(&entry, &mut bytes).unwrap();
 
         let restored =
-            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&bytes::Bytes::from(bytes)).unwrap();
-        let restored = restored
-            .0
-            .as_any()
-            .downcast_ref::<IvfIndexState<FlatQuantizer>>()
-            .expect("expected IvfIndexState<FlatQuantizer>");
-        assert_eq!(
-            restored.index_file_path,
-            entry
-                .0
-                .as_any()
-                .downcast_ref::<IvfIndexState<FlatQuantizer>>()
-                .unwrap()
-                .index_file_path
-        );
-        assert_eq!(restored.uuid, "test-uuid-1234");
-        assert_eq!(restored.distance_type, DistanceType::L2);
-        assert_eq!(restored.sub_index_metadata, vec!["meta1".to_string()]);
-        assert_eq!(restored.cache_key_prefix, "prefix/");
-        assert_eq!(restored.index_file_size, 1024);
-        assert_eq!(restored.aux_file_size, 512);
+            <IvfStateEntryBox as CacheCodecImpl>::deserialize(&bytes::Bytes::from(bytes.clone()))
+                .unwrap();
+
+        // Re-serialize the restored entry and compare bytes — a stronger check
+        // than field-by-field comparison and avoids needing to downcast.
+        let mut restored_bytes = Vec::new();
+        CacheCodecImpl::serialize(&restored, &mut restored_bytes).unwrap();
+        assert_eq!(bytes, restored_bytes);
     }
 }
