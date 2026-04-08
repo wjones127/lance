@@ -75,13 +75,12 @@ class PqVectorIndex(UpgradeDowngradeTest):
             indices = ds.describe_indices()
             assert len(indices) >= 1
             name = indices[0].name
-        else:
+        elif self.compat_version >= "0.39.0":
             indices = ds.list_indices()
             assert len(indices) >= 1
-            name = indices[0].name
-
-        stats = ds.stats.index_stats(name)
-        assert stats["num_indexed_rows"] > 0
+            name = indices[0]["name"]
+            stats = ds.stats.index_stats(name)
+            assert stats["num_indexed_rows"] > 0
 
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
@@ -159,7 +158,7 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
         else:
             indices = ds.list_indices()
             assert len(indices) >= 1
-            name = indices[0].name
+            name = indices[0]["name"]
 
         stats = ds.stats.index_stats(name)
         assert stats["num_indexed_rows"] > 0
@@ -240,7 +239,7 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         else:
             indices = ds.list_indices()
             assert len(indices) >= 1
-            name = indices[0].name
+            name = indices[0]["name"]
 
         stats = ds.stats.index_stats(name)
         assert stats["num_indexed_rows"] > 0
@@ -262,7 +261,7 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(min_version="v4.0.0-beta.8")
+@compat_test(min_version="4.0.0-beta.8")
 class IvfRqVectorIndex(UpgradeDowngradeTest):
     """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
 
