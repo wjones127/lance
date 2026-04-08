@@ -3569,6 +3569,12 @@ fn prepare_vector_index_params(
             sq_params.sample_rate = sample_rate;
         }
 
+        if let Some(max_iters) = kwargs.get_item("max_iters")? {
+            let max_iters: usize = max_iters.extract()?;
+            ivf_params.max_iters = max_iters;
+            pq_params.max_iters = max_iters;
+        }
+
         // Parse IVF params
         if let Some(n) = kwargs.get_item("num_partitions")? {
             ivf_params.num_partitions = Some(n.extract()?)
