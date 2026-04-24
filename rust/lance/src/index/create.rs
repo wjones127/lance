@@ -635,7 +635,6 @@ impl<'a> IndexSegmentBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -647,7 +646,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::{self, BatchCount, Dimension, RowCount, array, gen_batch};
+    use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -1593,137 +1592,6 @@ mod tests {
                 .iter()
                 .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
                     && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
-        );
-    }
-
-    // Repro for the bug in check_rewrite_txn when defer_index_remap=true.
-    //
-    // When a Rewrite transaction with frag_reuse_index=Some (i.e. deferred index
-    // remap) is committed, its conflict resolver takes the (None, Some(_)) branch
-    // for any previously committed CreateIndex, declaring COMPATIBLE without
-    // checking whether the rewritten fragments overlap with the indexed ones.
-    //
-    // Sequence:
-    //   1. optimize_indices commits a CreateIndex covering frag 0 + frag 1.
-    //   2. Frag 2 is appended (unindexed).
-    //   3. Compaction commits a Rewrite merging [frag1, frag2] → frag3 with an
-    //      FRI (defer_index_remap=true). Conflict check for Rewrite vs CreateIndex
-    //      hits (None, Some(_)) → COMPATIBLE, even though frag1 is indexed and
-    //      frag2 is not — a split of indexed and non-indexed data.
-    //   4. Query processes the FRI and fails with "split of indexed and
-    //      non-indexed data".
-    #[tokio::test]
-    async fn test_deferred_compaction_after_optimize_indices() {
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
-
-        // Step 1: Create initial dataset (fragment 0, 256 rows).
-        let reader = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(Dimension::from(16)),
-            )
-            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
-        let mut dataset = Dataset::write(
-            reader,
-            &dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 256,
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Step 2: Create base IVF index on fragment 0.
-        let ivf_params = prepare_vector_ivf(&dataset, "vector").await;
-        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
-        CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
-            .name("vector_idx".to_string())
-            .await
-            .unwrap();
-
-        // Step 3: Append fragment 1 (unindexed).
-        let reader = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(Dimension::from(16)),
-            )
-            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
-        dataset = Dataset::write(
-            reader,
-            &dataset_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                max_rows_per_file: 64,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Step 4: optimize_indices indexes frag 1, committing a CreateIndex that
-        // covers [frag0, frag1].
-        dataset
-            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
-            .await
-            .unwrap();
-
-        // Step 5: Append fragment 2 (unindexed).
-        let reader = gen_batch()
-            .col("id", array::step::<Int32Type>())
-            .col(
-                "vector",
-                array::rand_vec::<Float32Type>(Dimension::from(16)),
-            )
-            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
-        dataset = Dataset::write(
-            reader,
-            &dataset_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                max_rows_per_file: 64,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        // Step 6: Compact frags 1+2 → frag3 with defer_index_remap=true.
-        // check_rewrite_txn sees the CreateIndex and hits (None, Some(_)) →
-        // COMPATIBLE, even though frag1 is indexed and frag2 is not.
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                defer_index_remap: true,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Step 7: Query processes the FRI. remap_fragment_bitmap sees group
-        // [frag1, frag2] → [frag3]: frag1 is in the index bitmap but frag2 is
-        // not → "split of indexed and non-indexed data".
-        let query = arrow_array::Float32Array::from_iter_values((0..16).map(|_| 0.0_f32));
-        let stream_result = dataset
-            .scan()
-            .nearest("vector", &query, 10)
-            .unwrap()
-            .try_into_stream()
-            .await;
-        let err = match stream_result {
-            Err(e) => e,
-            Ok(_) => panic!("expected query to fail with 'split of indexed and non-indexed data'"),
-        };
-        assert!(
-            err.to_string()
-                .contains("split of indexed and non-indexed data"),
-            "expected 'split of indexed and non-indexed data', got: {err}"
         );
     }
 }

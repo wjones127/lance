@@ -4565,123 +4565,89 @@ mod tests {
         assert!(!plan.options.materialize_deletions);
     }
 
-    // Repro for the bug in check_rewrite_txn when defer_index_remap=true.
-    //
-    // check_rewrite_txn handles the case (Rewrite self, CreateIndex other) via:
-    //
-    //   match (fri_in_create_index, self.frag_reuse_index) {
-    //       (None, Some(_)) => Ok(()),   // ← too permissive
-    //       ...
-    //   }
-    //
-    // When the in-memory Rewrite carries frag_reuse_index=Some (defer_index_remap=true),
-    // it declares COMPATIBLE with any preceding CreateIndex without checking whether the
-    // rewritten fragments overlap with the indexed ones.
-    //
-    // Production sequence:
-    //   1. Compaction plans to merge [frag1, frag2] while both are unindexed.
-    //   2. optimize_indices commits a CreateIndex covering frag1 (and frag0).
-    //   3. Compaction commits the Rewrite with an FRI; conflict check hits
-    //      (None, Some(_)) → COMPATIBLE despite the split.
-    //   4. Query: remap_fragment_bitmap sees group [frag1, frag2] where only frag1
-    //      is indexed → "split of indexed and non-indexed data".
+    // check_rewrite_txn takes the (None, Some(_)) branch when a Rewrite with
+    // defer_index_remap=true is committed against a previously committed
+    // CreateIndex, declaring COMPATIBLE without verifying that the Rewrite's
+    // FRI groups don't straddle the CreateIndex's fragment bitmap. When a
+    // group mixes indexed and unindexed fragments, commit succeeds and later
+    // queries fail at load_indices with "split of indexed and non-indexed
+    // data".
     #[tokio::test]
-    async fn test_deferred_compaction_after_optimize_indices() {
-        use crate::dataset::WriteMode;
+    async fn test_rewrite_fri_vs_create_index_conflict() {
+        use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
-        use crate::index::{CreateIndexBuilder, DatasetIndexExt};
         use futures::TryStreamExt;
         use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
         use lance_index::IndexType;
         use lance_linalg::distance::MetricType;
 
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
-
-        fn make_reader(
-            rows: usize,
-            batches: usize,
-            mode: WriteMode,
-        ) -> (
-            impl arrow_array::RecordBatchReader + Send + 'static,
-            WriteParams,
-        ) {
+        async fn append_fragment(uri: &str, rows: u64) -> Dataset {
             let reader = gen_batch()
-                .col(
-                    "vec",
-                    array::rand_vec::<arrow_array::types::Float32Type>(Dimension::from(16)),
-                )
-                .into_reader_rows(
-                    RowCount::from(rows as u64),
-                    BatchCount::from(batches as u32),
-                );
+                .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+                .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
             let params = WriteParams {
-                max_rows_per_file: rows,
-                mode,
+                max_rows_per_file: rows as usize,
+                mode: WriteMode::Append,
                 ..Default::default()
             };
-            (reader, params)
+            Dataset::write(reader, uri, Some(params)).await.unwrap()
         }
 
-        // Step 1: initial dataset with 256 rows (fragment 0).
-        let (reader, params) = make_reader(256, 1, WriteMode::Overwrite);
-        let mut dataset = Dataset::write(reader, &dataset_uri, Some(params))
+        let tmpdir = TempStrDir::default();
+        let uri = format!("file://{}", tmpdir.as_str());
+
+        // frag0 (256 rows) with a base IVF index.
+        let reader = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 256,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
 
-        // Step 2: base IVF index on fragment 0.
-        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 50);
-        CreateIndexBuilder::new(&mut dataset, &["vec"], IndexType::Vector, &params)
-            .name("vec_idx".to_string())
-            .await
-            .unwrap();
+        // Append frag1 (unindexed), snapshot a stale handle pointing here,
+        // then append frag2 (also unindexed).
+        dataset = append_fragment(&uri, 64).await;
+        let mut stale = dataset.clone();
+        dataset = append_fragment(&uri, 64).await;
 
-        // Step 3: append frag1 (unindexed).
-        let (reader, params) = make_reader(64, 1, WriteMode::Append);
-        dataset = Dataset::write(reader, &dataset_uri, Some(params))
-            .await
-            .unwrap();
-        // Snapshot here — frag1 exists, frag2 does not. optimize_indices
-        // on this handle will cover frag1 only.
-        let mut stale_handle = dataset.clone();
-
-        // Step 4: append frag2 (unindexed).
-        let (reader, params) = make_reader(64, 1, WriteMode::Append);
-        dataset = Dataset::write(reader, &dataset_uri, Some(params))
-            .await
-            .unwrap();
-
-        // Step 5: plan and execute compaction while both frag1 and frag2 are
-        // unindexed. plan_compaction puts them in the same bin.
+        // Plan + execute compaction of frag1+frag2 with deferred remap.
         let options = CompactionOptions {
             defer_index_remap: true,
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
-        assert!(
-            !plan.tasks.is_empty(),
-            "expected compaction to plan a rewrite of frag1+frag2"
-        );
-        let dataset_snap = dataset.clone();
-        let completed: Vec<RewriteResult> = futures::stream::iter(plan.tasks.iter().cloned())
-            .map(|task| rewrite_files(std::borrow::Cow::Borrowed(&dataset_snap), task, &options))
+        assert!(!plan.tasks.is_empty());
+        let snapshot = dataset.clone();
+        let completed: Vec<RewriteResult> = futures::stream::iter(plan.tasks.into_iter())
+            .map(|task| rewrite_files(Cow::Borrowed(&snapshot), task, &options))
             .buffer_unordered(1)
             .try_collect()
             .await
             .unwrap();
 
-        // Step 6: optimize_indices on stale handle — sees only frag0+frag1.
-        // Commits a CreateIndex covering frag1 (but NOT frag2).
-        stale_handle
+        // optimize_indices on the stale handle indexes frag1 only (frag2
+        // didn't exist at that version), commits as CreateIndex.
+        stale
             .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
             .await
             .unwrap();
         dataset.checkout_latest().await.unwrap();
 
-        // Step 7: commit the pre-executed compaction. The Rewrite carries
-        // frag_reuse_index=Some in memory. check_rewrite_txn hits
-        // (None, Some(_)) → COMPATIBLE with the CreateIndex — the bug.
-        // It should reject because frag1 is indexed but frag2 is not.
+        // Commit the pre-executed Rewrite. The bug: check_rewrite_txn returns
+        // Ok despite the FRI group [frag1, frag2] straddling the new index.
         commit_compaction(
             &mut dataset,
             completed,
@@ -4691,23 +4657,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Step 8: query fails — remap_fragment_bitmap detects group [frag1, frag2]
-        // where only frag1 is indexed → "split of indexed and non-indexed data".
         let query = Float32Array::from_iter_values((0..16).map(|_| 0.0_f32));
-        let stream_result = dataset
+        let err = dataset
             .scan()
             .nearest("vec", &query, 10)
             .unwrap()
             .try_into_stream()
-            .await;
-        let err = match stream_result {
-            Err(e) => e,
-            Ok(_) => panic!("expected query to fail with 'split of indexed and non-indexed data'"),
-        };
+            .await
+            .err()
+            .expect("query should fail with split error");
         assert!(
             err.to_string()
                 .contains("split of indexed and non-indexed data"),
-            "expected 'split of indexed and non-indexed data', got: {err}"
+            "unexpected error: {err}"
         );
     }
 }
