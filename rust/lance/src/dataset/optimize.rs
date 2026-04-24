@@ -4639,36 +4639,28 @@ mod tests {
             .unwrap();
 
         // optimize_indices on the stale handle indexes frag1 only (frag2
-        // didn't exist at that version), commits as CreateIndex.
+        // didn't exist at that version), commits as CreateIndex. `dataset`
+        // stays at its pre-optimize version so the Rewrite commit has to
+        // conflict-check against this CreateIndex.
         stale
             .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
             .await
             .unwrap();
-        dataset.checkout_latest().await.unwrap();
 
-        // Commit the pre-executed Rewrite. The bug: check_rewrite_txn returns
-        // Ok despite the FRI group [frag1, frag2] straddling the new index.
-        commit_compaction(
+        // Commit the pre-executed Rewrite. The FRI group [frag1, frag2]
+        // straddles the new CreateIndex bitmap (frag1 indexed, frag2 not), so
+        // check_rewrite_txn must reject this as a retryable conflict rather
+        // than letting it commit into a broken state that fails queries.
+        let err = commit_compaction(
             &mut dataset,
             completed,
             Arc::new(DatasetIndexRemapperOptions::default()),
             &options,
         )
         .await
-        .unwrap();
-
-        let query = Float32Array::from_iter_values((0..16).map(|_| 0.0_f32));
-        let err = dataset
-            .scan()
-            .nearest("vec", &query, 10)
-            .unwrap()
-            .try_into_stream()
-            .await
-            .err()
-            .expect("query should fail with split error");
+        .expect_err("commit should fail with retryable conflict");
         assert!(
-            err.to_string()
-                .contains("split of indexed and non-indexed data"),
+            matches!(err, Error::RetryableCommitConflict { .. }),
             "unexpected error: {err}"
         );
     }
