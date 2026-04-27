@@ -2535,54 +2535,6 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    /// Detect and repair recoverable corruptions in the dataset's manifest.
-    ///
-    /// Returns a list of `(issue_kind, description, repaired)` tuples — one
-    /// entry per detected issue. `repaired` is True when the issue was
-    /// fixed by this call (always False under `dry_run`).
-    #[pyo3(signature = (dry_run = false))]
-    fn repair(&mut self, dry_run: bool) -> PyResult<Vec<(String, String, bool)>> {
-        let mut new_self = self.ds.as_ref().clone();
-        let report = rt()
-            .block_on(
-                None,
-                lance::dataset::repair::repair(
-                    &mut new_self,
-                    &lance::dataset::repair::RepairOptions { dry_run },
-                ),
-            )?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        let repaired_uuids: std::collections::HashSet<_> = report
-            .repaired
-            .iter()
-            .map(|i| match i {
-                lance::dataset::repair::DatasetIssue::FriIndexBitmapStraddle {
-                    index_uuid, ..
-                } => *index_uuid,
-            })
-            .collect();
-        let result = report
-            .issues
-            .iter()
-            .map(|issue| {
-                let kind = match issue {
-                    lance::dataset::repair::DatasetIssue::FriIndexBitmapStraddle { .. } => {
-                        "fri_index_bitmap_straddle"
-                    }
-                };
-                let was_repaired = match issue {
-                    lance::dataset::repair::DatasetIssue::FriIndexBitmapStraddle {
-                        index_uuid,
-                        ..
-                    } => repaired_uuids.contains(index_uuid),
-                };
-                (kind.to_string(), issue.to_string(), was_repaired)
-            })
-            .collect();
-        self.ds = Arc::new(new_self);
-        Ok(result)
-    }
-
     fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.migrate_manifest_paths_v2())?

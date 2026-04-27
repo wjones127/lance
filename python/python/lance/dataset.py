@@ -4209,38 +4209,6 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.validate()
 
-    def repair(self, dry_run: bool = False) -> List[Dict[str, object]]:
-        """
-        Detect and repair recoverable corruptions in the dataset.
-
-        Currently handles the fragment-reuse-index "straddle" corruption
-        introduced by the bug fixed in
-        https://github.com/lance-format/lance/pull/6610, where an index's
-        fragment bitmap covers some but not all of a rewrite group's old
-        fragments. Affected index segments have the straddling fragment
-        ids removed from their bitmap; previously-indexed rows in the
-        merged new fragment fall through to flat scan until the next
-        ``optimize.optimize_indices()``. No data is lost; no index is
-        retrained.
-
-        Parameters
-        ----------
-        dry_run : bool, default False
-            If True, detect issues without modifying the dataset.
-
-        Returns
-        -------
-        List[Dict[str, object]]
-            One entry per detected issue with keys ``kind`` (str),
-            ``description`` (str), and ``repaired`` (bool — always False
-            under ``dry_run``).
-        """
-        raw = self._ds.repair(dry_run)
-        return [
-            {"kind": kind, "description": desc, "repaired": repaired}
-            for (kind, desc, repaired) in raw
-        ]
-
     def shallow_clone(
         self,
         target_path: str | Path,
