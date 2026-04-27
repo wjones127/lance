@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Generator for the `fri_straddle_pre_6610` test fixture.
 //!
 //! Reproduces the corrupt dataset state caused by the bug fixed in
