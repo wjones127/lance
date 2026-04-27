@@ -79,6 +79,7 @@ mod metadata;
 pub mod optimize;
 pub mod progress;
 pub mod refs;
+pub mod repair;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
@@ -2314,6 +2315,25 @@ impl Dataset {
             .buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
+
+        // Detect FRI/index corruptions before calling load_indices, which
+        // would panic on a straddling fragment_bitmap (PR #6610). Surface
+        // them as structured errors with a pointer to Dataset::repair.
+        let issues = crate::dataset::repair::detect_issues(self).await?;
+        if !issues.is_empty() {
+            return Err(Error::corrupt_file(
+                self.manifest_location.path.clone(),
+                format!(
+                    "Dataset has detectable corruption that prevents index loading. \
+                     Run Dataset::repair to fix. Issues:\n{}",
+                    issues
+                        .iter()
+                        .map(|i| format!("  - {}", i))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            ));
+        }
 
         // Validate indices
         let indices = self.load_indices().await?;

@@ -5366,3 +5366,12 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     assert distances == sorted(distances)
 
     assert "id" in result.column_names
+
+
+def test_repair_no_op_on_healthy_dataset(tmp_path):
+    base_dir = tmp_path / "ds"
+    ds = lance.write_dataset(pa.table({"x": list(range(8))}), str(base_dir))
+
+    assert ds.repair() == []
+    assert ds.repair(dry_run=True) == []
+    ds.validate()
