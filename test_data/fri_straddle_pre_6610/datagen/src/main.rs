@@ -8,31 +8,24 @@
 //! compaction commits concurrently with `optimize_indices` against an older
 //! dataset version, leaving a user index whose `fragment_bitmap` straddles a
 //! fragment-reuse rewrite group. After this state is reached,
-//! `Dataset::list_indices` panics.
+//! `Dataset::list_indices` panics on pre-fix builds.
 //!
-//! The reproduction uses the public Rust APIs (`plan_compaction`,
-//! `CompactionTask::execute`, `optimize_indices`, `commit_compaction`) and is
-//! therefore deterministic — unlike a Python script driving
-//! `compact_files(defer_index_remap=True)` against a concurrent
-//! `optimize_indices`, which depends on a tight commit race that doesn't land
-//! reliably.
+//! Standalone crate — deliberately not part of the parent workspace because
+//! it must compile against a pre-#6610 `lance` (pinned in `Cargo.toml`).
 //!
 //! ## Usage
 //!
-//! Must be run on a Lance build that does *not* contain PR #6610 (the
-//! conflict resolver still has the buggy `(None, Some(_)) => Ok(())` arm in
-//! `rust/lance/src/io/commit/conflict_resolver.rs`). On a fixed build the
-//! commit will be rejected as a retryable conflict and the generator will
-//! return an error. To regenerate the fixture in the future, check out a
-//! pre-#6610 commit (e.g. tag `v4.0.1`) and run:
-//!
 //! ```bash
-//! cargo run -p lance-examples --example fri_straddle_datagen -- \
+//! cargo run --release --manifest-path test_data/fri_straddle_pre_6610/datagen/Cargo.toml -- \
 //!     test_data/fri_straddle_pre_6610/fri_straddle_dataset
 //! ```
+//!
+//! On a fixed `lance` the commit is rejected as a retryable conflict and the
+//! generator exits with an error — the desired forward-compat behaviour.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::datatypes::Float32Type;
 use clap::Parser;
@@ -149,6 +142,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              This generator must be run on a Lance build without PR #6610 applied."
         )
     })?;
+
+    // Drop intermediate versions so only the latest manifest + its data
+    // files are checked in. Keeps the fixture small.
+    let cleaned = Dataset::open(&uri).await?;
+    let stats = cleaned
+        .cleanup_old_versions(Duration::from_secs(0), Some(true), None)
+        .await?;
+    println!(
+        "Cleaned {} old manifests / {} bytes",
+        stats.old_versions, stats.bytes_removed
+    );
 
     println!(
         "Generated fri_straddle fixture at {}",

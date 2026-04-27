@@ -21,14 +21,17 @@ between them. Python's `Compaction.commit` hardcodes
 `CompactionOptions::default()` (no defer-remap), so a Python datagen
 cannot reach this path without a tight commit race.
 
-The generator must be run on a Lance build that does **not** contain PR
-\#6610. On a fixed build the conflict resolver rejects the rewrite as a
+The generator is a standalone crate at `datagen/` that pins `lance` to
+the last pre-#6610 release tag (`v6.0.0-beta.3`). It is deliberately not
+part of the parent Cargo workspace so it can compile against the buggy
+build. On a fixed build the conflict resolver rejects the rewrite as a
 retryable conflict and the generator fails loudly. To regenerate:
 
 ```bash
-# from a checkout that pre-dates PR #6610 (e.g. tag v4.0.1)
-cargo run -p lance-examples --example fri_straddle_datagen -- \
+cargo run --release \
+    --manifest-path test_data/fri_straddle_pre_6610/datagen/Cargo.toml -- \
     test_data/fri_straddle_pre_6610/fri_straddle_dataset
 ```
 
-Source: `rust/examples/src/fri_straddle_datagen.rs`.
+Bump the pinned tag in `datagen/Cargo.toml` only to another pre-#6610
+build.
