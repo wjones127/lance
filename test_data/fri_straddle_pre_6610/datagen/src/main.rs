@@ -25,9 +25,9 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::datatypes::Float32Type;
+use chrono::TimeDelta;
 use clap::Parser;
 use lance::Dataset;
 use lance::dataset::index::DatasetIndexRemapperOptions;
@@ -144,15 +144,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Drop intermediate versions so only the latest manifest + its data
-    // files are checked in. Keeps the fixture small.
+    // files are checked in. Keeps the fixture small. The corrupt manifest
+    // history may reference rewrite artifacts that were never written to
+    // disk; cleanup races with that and can NotFound. Treat as best-effort.
     let cleaned = Dataset::open(&uri).await?;
-    let stats = cleaned
-        .cleanup_old_versions(Duration::from_secs(0), Some(true), None)
-        .await?;
-    println!(
-        "Cleaned {} old manifests / {} bytes",
-        stats.old_versions, stats.bytes_removed
-    );
+    match cleaned
+        .cleanup_old_versions(TimeDelta::zero(), Some(true), None)
+        .await
+    {
+        Ok(stats) => println!(
+            "Cleaned {} old manifests / {} bytes",
+            stats.old_versions, stats.bytes_removed
+        ),
+        Err(e) => println!("cleanup_old_versions skipped (best-effort): {e}"),
+    }
 
     println!(
         "Generated fri_straddle fixture at {}",
