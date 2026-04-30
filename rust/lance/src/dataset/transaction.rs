@@ -1392,36 +1392,6 @@ impl Operation {
         }
     }
 
-    pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::UpdateConfig {
-                    schema_metadata_updates,
-                    field_metadata_updates,
-                    ..
-                },
-                Self::UpdateConfig {
-                    schema_metadata_updates: other_schema_metadata,
-                    field_metadata_updates: other_field_metadata,
-                    ..
-                },
-            ) => {
-                if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
-                    return true;
-                }
-                if !field_metadata_updates.is_empty() && !other_field_metadata.is_empty() {
-                    for field in field_metadata_updates.keys() {
-                        if other_field_metadata.contains_key(field) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
     /// Check whether another operation upserts a key that is referenced by another operation
     pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();

@@ -1120,19 +1120,11 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => {
-                    if self
-                        .transaction
-                        .operation
-                        .upsert_key_conflict(&other_transaction.operation)
-                        || self
-                            .transaction
-                            .operation
-                            .modifies_same_metadata(&other_transaction.operation)
-                    {
-                        Err(self.incompatible_conflict_err(other_transaction, other_version))
-                    } else {
-                        Ok(())
-                    }
+                    // Concurrent UpdateConfig transactions are allowed to overwrite
+                    // one another; the later commit wins for any overlapping keys
+                    // or metadata. This avoids spurious conflicts on independent
+                    // metadata edits and matches a last-writer-wins semantics.
+                    Ok(())
                 }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
@@ -2487,7 +2479,8 @@ mod tests {
                 [Compatible; 9],
             ),
             (
-                // Update config that conflicts with key being upserted by other UpdateConfig operation
+                // Update config overlapping with another UpdateConfig is allowed:
+                // last-writer-wins, so concurrent UpdateConfig commits no longer conflict.
                 create_update_config_for_test(
                     Some(HashMap::from_iter(vec![(
                         "lance.test".to_string(),
@@ -2497,20 +2490,10 @@ mod tests {
                     None,
                     None,
                 ),
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
+                [Compatible; 9],
             ),
             (
-                // Update config that conflicts with key being deleted by other UpdateConfig operation
+                // Same overlap with the other UpdateConfig's deleted key — still allowed.
                 create_update_config_for_test(
                     Some(HashMap::from_iter(vec![(
                         "remove-key".to_string(),
@@ -2520,17 +2503,7 @@ mod tests {
                     None,
                     None,
                 ),
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
+                [Compatible; 9],
             ),
             (
                 // Delete config keys currently being deleted by other UpdateConfig operation
@@ -2543,28 +2516,18 @@ mod tests {
                 [Compatible; 9],
             ),
             (
-                // Delete config keys currently being upserted by other UpdateConfig operation
+                // Delete config keys currently being upserted by other UpdateConfig — allowed.
                 create_update_config_for_test(
                     None,
                     Some(vec!["lance.test".to_string()]),
                     None,
                     None,
                 ),
-                [
-                    Compatible,    // append
-                    Compatible,    // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    Compatible,    // overwrite
-                    Compatible,    // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    NotCompatible, // update config
-                ],
+                [Compatible; 9],
             ),
             (
-                // Changing schema metadata conflicts with another update changing schema
-                // metadata or with an overwrite
+                // Changing schema metadata still conflicts with an overwrite, but no
+                // longer conflicts with another UpdateConfig changing schema metadata.
                 create_update_config_for_test(
                     None,
                     None,
@@ -2583,12 +2546,12 @@ mod tests {
                     Compatible,    // rewrite
                     Compatible,    // reserve
                     Compatible,    // update
-                    NotCompatible, // update config
+                    Compatible,    // update config
                 ],
             ),
             (
-                // Changing field metadata conflicts with another update changing same field
-                // metadata or overwrite
+                // Changing field metadata still conflicts with overwrite, but
+                // concurrent UpdateConfigs against the same field are allowed.
                 create_update_config_for_test(
                     None,
                     None,
@@ -2610,7 +2573,7 @@ mod tests {
                     Compatible,    // rewrite
                     Compatible,    // reserve
                     Compatible,    // update
-                    NotCompatible, // update config
+                    Compatible,    // update config
                 ],
             ),
             (
