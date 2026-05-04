@@ -633,6 +633,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         } else {
             HashMap::new()
         };
+        let progress = self.progress.clone();
+        progress.stage_start("shuffle", None, "batches").await?;
+
         let partition_map = Arc::new(precomputed_partitions);
         let mut transformed_stream = Box::pin(
             data.map(move |batch| {
@@ -708,6 +711,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .await?
                 .into(),
         );
+        progress.stage_complete("shuffle").await?;
 
         Ok(self)
     }
