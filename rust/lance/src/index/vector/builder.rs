@@ -88,6 +88,8 @@ use super::{
 
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
+// sample size for kmeans training when splitting a partition (sample_rate * k = 256 * 2)
+const SPLIT_SAMPLE_SIZE: usize = 512;
 
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
@@ -841,14 +843,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let frag_reuse_index = frag_reuse_index.clone();
                     let partition_adjustment = partition_adjustment.clone();
                     async move {
-                        // For affected partitions in a split, read from the
-                        // split shuffle reader which has re-quantized data.
-                        // For all other partitions, use the normal path.
-                        let is_affected = matches!(
-                            partition_adjustment.as_ref(),
-                            Some(PartitionAdjustment::Split { affected_partitions, .. })
-                            if affected_partitions.contains(&partition)
-                        );
+                        let (is_affected, split_reader) = match partition_adjustment.as_ref() {
+                            Some(PartitionAdjustment::Split {
+                                affected_partitions,
+                                split_shuffle_reader,
+                            }) => (
+                                affected_partitions.contains(&partition),
+                                Some(split_shuffle_reader.clone()),
+                            ),
+                            _ => (false, None),
+                        };
                         let partition = match partition_adjustment.as_ref() {
                             Some(PartitionAdjustment::Join(joined_partition))
                                 if partition >= *joined_partition =>
@@ -858,52 +862,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             _ => partition,
                         };
 
-                        let (mut batches, loss) = if is_affected {
-                            // Read from the split shuffle reader only — it has
-                            // all data for this partition (existing + new),
-                            // re-assigned with updated centroids.
-                            let split_reader = match partition_adjustment.as_ref() {
-                                Some(PartitionAdjustment::Split {
-                                    split_shuffle_reader,
-                                    ..
-                                }) => split_shuffle_reader.clone(),
-                                _ => unreachable!(),
-                            };
+                        // For affected partitions, the split shuffle reader has
+                        // all data (existing + new), re-assigned with updated
+                        // centroids. For other partitions, read from existing
+                        // indices + original shuffle reader as normal.
+                        let (mut batches, mut loss) = if is_affected {
                             Self::take_partition_batches(
                                 partition,
                                 &[],
-                                Some(split_reader.as_ref()),
+                                Some(split_reader.as_ref().unwrap().as_ref()),
                             )
                             .await?
                         } else {
-                            let (mut batches, loss) = Self::take_partition_batches(
+                            Self::take_partition_batches(
                                 partition,
                                 indices.as_ref(),
                                 Some(reader.as_ref()),
                             )
-                            .await?;
-
-                            // During a split, vectors from affected partitions
-                            // may have been reassigned to this (unaffected)
-                            // partition. Read any such data from the split
-                            // shuffle reader.
-                            if let Some(PartitionAdjustment::Split {
-                                split_shuffle_reader,
-                                ..
-                            }) = partition_adjustment.as_ref()
-                            {
-                                let (extra_batches, extra_loss) = Self::take_partition_batches(
-                                    partition,
-                                    &[],
-                                    Some(split_shuffle_reader.as_ref()),
-                                )
-                                .await?;
-                                batches.extend(extra_batches);
-                                (batches, loss + extra_loss)
-                            } else {
-                                (batches, loss)
-                            }
+                            .await?
                         };
+
+                        // For unaffected partitions during a split, vectors from
+                        // affected partitions may have been reassigned here.
+                        if !is_affected {
+                            if let Some(sr) = split_reader.as_ref() {
+                                let (extra, extra_loss) =
+                                    Self::take_partition_batches(partition, &[], Some(sr.as_ref()))
+                                        .await?;
+                                batches.extend(extra);
+                                loss += extra_loss;
+                            }
+                        }
 
                         spawn_cpu(move || {
                             // Apply assign_batch for join operations (splits no
@@ -1480,9 +1469,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut affected_partitions = HashSet::new();
         for &part_idx in &actual_splits {
             affected_partitions.insert(part_idx);
-            let c0 = ivf
-                .centroid(part_idx)
-                .ok_or(Error::invalid_input("centroid not found"))?;
+            let c0 = ivf.centroid(part_idx).ok_or(Error::invalid_input(format!(
+                "centroid not found for partition {part_idx}",
+            )))?;
             let (neighbor_ids, _) =
                 select_reassign_candidates_impl(self.distance_type, ivf, part_idx, &c0)?;
             for neighbor_id in neighbor_ids.values() {
@@ -1611,7 +1600,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
         .boxed();
 
-        // Transform through IVF assignment + quantization
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
                 new_centroids.clone(),
@@ -1652,7 +1640,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let transformed_stream =
             Box::new(RecordBatchStreamAdapter::new(schema, transformed_stream));
 
-        // Shuffle into per-partition temp files
         let split_shuffle_dir = self.temp_dir.child("split_shuffle");
         let shuffler = create_ivf_shuffler(
             split_shuffle_dir,
@@ -1720,8 +1707,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         T::Native: Dot + L2 + Normalize,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
-        // Sample 256 * 2 = 512 vectors for kmeans training with k=2
-        let Some(vectors) = self.sample_partition_raw_vectors(part_idx, 512).await? else {
+        let Some(vectors) = self
+            .sample_partition_raw_vectors(part_idx, SPLIT_SAMPLE_SIZE)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -1923,44 +1912,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )?,
         );
 
-        let num_rows = assign_ops
-            .iter()
-            .map(|ops| {
-                ops.iter()
-                    .map(|op| match op {
-                        AssignOp::Add(_) => 1,
-                        AssignOp::Remove(_) => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
+        let num_rows: usize = assign_ops.iter().map(|ops| ops.len()).sum();
 
         // build the input batch with schema | row_id | vector | part_id |
         let mut row_ids_builder = UInt64Builder::with_capacity(num_rows);
         let mut vector_builder =
             PrimitiveBuilder::<T>::with_capacity(num_rows * centroids.value_length() as usize);
         let mut part_ids_builder = UInt32Builder::with_capacity(num_rows);
-        let mut deleted_row_ids = UInt64Builder::with_capacity(num_rows);
 
-        let mut ops_count = Vec::with_capacity(assign_ops.len());
+        let mut counts = Vec::with_capacity(assign_ops.len());
         for (part_idx, ops) in assign_ops.iter().enumerate() {
-            let mut add_count = 0;
-            let mut remove_count = 0;
-            for op in ops {
-                match op {
-                    AssignOp::Add((row_id, vector)) => {
-                        row_ids_builder.append_value(*row_id);
-                        vector_builder.append_array(vector.as_primitive::<T>());
-                        part_ids_builder.append_value(part_idx as u32);
-                        add_count += 1;
-                    }
-                    AssignOp::Remove(row_id) => {
-                        deleted_row_ids.append_value(*row_id);
-                        remove_count += 1;
-                    }
-                }
+            for AssignOp::Add((row_id, vector)) in ops {
+                row_ids_builder.append_value(*row_id);
+                vector_builder.append_array(vector.as_primitive::<T>());
+                part_ids_builder.append_value(part_idx as u32);
             }
-            ops_count.push((add_count, remove_count));
+            counts.push(ops.len());
         }
 
         let row_ids = row_ids_builder.finish();
@@ -1969,7 +1936,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             centroids.value_length(),
         )?;
         let part_ids = part_ids_builder.finish();
-        let deleted_row_ids = deleted_row_ids.finish();
         let schema = arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
             vector_field,
@@ -1981,20 +1947,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         )?;
         let batch = transformer.transform(&batch)?;
 
-        // slice the batch according to the ops count
+        let empty_deleted = UInt64Array::from(Vec::<u64>::new());
         let mut results = Vec::with_capacity(assign_ops.len());
-        let mut add_offset = 0;
-        let mut remove_offset = 0;
-        for (add_count, remove_count) in ops_count.into_iter() {
-            if add_count == 0 && remove_count == 0 {
+        let mut offset = 0;
+        for count in counts {
+            if count == 0 {
                 results.push(None);
-                continue;
+            } else {
+                results.push(Some((batch.slice(offset, count), empty_deleted.clone())));
+                offset += count;
             }
-            let batch = batch.slice(add_offset, add_count);
-            let deleted_row_ids = deleted_row_ids.slice(remove_offset, remove_count);
-            results.push(Some((batch, deleted_row_ids)));
-            add_offset += add_count;
-            remove_offset += remove_count;
         }
         Ok(results)
     }
@@ -2142,8 +2104,6 @@ struct SplitResult {
 #[derive(Debug, Clone)]
 enum AssignOp {
     Add((u64, ArrayRef)),
-    #[allow(dead_code)]
-    Remove(u64),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -2162,6 +2122,21 @@ enum PartitionAdjustment {
     },
     /// Join partition at given id
     Join(usize),
+}
+
+impl std::fmt::Debug for PartitionAdjustment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Split {
+                affected_partitions,
+                ..
+            } => f
+                .debug_struct("Split")
+                .field("affected_partitions", affected_partitions)
+                .finish(),
+            Self::Join(id) => f.debug_tuple("Join").field(id).finish(),
+        }
+    }
 }
 
 pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: QuantizationType) -> String {
