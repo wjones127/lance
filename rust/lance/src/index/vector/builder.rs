@@ -884,14 +884,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                         // For unaffected partitions during a split, vectors from
                         // affected partitions may have been reassigned here.
-                        if !is_affected {
-                            if let Some(sr) = split_reader.as_ref() {
-                                let (extra, extra_loss) =
-                                    Self::take_partition_batches(partition, &[], Some(sr.as_ref()))
-                                        .await?;
-                                batches.extend(extra);
-                                loss += extra_loss;
-                            }
+                        if !is_affected && let Some(sr) = split_reader.as_ref() {
+                            let (extra, extra_loss) =
+                                Self::take_partition_batches(partition, &[], Some(sr.as_ref()))
+                                    .await?;
+                            batches.extend(extra);
+                            loss += extra_loss;
                         }
 
                         spawn_cpu(move || {
@@ -1454,7 +1452,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             // Create a dummy empty shuffle reader
             let empty_reader = Arc::new(IvfShufflerReader::new(
                 Arc::new(self.store.clone()),
-                self.temp_dir.child("split_shuffle"),
+                self.temp_dir.clone().join("split_shuffle"),
                 vec![0; ivf.num_partitions()],
                 0.0,
             ));
@@ -1629,7 +1627,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 log::info!("no vectors to reshuffle");
                 let empty_reader: Box<dyn ShuffleReader> = Box::new(IvfShufflerReader::new(
                     Arc::new(self.store.clone()),
-                    self.temp_dir.child("split_shuffle"),
+                    self.temp_dir.clone().join("split_shuffle"),
                     vec![0; new_centroids.len()],
                     0.0,
                 ));
@@ -1640,7 +1638,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let transformed_stream =
             Box::new(RecordBatchStreamAdapter::new(schema, transformed_stream));
 
-        let split_shuffle_dir = self.temp_dir.child("split_shuffle");
+        let split_shuffle_dir = self.temp_dir.clone().join("split_shuffle");
         let shuffler = create_ivf_shuffler(
             split_shuffle_dir,
             new_centroids.len(),
@@ -1720,7 +1718,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let vectors = normalize_fsl(&vectors)?;
                 (DistanceType::L2, vectors)
             }
-            _ => (self.distance_type, vectors.clone()),
+            _ => (self.distance_type, vectors),
         };
         let params = KMeansParams::new(None, 50, 1, normalized_dist_type);
         let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
