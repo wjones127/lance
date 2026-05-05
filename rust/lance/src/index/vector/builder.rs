@@ -92,6 +92,31 @@ const REASSIGN_RANGE: usize = 64;
 // sample size for kmeans training when splitting a partition (sample_rate * k = 256 * 2)
 const SPLIT_SAMPLE_SIZE: usize = 512;
 
+/// Build a new centroid array that incorporates the results of partition splits.
+///
+/// For each `(part_idx, centroid1, centroid2)` in `splits`:
+/// - `original[part_idx]` is replaced by `centroid1`
+/// - `centroid2` is appended after all existing centroids
+///
+/// Unchanged centroids keep their original indices.  The k-th split's second
+/// centroid lands at index `original.len() + k`.
+fn apply_centroid_splits(
+    original: &FixedSizeListArray,
+    splits: &[(usize, ArrayRef, ArrayRef)],
+) -> Result<FixedSizeListArray> {
+    let mut new_centroids: Vec<ArrayRef> = original.iter().map(|v| v.unwrap()).collect();
+    for (part_idx, centroid1, centroid2) in splits {
+        new_centroids[*part_idx] = centroid1.clone();
+        new_centroids.push(centroid2.clone());
+    }
+    let refs: Vec<&dyn Array> = new_centroids.iter().map(|a| a.as_ref()).collect();
+    let concatenated = arrow::compute::concat(&refs)?;
+    Ok(FixedSizeListArray::try_new_from_values(
+        concatenated,
+        original.value_length(),
+    )?)
+}
+
 // Builder for IVF index
 // The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
 // for each partition.
@@ -688,7 +713,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     let progress_completed =
                         completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    progress_clone.stage_progress("shuffle", progress_completed).await?;
+                    progress_clone
+                        .stage_progress("shuffle", progress_completed)
+                        .await?;
 
                     match batch.schema().column_with_name(code_column) {
                         Some(_) => {
@@ -1526,9 +1553,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
         let centroids = ivf.centroids_array().unwrap();
-        let mut new_centroids: Vec<ArrayRef> =
-            Vec::with_capacity(ivf.num_partitions() + split_partitions.len());
-        new_centroids.extend(centroids.iter().map(|vec| vec.unwrap()));
 
         // Train split centroids in parallel (low memory — only samples).
         let trained_centroids = stream::iter(split_partitions.iter().copied())
@@ -1537,28 +1561,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut actual_splits = Vec::new();
+        let mut splits = Vec::new();
         for (&part_idx, centroids_opt) in split_partitions.iter().zip(trained_centroids) {
             let Some((centroid1, centroid2)) = centroids_opt else {
                 continue;
             };
-            // Replace the original centroid with centroid1; append centroid2
-            new_centroids[part_idx] = centroid1;
-            new_centroids.push(centroid2);
-            actual_splits.push(part_idx);
+            splits.push((part_idx, centroid1, centroid2));
         }
 
-        if actual_splits.is_empty() {
-            return Ok((centroids.clone(), actual_splits));
+        if splits.is_empty() {
+            return Ok((centroids.clone(), vec![]));
         }
 
-        let concatenated = new_centroids
-            .iter()
-            .map(|vec| vec.as_ref())
-            .collect::<Vec<_>>();
-        let concatenated = arrow::compute::concat(&concatenated)?;
-        let new_centroids =
-            FixedSizeListArray::try_new_from_values(concatenated, centroids.value_length())?;
+        let actual_splits: Vec<usize> = splits.iter().map(|(idx, _, _)| *idx).collect();
+        let new_centroids = apply_centroid_splits(centroids, &splits)?;
 
         Ok((new_centroids, actual_splits))
     }
@@ -2218,6 +2234,45 @@ mod tests {
         fn total_loss(&self) -> Option<f64> {
             None
         }
+    }
+
+    // Helper to read centroid i from a FixedSizeListArray as a Vec<f32>
+    fn centroid_values(arr: &FixedSizeListArray, i: usize) -> Vec<f32> {
+        arr.value(i).as_primitive::<Float32Type>().values().to_vec()
+    }
+
+    #[test]
+    fn apply_centroid_splits_correct_count_and_ordering() {
+        // 4 original centroids at [0,0], [1,1], [2,2], [3,3].
+        // Split partitions 1 and 3; verify that:
+        //   - result has 6 centroids (4 original + 2 splits)
+        //   - unchanged partition indices 0 and 2 keep their original values
+        //   - split partitions 1 and 3 have centroid1 at their original index
+        //   - centroid2 for each split is appended at the end (indices 4, 5)
+        let original = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0]),
+            2,
+        )
+        .unwrap();
+
+        let c1_for_1: ArrayRef = Arc::new(Float32Array::from(vec![1.1_f32, 1.1]));
+        let c2_for_1: ArrayRef = Arc::new(Float32Array::from(vec![0.9_f32, 0.9]));
+        let c1_for_3: ArrayRef = Arc::new(Float32Array::from(vec![3.1_f32, 3.1]));
+        let c2_for_3: ArrayRef = Arc::new(Float32Array::from(vec![2.9_f32, 2.9]));
+
+        let splits = vec![(1_usize, c1_for_1, c2_for_1), (3_usize, c1_for_3, c2_for_3)];
+        let result = apply_centroid_splits(&original, &splits).unwrap();
+
+        assert_eq!(result.len(), 6);
+        // Unchanged partitions
+        assert_eq!(centroid_values(&result, 0), [0.0, 0.0]);
+        assert_eq!(centroid_values(&result, 2), [2.0, 2.0]);
+        // Replaced centroids (centroid1 for each split partition)
+        assert_eq!(centroid_values(&result, 1), [1.1, 1.1]);
+        assert_eq!(centroid_values(&result, 3), [3.1, 3.1]);
+        // Appended centroid2s, in split order
+        assert_eq!(centroid_values(&result, 4), [0.9, 0.9]);
+        assert_eq!(centroid_values(&result, 5), [2.9, 2.9]);
     }
 
     #[test]
