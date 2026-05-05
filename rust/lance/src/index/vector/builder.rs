@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::{collections::HashMap, pin::Pin};
 
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
@@ -634,13 +635,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             HashMap::new()
         };
         let progress = self.progress.clone();
-        progress.stage_start("shuffle", None, "batches").await?;
+        let total = if let (lower, Some(upper)) = data.size_hint()
+            && lower == upper
+        {
+            Some(lower as u64)
+        } else {
+            None
+        };
+        progress.stage_start("shuffle", total, "batches").await?;
+
+        let completed = Arc::new(AtomicU64::new(0));
+        let progress_clone = progress.clone();
 
         let partition_map = Arc::new(precomputed_partitions);
         let mut transformed_stream = Box::pin(
             data.map(move |batch| {
                 let partition_map = partition_map.clone();
                 let ivf_transformer = transformer.clone();
+                let completed = completed.clone();
+                let progress_clone = progress_clone.clone();
                 tokio::spawn(async move {
                     let mut batch = batch?;
                     if !partition_map.is_empty() {
@@ -672,6 +685,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batch = batch.take(&indices)?;
                         }
                     }
+
+                    let progress_completed =
+                        completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    progress_clone.stage_progress("shuffle", progress_completed).await?;
+
                     match batch.schema().column_with_name(code_column) {
                         Some(_) => {
                             // this batch is already transformed (in case of GPU training)
