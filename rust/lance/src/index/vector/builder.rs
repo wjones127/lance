@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, pin::Pin};
 
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
@@ -122,7 +122,7 @@ fn apply_centroid_splits(
 // for each partition.
 // To build the index for the whole dataset, call `build` method.
 // To build the index for given IVF, quantizer, data stream,
-// call `with_ivf`, `with_quantizer`, `shuffle_data`, and `build` in order.
+// call `with_ivf`, `with_quantizer`, `shuffle_data_input`, and `build` in order.
 pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     store: ObjectStore,
     column: String,
@@ -141,6 +141,10 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     ivf: Option<IvfModel>,
     quantizer: Option<Q>,
     shuffle_reader: Option<Arc<dyn ShuffleReader>>,
+    // unindexed input stream attached by callers; consumed during `build`'s
+    // shuffle stage so progress is reported. Wrapped in Mutex so the builder
+    // remains `Sync` (the boxed dyn Stream is not Sync on its own).
+    shuffle_data_input: Mutex<Option<UnindexedStream>>,
 
     // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
@@ -165,6 +169,8 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
 
 type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
+
+type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     #[allow(clippy::too_many_arguments)]
@@ -198,6 +204,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ivf: None,
             quantizer: None,
             shuffle_reader: None,
+            shuffle_data_input: Mutex::new(None),
             existing_indices: Vec::new(),
             frag_reuse_index,
             fragment_filter: None,
@@ -264,6 +271,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ivf: Some(ivf_index.ivf_model().clone()),
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
+            shuffle_data_input: Mutex::new(None),
             existing_indices: vec![index],
             frag_reuse_index: None,
             fragment_filter: None,
@@ -296,7 +304,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         if self.shuffle_reader.is_none() {
             let num_rows = self.num_rows_to_shuffle().await?;
             progress.stage_start("shuffle", num_rows, "rows").await?;
-            self.shuffle_dataset().boxed().await?;
+            let input = self.shuffle_data_input.lock().unwrap().take();
+            if let Some(input) = input {
+                self.shuffle_data(Some(input)).boxed().await?;
+            } else {
+                self.shuffle_dataset().boxed().await?;
+            }
             progress.stage_complete("shuffle").await?;
         }
 
@@ -612,12 +625,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(())
     }
 
+    /// Attach an unindexed input stream. The shuffle is deferred until
+    /// `build()` so progress reporting wraps the actual shuffle work.
+    /// Data must have schema | ROW_ID | vector_column |.
+    pub fn shuffle_data_input(
+        &mut self,
+        data: Option<impl RecordBatchStream + Unpin + 'static>,
+    ) -> &mut Self {
+        *self.shuffle_data_input.lock().unwrap() = data.map(|d| Box::new(d) as UnindexedStream);
+        self
+    }
+
     // shuffle the unindexed data and existing indices
     // data must be with schema | ROW_ID | vector_column |
     // the shuffled data will be with schema | ROW_ID | PART_ID | code_column |
     pub async fn shuffle_data(
         &mut self,
-        data: Option<impl RecordBatchStream + Unpin + 'static>,
+        data: Option<impl Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
     ) -> Result<&mut Self> {
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input("IVF not set before shuffle data"));
@@ -667,18 +691,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         } else {
             None
         };
-        progress.stage_start("shuffle", total, "batches").await?;
-
-        let completed = Arc::new(AtomicU64::new(0));
-        let progress_clone = progress.clone();
 
         let partition_map = Arc::new(precomputed_partitions);
         let mut transformed_stream = Box::pin(
             data.map(move |batch| {
                 let partition_map = partition_map.clone();
                 let ivf_transformer = transformer.clone();
-                let completed = completed.clone();
-                let progress_clone = progress_clone.clone();
                 tokio::spawn(async move {
                     let mut batch = batch?;
                     if !partition_map.is_empty() {
@@ -710,12 +728,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batch = batch.take(&indices)?;
                         }
                     }
-
-                    let progress_completed =
-                        completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    progress_clone
-                        .stage_progress("shuffle", progress_completed)
-                        .await?;
 
                     match batch.schema().column_with_name(code_column) {
                         Some(_) => {
@@ -756,7 +768,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .await?
                 .into(),
         );
-        progress.stage_complete("shuffle").await?;
 
         Ok(self)
     }
