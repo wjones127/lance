@@ -9,7 +9,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
@@ -17,7 +17,9 @@ use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
-use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{
+    self as current_reader, DEFAULT_READ_CHUNK_SIZE, FileReaderOptions, ReaderProjection,
+};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -27,6 +29,7 @@ use lance_table::format::{IndexFile, list_index_files_with_sizes};
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
 /// An index store that serializes scalar indices using the lance format
@@ -219,6 +222,33 @@ impl IndexReader for current_reader::FileReader {
             .await?;
         assert_eq!(batches.len(), 1);
         Ok(batches[0].clone())
+    }
+
+    async fn read_range_stream(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+        if range.is_empty() {
+            return Ok(futures::stream::empty().boxed());
+        }
+        let projection = if let Some(projection) = projection {
+            ReaderProjection::from_column_names(
+                self.metadata().version(),
+                self.schema(),
+                projection,
+            )?
+        } else {
+            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+        };
+        let stream = self.read_range_as_stream(
+            range.start as u64..range.end as u64,
+            u32::MAX,
+            2,
+            projection,
+            Some(DEFAULT_READ_CHUNK_SIZE),
+        )?;
+        Ok(StreamExt::boxed(stream))
     }
 
     // V2 format has removed the row group concept,

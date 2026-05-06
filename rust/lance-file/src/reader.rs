@@ -1229,6 +1229,43 @@ impl FileReader {
         )))
     }
 
+    /// Read a range of rows as a stream of record batches.
+    ///
+    /// Similar to [`Self::read_stream_projected`] with [`ReadBatchParams::Range`],
+    /// but allows overriding `batch_size_bytes` per call instead of using the
+    /// reader-level default from [`FileReaderOptions`].
+    pub fn read_range_as_stream(
+        &self,
+        range: Range<u64>,
+        batch_size: u32,
+        batch_readahead: u32,
+        projection: ReaderProjection,
+        batch_size_bytes: Option<u64>,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
+        let tasks_stream = Self::do_read_range(
+            self.collect_columns_from_projection(&projection)?,
+            self.scheduler.clone(),
+            self.cache.clone(),
+            self.num_rows,
+            self.decoder_plugins.clone(),
+            range,
+            batch_size,
+            projection,
+            FilterExpression::no_filter(),
+            self.options.decoder_config.clone(),
+            batch_size_bytes,
+        )?;
+        let batch_stream = tasks_stream
+            .map(|task| task.task)
+            .buffered(batch_readahead as usize)
+            .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            batch_stream,
+        )))
+    }
+
     fn take_rows_blocking(
         &self,
         indices: Vec<u64>,
