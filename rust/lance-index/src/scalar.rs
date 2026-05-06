@@ -20,10 +20,10 @@ use std::{any::Any, ops::Bound, sync::Arc};
 use datafusion_expr::Expr;
 use datafusion_expr::expr::ScalarFunction;
 use deepsize::DeepSizeOf;
-use futures::{Stream, StreamExt};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, Result};
+use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 
@@ -219,9 +219,13 @@ pub trait IndexReader: Send + Sync {
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let batch = self.read_range(range, projection).await?;
-        Ok(futures::stream::once(async move { Ok(batch) }).boxed())
+        let schema = batch.schema();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move { Ok(batch) }),
+        )))
     }
     /// Return the number of batches in the file
     async fn num_batches(&self, batch_size: u64) -> u32;

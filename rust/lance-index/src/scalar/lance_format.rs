@@ -9,7 +9,7 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
@@ -17,9 +17,7 @@ use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
-use lance_file::reader::{
-    self as current_reader, DEFAULT_READ_CHUNK_SIZE, FileReaderOptions, ReaderProjection,
-};
+use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -228,9 +226,12 @@ impl IndexReader for current_reader::FileReader {
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
         if range.is_empty() {
-            return Ok(futures::stream::empty().boxed());
+            return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+                Arc::new(self.schema().as_ref().into()),
+                futures::stream::empty(),
+            )));
         }
         let projection = if let Some(projection) = projection {
             ReaderProjection::from_column_names(
@@ -241,14 +242,13 @@ impl IndexReader for current_reader::FileReader {
         } else {
             ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
         };
-        let stream = self.read_range_as_stream(
-            range.start as u64..range.end as u64,
-            u32::MAX,
+        self.read_stream_projected(
+            ReadBatchParams::Range(range),
+            4096,
             2,
             projection,
-            Some(DEFAULT_READ_CHUNK_SIZE),
-        )?;
-        Ok(StreamExt::boxed(stream))
+            FilterExpression::no_filter(),
+        )
     }
 
     // V2 format has removed the row group concept,
