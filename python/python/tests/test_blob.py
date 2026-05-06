@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import importlib
 import io
 import subprocess
 import sys
@@ -10,7 +11,35 @@ import textwrap
 import lance
 import pyarrow as pa
 import pytest
-from lance import Blob, BlobColumn, DatasetBasePath
+from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+
+lance_dataset_module = importlib.import_module("lance.dataset")
+
+
+def _blob_row_ids(dataset):
+    return dataset.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+
+
+def _blob_row_addresses(dataset):
+    return (
+        dataset.to_table(columns=["idx"], with_row_address=True)
+        .column("_rowaddr")
+        .to_pylist()
+    )
+
+
+def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
+    addresses = _blob_row_addresses(dataset_with_blobs)
+    expected = [(addresses[4], b"quux"), (addresses[0], b"foo")]
+
+    if selection_kind == "ids":
+        return [
+            _blob_row_ids(dataset_with_blobs)[4],
+            _blob_row_ids(dataset_with_blobs)[0],
+        ], expected
+    if selection_kind == "addresses":
+        return [addresses[4], addresses[0]], expected
+    return [4, 0], expected
 
 
 def test_blob_read_from_binary():
@@ -248,6 +277,134 @@ def test_blob_by_indices(tmp_path, dataset_with_blobs):
             assert f1.read() == f2.read()
 
 
+@pytest.mark.parametrize(
+    ("selection_kind", "selection_values", "expected"),
+    [
+        ("ids", [0, (1 << 32) + 1], [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
+        ("addresses", [0, (1 << 32) + 1], [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
+        ("indices", [0, 4], [(0, b"foo"), ((1 << 32) + 1, b"quux")]),
+    ],
+)
+def test_read_blobs(dataset_with_blobs, selection_kind, selection_values, expected):
+    kwargs = {selection_kind: selection_values}
+
+    blobs = dataset_with_blobs.read_blobs(
+        "blobs",
+        **kwargs,
+        io_buffer_size=1024,
+        preserve_order=True,
+    )
+
+    assert blobs == expected
+
+
+def test_read_blobs_requires_single_selector(dataset_with_blobs):
+    with pytest.raises(
+        ValueError, match="Exactly one of ids, indices, or addresses must be specified"
+    ):
+        dataset_with_blobs.read_blobs("blobs", ids=[0], indices=[0])
+
+
+def test_read_blobs_requires_selector(dataset_with_blobs):
+    with pytest.raises(
+        ValueError, match="Exactly one of ids, indices, or addresses must be specified"
+    ):
+        dataset_with_blobs.read_blobs("blobs")
+
+
+def test_read_blobs_rejects_non_blob_column(dataset_with_blobs):
+    with pytest.raises(ValueError, match="not a blob column"):
+        dataset_with_blobs.read_blobs("idx", indices=[0])
+
+
+@pytest.mark.parametrize(
+    ("selection_kind", "selection_values", "expected"),
+    [
+        (
+            "ids",
+            pa.array([0, (1 << 32) + 1], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
+        (
+            "addresses",
+            pa.array([0, (1 << 32) + 1], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
+        (
+            "indices",
+            pa.array([0, 4], type=pa.uint64()),
+            [(0, b"foo"), ((1 << 32) + 1, b"quux")],
+        ),
+    ],
+)
+def test_read_blobs_accepts_arrow_array_selectors(
+    dataset_with_blobs, selection_kind, selection_values, expected
+):
+    kwargs = {selection_kind: selection_values}
+
+    blobs = dataset_with_blobs.read_blobs("blobs", **kwargs)
+
+    assert blobs == expected
+
+
+@pytest.mark.parametrize(
+    ("selection_kind", "selection_values"),
+    [
+        ("ids", []),
+        ("addresses", []),
+        ("indices", []),
+        ("ids", pa.array([], type=pa.uint64())),
+        ("addresses", pa.array([], type=pa.uint64())),
+        ("indices", pa.array([], type=pa.uint64())),
+    ],
+)
+def test_read_blobs_accepts_empty_selection(
+    dataset_with_blobs, selection_kind, selection_values
+):
+    kwargs = {selection_kind: selection_values}
+
+    assert dataset_with_blobs.read_blobs("blobs", **kwargs) == []
+
+
+@pytest.mark.parametrize(
+    ("planner_kwargs", "error_message"),
+    [
+        ({"io_buffer_size": 0}, "io_buffer_size must be greater than 0"),
+    ],
+)
+def test_read_blobs_rejects_invalid_planner_options(
+    dataset_with_blobs, planner_kwargs, error_message
+):
+    with pytest.raises(ValueError, match=error_message):
+        dataset_with_blobs.read_blobs("blobs", indices=[0], **planner_kwargs)
+
+
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+def test_read_blobs_preserves_input_order(dataset_with_blobs, selection_kind):
+    selection_values, expected = _out_of_order_blob_selection(
+        dataset_with_blobs, selection_kind
+    )
+    kwargs = {selection_kind: selection_values}
+
+    blobs = dataset_with_blobs.read_blobs("blobs", **kwargs, preserve_order=True)
+
+    assert blobs == expected
+
+
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+def test_read_blobs_without_preserve_order_returns_same_rows(
+    dataset_with_blobs, selection_kind
+):
+    selection_values, expected = _out_of_order_blob_selection(
+        dataset_with_blobs, selection_kind
+    )
+    kwargs = {selection_kind: selection_values}
+
+    blobs = dataset_with_blobs.read_blobs("blobs", **kwargs, preserve_order=False)
+
+    assert sorted(blobs) == sorted(expected)
+
+
 def test_blob_file_seek(tmp_path, dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)
@@ -463,6 +620,12 @@ def test_blob_extension_write_external_slice(tmp_path):
         with blob_file as f:
             assert f.read() == expected
 
+    assert ds.read_blobs("blob", indices=[0, 1, 2]) == [
+        (0, b"alpha"),
+        (1, b"bravo"),
+        (2, b"charlie"),
+    ]
+
 
 def test_blob_extension_write_external_slice_ingest(tmp_path):
     tar_path = tmp_path / "container.tar"
@@ -544,3 +707,121 @@ def test_blob_extension_take_blobs_multi_base(payload, is_dataset_root, tmp_path
     assert len(blobs) == 1
     with blobs[0] as f:
         assert f.read() == payload
+
+    assert ds.read_blobs("blob", indices=[0]) == [(0, payload)]
+
+
+@pytest.fixture
+def dataset_for_pandas_blob_tests(tmp_path):
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "blob": pa.array([b"hello", None, b"world"], pa.large_binary()),
+            "bin": pa.array([b"x", b"y", b"z"], pa.large_binary()),
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field(
+                    "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                ),
+                pa.field("bin", pa.large_binary()),
+            ]
+        ),
+    )
+    return lance.write_dataset(table, tmp_path / "blob_pandas_ds")
+
+
+def test_dataset_to_pandas_blob_lazy(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.to_pandas()
+
+    assert list(df.columns) == ["id", "blob", "bin"]
+    assert isinstance(df.iloc[0]["blob"], BlobFile)
+    assert df.iloc[1]["blob"] is None
+    assert isinstance(df.iloc[2]["blob"], BlobFile)
+    assert df["bin"].tolist() == [b"x", b"y", b"z"]
+    assert [df.iloc[0]["blob"].readall(), df.iloc[2]["blob"].readall()] == [
+        b"hello",
+        b"world",
+    ]
+
+
+def test_dataset_to_pandas_blob_bytes(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.to_pandas(blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob", "bin"]
+    assert df["blob"].tolist() == [b"hello", None, b"world"]
+    assert df["bin"].tolist() == [b"x", b"y", b"z"]
+
+
+def test_dataset_to_pandas_blob_descriptions(dataset_for_pandas_blob_tests):
+    descriptions_df = dataset_for_pandas_blob_tests.to_pandas(blob_mode="descriptions")
+    table_df = dataset_for_pandas_blob_tests.to_table().to_pandas()
+
+    assert descriptions_df.equals(table_df)
+
+
+def test_scanner_to_pandas_blob_alias(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns={"video": "blob", "id": "id"}
+    ).to_pandas()
+
+    assert list(df.columns) == ["video", "id"]
+    assert isinstance(df.iloc[0]["video"], BlobFile)
+    assert df.iloc[1]["video"] is None
+    assert df.iloc[2]["video"].readall() == b"world"
+
+
+def test_scanner_to_pandas_blob_filter_limit_order(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns=["id", "blob"],
+        filter="id > 1",
+        limit=1,
+        order_by=["id"],
+    ).to_pandas(blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["id"].tolist() == [2]
+    assert df["blob"].tolist() == [None]
+
+
+def test_scanner_to_pandas_blob_empty_result(dataset_for_pandas_blob_tests):
+    df = dataset_for_pandas_blob_tests.scanner(
+        columns=["id", "blob"], filter="id > 10"
+    ).to_pandas()
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df.empty
+
+
+def test_fragment_to_pandas_blob(dataset_for_pandas_blob_tests):
+    fragment = dataset_for_pandas_blob_tests.get_fragments()[0]
+    df = fragment.to_pandas(columns=["id", "blob"], blob_mode="bytes")
+
+    assert list(df.columns) == ["id", "blob"]
+    assert df["blob"].tolist() == [b"hello", None, b"world"]
+
+
+def test_dataset_to_pandas_invalid_blob_mode(dataset_for_pandas_blob_tests):
+    with pytest.raises(ValueError, match="blob_mode must be one of"):
+        dataset_for_pandas_blob_tests.to_pandas(blob_mode="inline")
+
+
+def test_blob_column_sources_rejects_unmappable_transform(
+    dataset_for_pandas_blob_tests,
+):
+    projected_schema = pa.schema(
+        [
+            pa.field(
+                "video",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            )
+        ]
+    )
+    snapshot = {"_columns_with_transform": (("video", "concat(blob, blob)"),)}
+
+    with pytest.raises(NotImplementedError, match="direct blob column references"):
+        lance_dataset_module._blob_column_sources(
+            projected_schema, snapshot, dataset_for_pandas_blob_tests.schema
+        )

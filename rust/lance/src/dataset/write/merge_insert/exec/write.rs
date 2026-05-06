@@ -29,7 +29,8 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    SourceDedupeBehavior, create_duplicate_row_error, format_key_values_on_columns,
+    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
+    format_key_values_on_columns,
 };
 use crate::{
     Dataset,
@@ -181,7 +182,7 @@ pub struct FullSchemaMergeInsertExec {
     input: Arc<dyn ExecutionPlan>,
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
@@ -199,12 +200,12 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(empty_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         // Check if ON columns match the schema's unenforced primary key
         let field_ids: Vec<i32> = params
@@ -418,18 +419,19 @@ impl FullSchemaMergeInsertExec {
         // from the logical join, leaving us with the merged data columns plus special columns
         let total_fields = input_schema.fields().len();
 
-        // Select all columns that are data columns (not _rowaddr or __action)
+        // Select all columns that are data columns (not _rowaddr, __action, or the sentinel)
         // These represent the final merged data values to write
         let data_column_indices: Vec<usize> = (0..total_fields)
             .filter(|&idx| {
                 let field = input_schema.field(idx);
                 let name = field.name();
-                // Skip special columns: _rowaddr and __action
+                // Skip special columns: _rowaddr, __action, and the source-presence sentinel
                 idx != rowaddr_idx
                     && idx != action_idx
                     && name != ROW_ADDR
                     && name != ROW_ID
                     && name != MERGE_ACTION_COLUMN
+                    && name != MERGE_SOURCE_SENTINEL
             })
             .collect();
 
@@ -790,7 +792,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -926,6 +928,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                     .collect(),
                 update_mode: Some(RewriteRows),
                 inserted_rows_filter: inserted_rows_filter.clone(),
+                updated_fragment_offsets: None,
             };
 
             // Step 5: Create and store the transaction

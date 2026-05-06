@@ -14,7 +14,9 @@ use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use log::info;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
+use tracing::instrument;
 use uuid::Uuid;
 
 use super::super::index::MemIndexConfig;
@@ -77,6 +79,7 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage (data files, indexes, bloom filter).
+    #[instrument(name = "mt_flush_storage", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count()))]
     pub async fn flush(&self, memtable: &MemTable, epoch: u64) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
@@ -106,7 +109,7 @@ impl MemTableFlusher {
 
         let rows_flushed = self.write_data_file(&gen_path, memtable).await?;
 
-        let bloom_path = gen_path.child("bloom_filter.bin");
+        let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
@@ -134,6 +137,7 @@ impl MemTableFlusher {
     ///
     /// Returns the total number of rows written, which is needed for
     /// reversing row positions in indexes.
+    #[instrument(name = "mt_write_data_file", level = "debug", skip_all, fields(path = %path))]
     async fn write_data_file(&self, path: &Path, memtable: &MemTable) -> Result<usize> {
         use arrow_array::RecordBatchIterator;
 
@@ -180,6 +184,7 @@ impl MemTableFlusher {
     }
 
     /// Flush the MemTable to storage with indexes.
+    #[instrument(name = "mt_flush_with_indexes", level = "info", skip_all, fields(shard_id = %self.shard_id, epoch, generation = memtable.generation(), row_count = memtable.row_count(), index_count = index_configs.len()))]
     pub async fn flush_with_indexes(
         &self,
         memtable: &MemTable,
@@ -277,7 +282,7 @@ impl MemTableFlusher {
                 .await?;
         }
 
-        let bloom_path = gen_path.child("bloom_filter.bin");
+        let bloom_path = gen_path.clone().join("bloom_filter.bin");
         self.write_bloom_filter(&bloom_path, memtable.bloom_filter())
             .await?;
 
@@ -442,7 +447,10 @@ impl MemTableFlusher {
 
             // Create the index store for writing
             let index_uuid = uuid::Uuid::new_v4();
-            let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
+            let index_dir = gen_path
+                .clone()
+                .join("_indices")
+                .join(index_uuid.to_string());
             let index_store = LanceIndexStore::new(
                 self.object_store.clone(),
                 index_dir.clone(),
@@ -579,7 +587,10 @@ impl MemTableFlusher {
         use std::sync::Arc;
 
         let index_uuid = uuid::Uuid::new_v4();
-        let index_dir = gen_path.child("_indices").child(index_uuid.to_string());
+        let index_dir = gen_path
+            .clone()
+            .join("_indices")
+            .join(index_uuid.to_string());
 
         // Get partition data from in-memory index with reversed row positions
         // since the flushed data is in reverse order.
@@ -606,8 +617,8 @@ impl MemTableFlusher {
         let index_schema: ArrowSchema = FlatIndex::schema().as_ref().clone();
 
         // Create file writers
-        let storage_path = index_dir.child(INDEX_AUXILIARY_FILE_NAME);
-        let index_path = index_dir.child(INDEX_FILE_NAME);
+        let storage_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let index_path = index_dir.clone().join(INDEX_FILE_NAME);
 
         let mut storage_writer = FileWriter::try_new(
             self.object_store.create(&storage_path).await?,
@@ -1051,7 +1062,7 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "LanceRead: ...full_filter=id = Int32(5)...
-  ScalarIndexQuery: query=[id = 5]@id_btree",
+  ScalarIndexQuery: query=[id = 5]@id_btree(BTree)",
         )
         .await
         .unwrap();

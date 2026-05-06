@@ -60,6 +60,7 @@ use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
+use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -79,11 +80,40 @@ pub(crate) async fn read_transaction_file(
     base_path: &Path,
     transaction_file: &str,
 ) -> Result<Transaction> {
-    let path = base_path.child(TRANSACTIONS_DIR).child(transaction_file);
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
     let result = object_store.inner.get(&path).await?;
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
     transaction.try_into()
+}
+
+/// Best-effort delete of a transaction file that is no longer needed.
+///
+/// Logs a warning on failure rather than propagating the error, since the
+/// primary operation has already failed and the orphaned file will eventually
+/// be removed by GC.
+async fn cleanup_transaction_file(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) {
+    if transaction_file.is_empty() {
+        return;
+    }
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
+    if let Err(e) = object_store.delete(&path).await {
+        log::warn!(
+            "Failed to clean up orphaned transaction file '{}': {}",
+            transaction_file,
+            e
+        );
+    }
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -93,7 +123,10 @@ pub(crate) async fn write_transaction_file(
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
-    let path = base_path.child(TRANSACTIONS_DIR).child(file_name.as_str());
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
@@ -153,7 +186,7 @@ async fn do_commit_new_dataset(
                 ref_path.clone(),
                 new_base_id,
                 branch_name.clone(),
-                transaction_file,
+                transaction_file.clone(),
             );
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
@@ -252,9 +285,13 @@ async fn do_commit_new_dataset(
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
+            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
-        Err(CommitError::OtherError(err)) => Err(err),
+        Err(CommitError::OtherError(err)) => {
+            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            Err(err)
+        }
     }
 }
 
@@ -465,17 +502,22 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     // We iterate over files in reverse order so that we only map the last field id
     seen_fields.clear();
     for fragment in fragments.iter_mut() {
-        for field_id in fragment
-            .files
-            .iter_mut()
-            .rev()
-            .flat_map(|file| file.fields.iter_mut())
-        {
-            if let Some(new_field_id) = old_field_id_mapping.get(field_id)
-                && seen_fields.insert(*field_id)
-            {
-                *field_id = *new_field_id;
-            }
+        for file in fragment.files.iter_mut().rev() {
+            let new_fields: Arc<[i32]> = file
+                .fields
+                .iter()
+                .map(|field_id| {
+                    if let Some(new_field_id) = old_field_id_mapping.get(field_id)
+                        && seen_fields.insert(*field_id)
+                    {
+                        *new_field_id
+                    } else {
+                        *field_id
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+            file.fields = new_fields;
         }
         seen_fields.clear();
     }
@@ -549,7 +591,7 @@ pub(crate) async fn migrate_fragments(
             let mut data_files = fragment.files.clone();
 
             // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store();
+            let object_store = dataset.object_store.as_ref();
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
@@ -558,7 +600,7 @@ pub(crate) async fn migrate_fragments(
                     } else {
                         Either::Right(async {
                             object_store
-                                .size(&dataset.base.child("data").child(file.path.clone()))
+                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -668,8 +710,9 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             let result = async {
                 let index_dir = dataset
                     .indice_files_dir(index)?
-                    .child(index.uuid.to_string());
-                list_index_files_with_sizes(&dataset.object_store, &index_dir).await
+                    .join(index.uuid.to_string());
+                let object_store = dataset.object_store_for_index(index).await?;
+                list_index_files_with_sizes(&object_store, &index_dir).await
             }
             .await;
             match result {
@@ -814,6 +857,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
+                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
                 return Err(err);
             }
         }
@@ -821,6 +865,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
+    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -876,7 +921,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // Note: object_store has been configured with WriteParams, but dataset.object_store()
+    // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
@@ -906,6 +951,9 @@ pub(crate) async fn commit_transaction(
     // Other transactions that may have been committed since the read_version.
     // We keep pair of (version, transaction). No other transactions to check initially
     let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
+    // Track the transaction file written in the current loop iteration so we can
+    // delete it if the commit ultimately fails.
+    let mut current_transaction_file = String::new();
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -933,11 +981,12 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
-        let transaction_file = if !write_config.disable_transaction_file() {
+        current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &transaction).await?
         } else {
             String::new()
         };
+        let transaction_file = current_transaction_file.as_str();
 
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
@@ -954,7 +1003,7 @@ pub(crate) async fn commit_transaction(
                     &dataset.base,
                     version,
                     write_config,
-                    &transaction_file,
+                    transaction_file,
                     &dataset.manifest,
                 )
                 .await?
@@ -962,7 +1011,7 @@ pub(crate) async fn commit_transaction(
             _ => transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
-                &transaction_file,
+                transaction_file,
                 write_config,
             )?,
         };
@@ -1055,6 +1104,14 @@ pub(crate) async fn commit_transaction(
                 }
 
                 if next_attempt_i < num_attempts {
+                    // The transaction file from this attempt is now stale; clean it up
+                    // before the next attempt writes a new one (possibly rebased).
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.base,
+                        &current_transaction_file,
+                    )
+                    .await;
                     tokio::time::sleep(backoff.next_backoff()).await;
                     continue;
                 } else {
@@ -1062,12 +1119,14 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                // If other error, return
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
                 return Err(err);
             }
         }
     }
 
+    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(
@@ -1094,7 +1153,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
-        CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
+        CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
     };
     use lance_testing::datagen::generate_random_array;
 
@@ -1702,6 +1761,77 @@ mod tests {
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
     }
 
+    /// A CommitHandler that always fails with OtherError, used to simulate
+    /// a manifest write failure so we can verify orphaned transaction files
+    /// are cleaned up.
+    #[derive(Debug)]
+    struct FailingCommitHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for FailingCommitHandler {
+        async fn commit(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+            _manifest_writer: ManifestWriter,
+            _naming_scheme: ManifestNamingScheme,
+            _transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            Err(CommitError::OtherError(lance_core::Error::io(
+                "simulated commit failure",
+            )))
+        }
+    }
+
+    fn count_txn_files(uri: &str) -> usize {
+        let tx_dir = std::path::Path::new(uri).join("_transactions");
+        std::fs::read_dir(&tx_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_transaction_file_cleanup_on_commit_failure() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+
+        // Create initial dataset with a normal commit handler.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, uri, None).await.unwrap();
+
+        let txn_files_before = count_txn_files(uri);
+
+        // Attempt to append with a commit handler that always fails.
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(FailingCommitHandler)),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let result = Dataset::write(reader, uri, Some(params)).await;
+        assert!(result.is_err(), "expected commit to fail");
+
+        // The failed commit must not leave any extra transaction files behind.
+        let txn_files_after = count_txn_files(uri);
+        assert_eq!(
+            txn_files_after,
+            txn_files_before,
+            "failed commit left {extra} orphaned transaction file(s)",
+            extra = txn_files_after.saturating_sub(txn_files_before),
+        );
+    }
     /// Helper to build a simple manifest for check_column_indices tests.
     fn make_manifest_with_file(
         schema: Schema,

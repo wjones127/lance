@@ -523,7 +523,7 @@ pub async fn infer_vector_index_details(
 ) -> Result<prost_types::Any> {
     let uuid = index.uuid.to_string();
     let index_dir = dataset.indice_files_dir(index)?;
-    let index_file = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
+    let index_file = index_dir.clone().join(uuid.as_str()).join(INDEX_FILE_NAME);
     let reader: Arc<dyn Reader> = dataset.object_store.open(&index_file).await?.into();
 
     let tailing_bytes = read_last_block(reader.as_ref()).await?;

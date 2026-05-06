@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+
+use datafusion::config::ConfigOptions;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -18,6 +20,7 @@ use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_dataf
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
+#[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
@@ -68,7 +71,7 @@ use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
-use lance_index::vector::{DIST_COL, Query};
+use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -81,6 +84,8 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -98,7 +103,10 @@ use crate::io::exec::{
 };
 use crate::io::exec::{AddRowOffsetExec, LanceFilterExec, LanceScanConfig, get_physical_optimizer};
 use crate::{Error, Result};
-use crate::{datatypes::Schema, io::exec::fts::BooleanQueryExec};
+use crate::{
+    datatypes::Schema,
+    io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children},
+};
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
@@ -165,6 +173,18 @@ pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
     )
     .unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
 });
+
+/// The user-set value of `LANCE_DEFAULT_IO_BUFFER_SIZE`, or `None` if the env var
+/// is unset or unparsable. Consult this from paths that have a sensible non-fixed
+/// default (e.g. `SchedulerConfig::max_bandwidth`) so the env var still takes
+/// precedence over that default. Re-reads the env var on each call so tests can
+/// mutate it.
+pub fn get_default_io_buffer_size_override() -> Option<u64> {
+    parse_env_var(
+        "LANCE_DEFAULT_IO_BUFFER_SIZE",
+        &DEFAULT_IO_BUFFER_SIZE_VALUE.to_string(),
+    )
+}
 
 /// Defines an ordering for a single column
 ///
@@ -719,6 +739,10 @@ pub struct Scanner {
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: Option<usize>,
 
+    /// If set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    batch_size_bytes: Option<u64>,
+
     /// Number of batches to prefetch
     batch_readahead: usize,
 
@@ -989,6 +1013,7 @@ impl Scanner {
             filter: LanceFilter::default(),
             full_text_query: None,
             batch_size: None,
+            batch_size_bytes: None,
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
@@ -1072,7 +1097,7 @@ impl Scanner {
         get_default_batch_size().unwrap_or_else(|| {
             self.batch_size.unwrap_or_else(|| {
                 std::cmp::max(
-                    self.dataset.object_store().block_size() / 4,
+                    self.dataset.object_store.as_ref().block_size() / 4,
                     BATCH_SIZE_FALLBACK,
                 )
             })
@@ -1261,9 +1286,26 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Set the batch size.
+    /// Set the maximum number of rows per batch.
+    ///
+    /// Note: this can be overridden by [`Self::batch_size_bytes`] or by a dataset-level
+    /// `batch_size_bytes` set via [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  When a byte-based
+    /// batch size is active, the row-based batch size is used only as an initial estimate.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the target batch size in bytes.
+    ///
+    /// When set, the scanner will produce batches whose total size in bytes
+    /// is approximately this value, overriding the row-based `batch_size`.
+    ///
+    /// This can also be configured at the dataset level via
+    /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).  A scanner-level setting takes
+    /// precedence over the dataset-level default.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
         self
     }
 
@@ -1481,6 +1523,7 @@ impl Scanner {
             refine_factor: None,
             metric_type: None,
             use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
         });
         Ok(self)
@@ -1648,6 +1691,24 @@ impl Scanner {
         self
     }
 
+    /// Configure partition-search concurrency for each vector query.
+    ///
+    /// The default is 0.
+    /// Value 0 selects the automatic policy; today this resolves to 1 for the
+    /// sequential fast path unless an index implementation overrides it.
+    /// Value -1 uses the CPU pool size.
+    /// Value 1 uses the single-worker sequential partition search path.
+    /// Values >= 2 use the partition-parallel path and are clamped to the CPU
+    /// pool size by the execution layer.
+    pub fn query_parallelism(&mut self, query_parallelism: i32) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.query_parallelism = query_parallelism;
+        } else {
+            log::warn!("query_parallelism is not set because nearest has not been called yet");
+        }
+        self
+    }
+
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
         self.legacy_with_row_id = true;
@@ -1686,6 +1747,30 @@ impl Scanner {
     pub fn with_file_reader_options(&mut self, options: FileReaderOptions) -> &mut Self {
         self.file_reader_options = Some(options);
         self
+    }
+
+    /// Compute the resolved file reader options, merging the scanner's explicit
+    /// `file_reader_options`, the dataset-level defaults, and the `batch_size_bytes`
+    /// setting.
+    fn resolved_file_reader_options(&self) -> Option<FileReaderOptions> {
+        let base = self
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.clone());
+        match (base, self.batch_size_bytes) {
+            (Some(mut opts), Some(bsb)) => {
+                if opts.batch_size_bytes.is_none() {
+                    opts.batch_size_bytes = Some(bsb);
+                }
+                Some(opts)
+            }
+            (Some(opts), None) => Some(opts),
+            (None, Some(bsb)) => Some(FileReaderOptions {
+                batch_size_bytes: Some(bsb),
+                ..Default::default()
+            }),
+            (None, None) => None,
+        }
     }
 
     /// Create a physical expression for a column that may be nested
@@ -2126,7 +2211,7 @@ impl Scanner {
                 }
 
                 let byte_width = field.data_type().byte_width_opt();
-                let is_cloud = self.dataset.object_store().is_cloud();
+                let is_cloud = self.dataset.object_store.as_ref().is_cloud();
                 if is_cloud {
                     byte_width.is_some_and(|bw| bw < 1000)
                 } else {
@@ -2511,7 +2596,7 @@ impl Scanner {
         }
 
         let optimizer = get_physical_optimizer();
-        let options = Default::default();
+        let options: ConfigOptions = Default::default();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -2656,6 +2741,10 @@ impl Scanner {
 
         if let Some(batch_size) = self.batch_size {
             read_options = read_options.with_batch_size(batch_size as u32);
+        }
+
+        if let Some(file_reader_options) = self.resolved_file_reader_options() {
+            read_options = read_options.with_file_reader_options(file_reader_options);
         }
 
         if let Some(fragment_readahead) = self.fragment_readahead {
@@ -3154,82 +3243,48 @@ impl Scanner {
                 // so that we won't miss possible matches
                 let unlimited_params = params.clone().with_limit(None);
 
-                // For should queries, union the results of each subquery
                 let mut should = Vec::with_capacity(query.should.len());
                 for subquery in &query.should {
-                    let plan = Box::pin(self.plan_fts(
-                        subquery,
-                        &unlimited_params,
-                        filter_plan,
-                        prefilter_source,
-                    ))
-                    .await?;
-                    should.push(plan);
+                    should.push(
+                        Box::pin(self.plan_fts(
+                            subquery,
+                            &unlimited_params,
+                            filter_plan,
+                            prefilter_source,
+                        ))
+                        .await?,
+                    );
                 }
-                let should = if should.is_empty() {
-                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
-                } else if should.len() == 1 {
-                    should.pop().unwrap()
-                } else {
-                    let unioned = UnionExec::try_new(should)?;
-                    Arc::new(RepartitionExec::try_new(
-                        unioned,
-                        Partitioning::RoundRobinBatch(1),
-                    )?)
-                };
-
-                // For must queries, inner join the results of each subquery on row_id
-                let mut must = None;
-                for query in &query.must {
-                    let plan = Box::pin(self.plan_fts(
-                        query,
-                        &unlimited_params,
-                        filter_plan,
-                        prefilter_source,
-                    ))
-                    .await?;
-                    if let Some(joined_plan) = must {
-                        must = Some(Arc::new(HashJoinExec::try_new(
-                            joined_plan,
-                            plan,
-                            vec![(
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                                Arc::new(Column::new_with_schema(ROW_ID, &FTS_SCHEMA)?),
-                            )],
-                            None,
-                            &datafusion_expr::JoinType::Inner,
-                            None,
-                            datafusion_physical_plan::joins::PartitionMode::CollectLeft,
-                            NullEquality::NullEqualsNothing,
-                        )?) as _);
-                    } else {
-                        must = Some(plan);
-                    }
+                let mut must = Vec::with_capacity(query.must.len());
+                for subquery in &query.must {
+                    must.push(
+                        Box::pin(self.plan_fts(
+                            subquery,
+                            &unlimited_params,
+                            filter_plan,
+                            prefilter_source,
+                        ))
+                        .await?,
+                    );
                 }
-
-                // For must_not queries, union the results of each subquery
                 let mut must_not = Vec::with_capacity(query.must_not.len());
-                for query in &query.must_not {
-                    let plan = Box::pin(self.plan_fts(
-                        query,
-                        &unlimited_params,
-                        filter_plan,
-                        prefilter_source,
-                    ))
-                    .await?;
-                    must_not.push(plan);
+                for subquery in &query.must_not {
+                    must_not.push(
+                        Box::pin(self.plan_fts(
+                            subquery,
+                            &unlimited_params,
+                            filter_plan,
+                            prefilter_source,
+                        ))
+                        .await?,
+                    );
                 }
-                let must_not = if must_not.is_empty() {
-                    Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
-                } else if must_not.len() == 1 {
-                    must_not.pop().unwrap()
-                } else {
-                    let unioned = UnionExec::try_new(must_not)?;
-                    Arc::new(RepartitionExec::try_new(
-                        unioned,
-                        Partitioning::RoundRobinBatch(1),
-                    )?)
-                };
+
+                let should = build_boolean_query_children(BoolSlot::Should, should)?
+                    .expect("Should slot always returns Some");
+                let must = build_boolean_query_children(BoolSlot::Must, must)?;
+                let must_not = build_boolean_query_children(BoolSlot::MustNot, must_not)?
+                    .expect("MustNot slot always returns Some");
 
                 if query.should.is_empty() && must.is_none() {
                     return Err(Error::invalid_input(
@@ -3260,20 +3315,14 @@ impl Scanner {
             "the column must be specified in the query".to_string(),
         ))?;
 
-        let index_meta = self
-            .dataset
-            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+        let segments = load_segments(&self.dataset, &column)
             .await?
             .ok_or(Error::invalid_input(format!(
                 "No Inverted index found for column {}",
                 column
             )))?;
+        let details = load_segment_details(&self.dataset, &column, &segments).await?;
 
-        let details_any =
-            crate::index::scalar::fetch_index_details(&self.dataset, &column, &index_meta).await?;
-        let details = details_any
-            .as_ref()
-            .to_msg::<lance_index::pbold::InvertedIndexDetails>()?;
         if !details.with_position {
             return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
                 .to_string()));
@@ -3765,16 +3814,18 @@ impl Scanner {
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(search) => {
-                let idx = self
-                    .dataset
-                    .load_scalar_index(IndexCriteria::default().with_name(&search.index_name))
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
-            }
+            ScalarIndexExpr::Query(search) => scalar_index_fragment_bitmap(
+                self.dataset.as_ref(),
+                &search.column,
+                &search.index_name,
+            )
+            .await?
+            .ok_or_else(|| {
+                crate::Error::internal(format!(
+                    "Index not found even though it must have been found earlier: {}",
+                    search.index_name
+                ))
+            }),
         }
     }
 
@@ -4008,6 +4059,7 @@ impl Scanner {
             with_row_created_at_version,
             with_make_deletions_null,
             ordered_output: ordered,
+            file_reader_options: self.resolved_file_reader_options(),
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
@@ -4034,10 +4086,7 @@ impl Scanner {
             with_row_address: self.projection_plan.physical_projection.with_row_addr,
             make_deletions_null,
             ordered_output: self.ordered,
-            file_reader_options: self
-                .file_reader_options
-                .clone()
-                .or_else(|| self.dataset.file_reader_options.clone()),
+            file_reader_options: self.resolved_file_reader_options(),
         };
 
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
@@ -4164,6 +4213,7 @@ impl Scanner {
                     None,
                     PartitionMode::CollectLeft,
                     NullEquality::NullEqualsNull,
+                    false,
                 )?;
 
                 let schema = join.schema();
@@ -4516,6 +4566,7 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
+    #[allow(deprecated)]
     fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
@@ -4847,6 +4898,13 @@ pub mod test_dataset {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>();
+            let segments = self
+                .dataset
+                .create_index_segment_builder()
+                .with_index_type(params.index_type())
+                .with_segments(segments)
+                .build_all()
+                .await?;
             self.dataset
                 .commit_existing_index_segments("idx", "vec", segments)
                 .await?;
@@ -7672,7 +7730,7 @@ mod test {
             "LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, \
              range_before=None, range_after=None, row_id=false, row_addr=false, \
              full_filter=contains(ngram, Utf8(\"test string\")), refine_filter=--
-               ScalarIndexQuery: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx",
+               ScalarIndexQuery: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram)",
         )
         .await
         .unwrap();
@@ -7685,7 +7743,7 @@ mod test {
             range_before=None, range_after=None, row_id=false, row_addr=false, \
             full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50), \
             refine_filter=--
-              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
+              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
         )
         .await
         .unwrap();
@@ -7700,7 +7758,7 @@ mod test {
   LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, range_before=None, \
   range_after=None, row_id=true, row_addr=false, full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50) AND no_index > UInt32(100), \
   refine_filter=no_index > UInt32(100)
-    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx,[exact < 50]@exact_idx)",
+    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
         )
         .await
         .unwrap();
@@ -7752,7 +7810,7 @@ mod test {
             "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
              range_before=None, range_after=None, row_id=false, row_addr=false, \
              full_filter=name LIKE Utf8(\"app%\"), refine_filter=--
-               ScalarIndexQuery: query=[name LIKE 'app%']@name_idx",
+               ScalarIndexQuery: query=[name LIKE 'app%']@name_idx(BTree)",
         )
         .await
         .unwrap();
@@ -7786,7 +7844,7 @@ mod test {
             "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
              range_before=None, range_after=None, row_id=false, row_addr=false, \
              full_filter=name LIKE Utf8(\"ban%\"), refine_filter=--
-               ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx",
+               ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx(BTree)",
         )
         .await
         .unwrap();
@@ -7820,7 +7878,7 @@ mod test {
   LanceRead: uri=..., projection=[name, id], num_fragments=1, \
 range_before=None, range_after=None, row_id=true, row_addr=false, \
 full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
-    ScalarIndexQuery: query=[name LIKE 'test%']@name_idx",
+    ScalarIndexQuery: query=[name LIKE 'test%']@name_idx(BTree)",
         )
         .await
         .unwrap();
@@ -8138,6 +8196,234 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
+    async fn test_like_prefix_with_segmented_zone_map() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(150), BatchCount::from(6));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(
+            data,
+            "memory://test_like_segmented_zonemap",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() > 1, "expected multiple fragments");
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let mut segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            let mut builder = dataset.create_index_builder(&["name"], IndexType::Scalar, &params);
+            builder = builder
+                .name("name_zonemap".to_string())
+                .fragments(vec![fragment.id() as u32]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+
+        dataset
+            .commit_existing_index_segments("name_zonemap", "name", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("name_zonemap").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix"),
+            "segmented zonemap should use LikePrefix pruning, but got: {}",
+            plan_str
+        );
+
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let with_index_ids = with_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let without_index_ids = without_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(with_index_ids, without_index_ids);
+        assert!(!with_index_ids.is_empty());
+
+        let names = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|value| value.unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().all(|name| name.starts_with("app")));
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_with_segmented_btree() {
+        let data = gen_batch()
+            .col(
+                "name",
+                array::cycle_utf8_literals(&[
+                    "apple",
+                    "application",
+                    "app",
+                    "banana",
+                    "band",
+                    "testns1",
+                    "testns2",
+                    "test",
+                    "testing",
+                    "zoo",
+                ]),
+            )
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(150), BatchCount::from(6));
+
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(
+            data,
+            "memory://test_like_segmented_btree",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() > 1, "expected multiple fragments");
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            let mut builder = dataset.create_index_builder(&["name"], IndexType::BTree, &params);
+            builder = builder
+                .name("name_btree".to_string())
+                .fragments(vec![fragment.id() as u32]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+
+        dataset
+            .commit_existing_index_segments("name_btree", "name", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("name_btree").await.unwrap();
+        assert_eq!(committed.len(), fragments.len());
+
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!("{:?}", plan);
+        assert!(
+            plan_str.contains("ScalarIndexExec") && plan_str.contains("LikePrefix(Utf8(\"app\"))"),
+            "segmented btree should use scalar index pruning, but got: {}",
+            plan_str
+        );
+
+        let with_index = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let without_index = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let with_index_ids = with_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let without_index_ids = without_index
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(with_index_ids, without_index_ids);
+        assert!(!with_index_ids.is_empty());
+
+        let names = with_index
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|value| value.unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().all(|name| name.starts_with("app")));
+    }
+
+    #[tokio::test]
     async fn test_like_prefix_correctness_with_zone_map() {
         use lance_index::scalar::BuiltinIndexType;
 
@@ -8300,9 +8586,9 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .unwrap();
 
         // First run a full scan to get a baseline
-        let _ = dataset.object_store().io_stats_incremental(); // reset
+        let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
         dataset.scan().try_into_batch().await.unwrap();
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         let full_scan_bytes = io_stats.read_bytes;
 
         // Next do a scan without pushdown, we should still see a benefit from late materialization
@@ -8314,7 +8600,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let filtered_scan_bytes = io_stats.read_bytes;
 
@@ -8328,7 +8614,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .try_into_batch()
                 .await
                 .unwrap();
-            let io_stats = dataset.object_store().io_stats_incremental();
+            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
             assert_io_lt!(io_stats, read_bytes, filtered_scan_bytes);
         }
 
@@ -8342,7 +8628,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
         let index_scan_bytes = io_stats.read_bytes;
 
@@ -8355,7 +8641,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .try_into_batch()
             .await
             .unwrap();
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
@@ -8906,7 +9192,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1, metric=L2
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-          ScalarIndexQuery: query=[i > 10]@i_idx";
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -8974,7 +9260,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx";
+                        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)";
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -9010,7 +9296,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx";
+                        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)";
         dataset.make_scalar_index().await?;
         assert_plan_equals(
             &dataset.dataset,
@@ -9031,11 +9317,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
-      MaterializeIndex: query=[i > 10]@i_idx"
+      MaterializeIndex: query=[i > 10]@i_idx(BTree)"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=4, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9068,11 +9354,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   AddRowAddrExec
-    MaterializeIndex: query=[i > 10]@i_idx"
+    MaterializeIndex: query=[i > 10]@i_idx(BTree)"
         } else {
             "LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9094,14 +9380,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     UnionExec
       Take: columns=\"_rowid, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=[i > 10]@i_idx
+          MaterializeIndex: query=[i > 10]@i_idx(BTree)
       ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9116,14 +9402,14 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       AddRowAddrExec
-        MaterializeIndex: query=[i > 10]@i_idx
+        MaterializeIndex: query=[i > 10]@i_idx(BTree)
       ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
         FilterExec: i@0 > 10
           LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
         } else {
             "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
             range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx"
+              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9146,7 +9432,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     UnionExec
       Take: columns=\"_rowid, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
-          MaterializeIndex: query=[i > 10]@i_idx
+          MaterializeIndex: query=[i > 10]@i_idx(BTree)
       ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
         FilterExec: i@0 > 10
           LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
@@ -9154,7 +9440,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
   range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx"
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9234,7 +9520,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       MatchQuery: column=s, query=hello
         RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
           UnionExec
-            MaterializeIndex: query=[i > 10]@i_idx
+            MaterializeIndex: query=[i > 10]@i_idx(BTree)
             ProjectionExec: expr=[_rowid@1 as _rowid]
               FilterExec: i@0 > 10
                 LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
@@ -9244,7 +9530,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-          ScalarIndexQuery: query=[i > 10]@i_idx"#
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
         assert_plan_equals(
             &dataset.dataset,
@@ -9311,7 +9597,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             MatchQuery: column=s, query=hello
               RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
                 UnionExec
-                  MaterializeIndex: query=[i > 10]@i_idx
+                  MaterializeIndex: query=[i > 10]@i_idx(BTree)
                   ProjectionExec: expr=[_rowid@1 as _rowid]
                     FilterExec: i@0 > 10
                       LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
@@ -9327,7 +9613,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
           UnionExec
             MatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-                ScalarIndexQuery: query=[i > 10]@i_idx
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
               FilterExec: i@1 > 10
                 LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false, range=None"#
@@ -9527,7 +9813,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .unwrap();
 
         // First pass will need to perform some IOPs to determine what scalar indices are available
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
 
         // Second planning cycle should not perform any I/O
@@ -9540,7 +9826,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -9552,7 +9838,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -9565,7 +9851,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
 
         dataset
@@ -9578,7 +9864,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        let io_stats = dataset.object_store().io_stats_incremental();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
     }
 
@@ -9747,6 +10033,49 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .project(&["i"])
             .unwrap();
         limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[tokio::test]
+    async fn test_knn_query_parallelism_defaults_and_setter() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(
+            scanner.nearest_mut().unwrap().query_parallelism,
+            DEFAULT_QUERY_PARALLELISM
+        );
+
+        scanner.query_parallelism(4);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, 4);
+
+        scanner.query_parallelism(-1);
+        assert_eq!(scanner.nearest_mut().unwrap().query_parallelism, -1);
+    }
+
+    #[tokio::test]
+    async fn test_ivf_pq_query_parallelism_returns_same_results() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+
+        let mut sequential = test_ds.dataset.scan();
+        sequential.nearest("vec", &query_vector, 50).unwrap();
+        let sequential_results = sequential.try_into_batch().await.unwrap();
+
+        let mut parallel = test_ds.dataset.scan();
+        parallel
+            .nearest("vec", &query_vector, 50)
+            .unwrap()
+            .query_parallelism(4);
+        let parallel_results = parallel.try_into_batch().await.unwrap();
+
+        assert_eq!(sequential_results, parallel_results);
     }
 
     #[tokio::test]
@@ -10326,6 +10655,75 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "Tasks should have finished within 10 seconds but there are still {} tasks running",
             runtime.handle().metrics().num_alive_tasks()
         );
+    }
+
+    fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec> {
+        if let Some(f) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+            return Some(f);
+        }
+        for child in plan.children() {
+            if let Some(f) = find_filtered_read(child.as_ref()) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn test_io_buffer_size_explicit_propagated() {
+        // Sanity check: an explicit .io_buffer_size(N) call must reach the
+        // FilteredReadExec options unchanged, and the absence of one must leave
+        // io_buffer_size_bytes as None so FilteredReadExec can pick its own
+        // fallback (env var or max_bandwidth).
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_io_buffer_explicit", None)
+            .await
+            .unwrap();
+
+        let plan = dataset.scan().create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(filtered.options().io_buffer_size_bytes, None);
+
+        let mut scanner = dataset.scan();
+        scanner.io_buffer_size(7777);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    // The env var key scopes serial_test's lock so this test only blocks others
+    // that touch LANCE_DEFAULT_IO_BUFFER_SIZE — unrelated tests still run in
+    // parallel.
+    #[test]
+    #[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
+    fn test_default_io_buffer_size_override_env_var() {
+        // Force the sibling LazyLock to evaluate before we mutate the env var.
+        // It caches forever on first read, so another test concurrently reading
+        // *DEFAULT_IO_BUFFER_SIZE during our mutation window would otherwise
+        // cache one of our test values and poison the rest of the suite.
+        let _ = *DEFAULT_IO_BUFFER_SIZE;
+
+        // FilteredReadExec consults this when no explicit io_buffer_size was set
+        // on the scanner, so the LANCE_DEFAULT_IO_BUFFER_SIZE env var takes
+        // precedence over the max_bandwidth fallback.
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "4096");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), Some(4096));
+
+        unsafe {
+            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "not_a_number");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), None);
+
+        unsafe {
+            std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
+        }
+        assert_eq!(get_default_io_buffer_size_override(), None);
     }
 
     fn assert_values_in_range(array: &Int32Array, range: std::ops::Range<i32>, msg: &str) {
