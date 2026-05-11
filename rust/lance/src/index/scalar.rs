@@ -613,7 +613,6 @@ mod tests {
         pbold::NGramIndexDetails,
         scalar::{BuiltinIndexType, ScalarIndexParams},
     };
-    use lance_table::format::pb::VectorIndexDetails;
 
     fn make_index_metadata(
         name: &str,

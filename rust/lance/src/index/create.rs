@@ -2027,7 +2027,7 @@ mod tests {
                 vec![IndexSegment::new(
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(vector_index_details()),
+                    Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
                 )],
             )

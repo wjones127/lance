@@ -527,8 +527,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
                 .with_transpose(!skip_transpose)
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             } else {
@@ -546,8 +546,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
                 .with_transpose(!skip_transpose)
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             }
@@ -567,8 +567,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -588,8 +588,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_transpose(!skip_transpose)
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -609,8 +609,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_transpose(!skip_transpose)
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -629,8 +629,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_transpose(!skip_transpose)
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -651,8 +651,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
                 .with_transpose(!skip_transpose)
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             } else {
@@ -670,8 +670,8 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
                 .with_transpose(!skip_transpose)
-                .shuffle_data(unindexed)
-                .await?
+                .with_progress(options.progress.clone())
+                .shuffle_data_input(unindexed)
                 .build()
                 .await?
             }
@@ -692,8 +692,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_transpose(!skip_transpose)
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
@@ -713,8 +713,8 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
             .with_transpose(!skip_transpose)
-            .shuffle_data(unindexed)
-            .await?
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
             .build()
             .await?
         }
