@@ -172,10 +172,6 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         }
     }
 
-    if params.skip_transpose {
-        runtime_hints.insert("lance.skip_transpose".to_string(), "true".to_string());
-    }
-
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
     let index_version = params.index_type().version() as u32;
 
@@ -200,6 +196,9 @@ pub fn vector_index_details_default() -> prost_types::Any {
 /// Known `lance.*` keys are parsed and applied to the appropriate stage. Unknown
 /// keys (e.g., from other runtimes) are silently ignored. Malformed values are
 /// also silently ignored — the stage keeps its existing default.
+// TODO: wire into a general `Dataset::rebuild_index` method so users can
+// regenerate an index from its stored details (e.g. after file corruption).
+#[allow(dead_code)]
 pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorIndexParams) {
     fn parse<T: FromStr>(hints: &HashMap<String, String>, key: &str) -> Option<T> {
         hints.get(key)?.parse().ok()
@@ -249,20 +248,15 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
             StageParams::RQ(_) => {}
         }
     }
-
-    if hints
-        .get("lance.skip_transpose")
-        .map(|v| v == "true")
-        .unwrap_or(false)
-    {
-        params.skip_transpose = true;
-    }
 }
 
 /// Reconstruct `VectorIndexParams` from a stored `VectorIndexDetails` proto.
 ///
 /// Returns `None` for legacy indices (empty details) or if the proto is malformed.
 /// Runtime hints are applied on top of the reconstructed spec.
+// TODO: wire into a general `Dataset::rebuild_index` method so users can
+// regenerate an index from its stored details (e.g. after file corruption).
+#[allow(dead_code)]
 pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIndexParams> {
     if details.value.is_empty() {
         return None;
@@ -523,7 +517,8 @@ pub async fn infer_vector_index_details(
 ) -> Result<prost_types::Any> {
     let uuid = index.uuid.to_string();
     let index_dir = dataset.indice_files_dir(index)?;
-    let index_file = index_dir.clone().join(uuid.as_str()).join(INDEX_FILE_NAME);
+    let file_dir = index_dir.clone().join(uuid.as_str());
+    let index_file = file_dir.clone().join(INDEX_FILE_NAME);
     let reader: Arc<dyn Reader> = dataset.object_store.open(&index_file).await?.into();
 
     let tailing_bytes = read_last_block(reader.as_ref()).await?;
@@ -537,7 +532,7 @@ pub async fn infer_vector_index_details(
         }
         _ => {
             // v0.2+/v0.3: read lance file schema metadata
-            convert_v3_metadata_to_details(dataset, &index_file).await
+            convert_v3_metadata_to_details(dataset, &file_dir).await
         }
     }
 }
@@ -578,87 +573,131 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
 
 async fn convert_v3_metadata_to_details(
     dataset: &Dataset,
-    index_file: &object_store::path::Path,
+    file_dir: &object_store::path::Path,
 ) -> Result<prost_types::Any> {
+    use lance_index::INDEX_AUXILIARY_FILE_NAME;
     use lance_index::pb::vector_index_details::*;
     use lance_index::pb::{HnswParameters, VectorIndexDetails};
-    use lance_index::vector::bq::storage::RABIT_METADATA_KEY;
+    use lance_index::vector::bq::storage::RabitQuantizationMetadata;
     use lance_index::vector::hnsw::HnswMetadata;
-    use lance_index::vector::ivf::storage::IVF_PARTITION_KEY;
-    use lance_index::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata};
-    use lance_index::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
+    use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
+    use lance_index::vector::pq::storage::ProductQuantizationMetadata;
+    use lance_index::vector::shared::partition_merger::SupportedIvfIndexType;
+    use lance_index::vector::sq::storage::ScalarQuantizationMetadata;
+    use lance_index::vector::storage::STORAGE_METADATA_KEY;
 
-    let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
-    );
-    let file = scheduler
-        .open_file(index_file, &CachedFileSize::unknown())
-        .await?;
-    let reader = lance_file::reader::FileReader::try_open(
-        file,
-        None,
-        Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(index_file),
-        FileReaderOptions::default(),
-    )
-    .await?;
+    let index_file = file_dir.clone().join(INDEX_FILE_NAME);
+    let main_reader = open_lance_file(dataset, &index_file).await?;
+    let main_meta = &main_reader.schema().metadata;
 
-    let metadata = &reader.schema().metadata;
+    // Index type and distance live in the main file's INDEX_METADATA_SCHEMA_KEY.
+    let idx_meta: Option<lance_index::IndexMetadata> = main_meta
+        .get(INDEX_METADATA_SCHEMA_KEY)
+        .map(|s| serde_json::from_str(s))
+        .transpose()?;
 
-    // Get distance_type from index metadata
-    let metric_type = if let Some(idx_meta_str) = metadata.get(INDEX_METADATA_SCHEMA_KEY) {
-        let idx_meta: lance_index::IndexMetadata = serde_json::from_str(idx_meta_str)?;
-        match idx_meta.distance_type.to_uppercase().as_str() {
+    let metric_type = idx_meta
+        .as_ref()
+        .map(|m| match m.distance_type.to_uppercase().as_str() {
             "L2" | "EUCLIDEAN" => VectorMetricType::L2,
             "COSINE" => VectorMetricType::Cosine,
             "DOT" => VectorMetricType::Dot,
             "HAMMING" => VectorMetricType::Hamming,
             _ => VectorMetricType::L2,
-        }
-    } else {
-        VectorMetricType::L2
-    };
-
-    // Check for compression
-    let compression = if let Some(pq_str) = metadata.get(PQ_METADATA_KEY) {
-        let pq_meta: ProductQuantizationMetadata = serde_json::from_str(pq_str)?;
-        Some(Compression::Pq(ProductQuantization {
-            num_bits: pq_meta.nbits as u32,
-            num_sub_vectors: pq_meta.num_sub_vectors as u32,
-        }))
-    } else if let Some(sq_str) = metadata.get(SQ_METADATA_KEY) {
-        let sq_meta: ScalarQuantizationMetadata = serde_json::from_str(sq_str)?;
-        Some(Compression::Sq(ScalarQuantization {
-            num_bits: sq_meta.num_bits as u32,
-        }))
-    } else if let Some(rq_str) = metadata.get(RABIT_METADATA_KEY) {
-        let rq_meta: lance_index::vector::bq::storage::RabitQuantizationMetadata =
-            serde_json::from_str(rq_str)?;
-        let rotation_type = match rq_meta.rotation_type {
-            lance_index::vector::bq::RQRotationType::Fast => rabit_quantization::RotationType::Fast,
-            lance_index::vector::bq::RQRotationType::Matrix => {
-                rabit_quantization::RotationType::Matrix
-            }
-        };
-        Some(Compression::Rq(RabitQuantization {
-            num_bits: rq_meta.num_bits as u32,
-            rotation_type: rotation_type.into(),
-        }))
-    } else {
-        Some(Compression::Flat(FlatCompression {}))
-    };
-
-    // Check for HNSW
-    let hnsw_index_config = if let Some(partition_str) = metadata.get(IVF_PARTITION_KEY) {
-        let partitions: Vec<HnswMetadata> = serde_json::from_str(partition_str)?;
-        partitions.first().map(|hnsw| HnswParameters {
-            max_connections: hnsw.params.m as u32,
-            construction_ef: hnsw.params.ef_construction as u32,
-            max_level: hnsw.params.max_level as u32,
         })
+        .unwrap_or(VectorMetricType::L2);
+
+    // The index_type string drives both whether HNSW is present and which
+    // compression to expect. Falls back to IvfFlat if the metadata is missing
+    // or unrecognized.
+    let supported_type = idx_meta
+        .as_ref()
+        .and_then(|m| SupportedIvfIndexType::from_index_type_str(&m.index_type))
+        .unwrap_or(SupportedIvfIndexType::IvfFlat);
+    let (has_hnsw, compression_kind) = match supported_type {
+        SupportedIvfIndexType::IvfFlat => (false, CompressionKind::Flat),
+        SupportedIvfIndexType::IvfPq => (false, CompressionKind::Pq),
+        SupportedIvfIndexType::IvfSq => (false, CompressionKind::Sq),
+        SupportedIvfIndexType::IvfRq => (false, CompressionKind::Rq),
+        SupportedIvfIndexType::IvfHnswFlat => (true, CompressionKind::Flat),
+        SupportedIvfIndexType::IvfHnswPq => (true, CompressionKind::Pq),
+        SupportedIvfIndexType::IvfHnswSq => (true, CompressionKind::Sq),
+    };
+
+    let hnsw_index_config = if has_hnsw {
+        // HNSW partition metadata is stored as a JSON array of JSON-encoded
+        // strings (one per partition), matching how the builder writes
+        // `partition_index_metadata: Vec<String>`.
+        main_meta
+            .get(HNSW_METADATA_KEY)
+            .map(|s| serde_json::from_str::<Vec<String>>(s))
+            .transpose()?
+            .and_then(|entries| entries.into_iter().next())
+            .map(|s| serde_json::from_str::<HnswMetadata>(&s))
+            .transpose()?
+            .map(|hnsw| HnswParameters {
+                max_connections: hnsw.params.m as u32,
+                construction_ef: hnsw.params.ef_construction as u32,
+                max_level: hnsw.params.max_level as u32,
+            })
     } else {
         None
+    };
+
+    // For quantized indices, the per-quantizer metadata is in the auxiliary
+    // file under STORAGE_METADATA_KEY (a JSON-encoded Vec<String>, one entry
+    // per partition; all entries currently share the same metadata so we read
+    // the first).
+    let compression = match compression_kind {
+        CompressionKind::Flat => Some(Compression::Flat(FlatCompression {})),
+        CompressionKind::Pq | CompressionKind::Sq | CompressionKind::Rq => {
+            let aux_file = file_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+            let aux_reader = open_lance_file(dataset, &aux_file).await?;
+            let raw = aux_reader
+                .schema()
+                .metadata
+                .get(STORAGE_METADATA_KEY)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "auxiliary file missing {STORAGE_METADATA_KEY} metadata"
+                    ))
+                })?;
+            let entries: Vec<String> = serde_json::from_str(raw)?;
+            let first = entries.first().ok_or_else(|| {
+                Error::index("auxiliary STORAGE_METADATA_KEY was empty".to_string())
+            })?;
+            match compression_kind {
+                CompressionKind::Pq => {
+                    let pq: ProductQuantizationMetadata = serde_json::from_str(first)?;
+                    Some(Compression::Pq(ProductQuantization {
+                        num_bits: pq.nbits,
+                        num_sub_vectors: pq.num_sub_vectors as u32,
+                    }))
+                }
+                CompressionKind::Sq => {
+                    let sq: ScalarQuantizationMetadata = serde_json::from_str(first)?;
+                    Some(Compression::Sq(ScalarQuantization {
+                        num_bits: sq.num_bits as u32,
+                    }))
+                }
+                CompressionKind::Rq => {
+                    let rq: RabitQuantizationMetadata = serde_json::from_str(first)?;
+                    let rotation_type = match rq.rotation_type {
+                        lance_index::vector::bq::RQRotationType::Fast => {
+                            rabit_quantization::RotationType::Fast
+                        }
+                        lance_index::vector::bq::RQRotationType::Matrix => {
+                            rabit_quantization::RotationType::Matrix
+                        }
+                    };
+                    Some(Compression::Rq(RabitQuantization {
+                        num_bits: rq.num_bits as u32,
+                        rotation_type: rotation_type.into(),
+                    }))
+                }
+                CompressionKind::Flat => unreachable!(),
+            }
+        }
     };
 
     let details = VectorIndexDetails {
@@ -670,6 +709,34 @@ async fn convert_v3_metadata_to_details(
         runtime_hints: Default::default(),
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
+}
+
+enum CompressionKind {
+    Flat,
+    Pq,
+    Sq,
+    Rq,
+}
+
+async fn open_lance_file(
+    dataset: &Dataset,
+    path: &object_store::path::Path,
+) -> Result<lance_file::reader::FileReader> {
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let file = scheduler
+        .open_file(path, &CachedFileSize::unknown())
+        .await?;
+    lance_file::reader::FileReader::try_open(
+        file,
+        None,
+        Default::default(),
+        &dataset.metadata_cache.file_metadata_cache(path),
+        FileReaderOptions::default(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1126,6 +1193,180 @@ mod tests {
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
+    }
+
+    /// Matrix of subindex/quantizer combinations we want to round-trip.
+    #[derive(Debug, Clone, Copy)]
+    #[allow(clippy::enum_variant_names)]
+    enum Combo {
+        IvfFlat,
+        IvfPq,
+        IvfSq,
+        IvfRqMatrix,
+        IvfRqFast,
+        IvfHnswFlat,
+        IvfHnswPq,
+        IvfHnswSq,
+    }
+
+    fn build_roundtrip_params(combo: Combo, metric: DistanceType) -> VectorIndexParams {
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
+
+        // Non-default values so the round-trip actually checks preservation
+        // rather than coincidentally matching defaults.
+        let ivf = IvfBuildParams {
+            max_iters: 100,
+            sample_rate: 512,
+            target_partition_size: Some(2048),
+            shuffle_partition_batches: 4096,
+            shuffle_partition_concurrency: 4,
+            ..Default::default()
+        };
+        let hnsw = HnswBuildParams {
+            m: 30,
+            ef_construction: 200,
+            max_level: 5,
+            prefetch_distance: Some(2),
+        };
+        let pq = PQBuildParams {
+            num_sub_vectors: 8,
+            num_bits: 8,
+            max_iters: 75,
+            sample_rate: 128,
+            kmeans_redos: 3,
+            ..Default::default()
+        };
+        let sq = SQBuildParams {
+            num_bits: 8,
+            sample_rate: 128,
+        };
+
+        match combo {
+            Combo::IvfFlat => VectorIndexParams::with_ivf_flat_params(metric, ivf),
+            Combo::IvfPq => VectorIndexParams::with_ivf_pq_params(metric, ivf, pq),
+            Combo::IvfSq => VectorIndexParams::with_ivf_sq_params(metric, ivf, sq),
+            Combo::IvfRqMatrix => VectorIndexParams::with_ivf_rq_params(
+                metric,
+                ivf,
+                RQBuildParams::with_rotation_type(1, RQRotationType::Matrix),
+            ),
+            Combo::IvfRqFast => VectorIndexParams::with_ivf_rq_params(
+                metric,
+                ivf,
+                RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
+            ),
+            Combo::IvfHnswFlat => VectorIndexParams::ivf_hnsw(metric, ivf, hnsw),
+            Combo::IvfHnswPq => VectorIndexParams::with_ivf_hnsw_pq_params(metric, ivf, hnsw, pq),
+            Combo::IvfHnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(metric, ivf, hnsw, sq),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::ivf_flat(Combo::IvfFlat)]
+    #[case::ivf_pq(Combo::IvfPq)]
+    #[case::ivf_sq(Combo::IvfSq)]
+    #[case::ivf_rq_matrix(Combo::IvfRqMatrix)]
+    #[case::ivf_rq_fast(Combo::IvfRqFast)]
+    #[case::ivf_hnsw_flat(Combo::IvfHnswFlat)]
+    #[case::ivf_hnsw_pq(Combo::IvfHnswPq)]
+    #[case::ivf_hnsw_sq(Combo::IvfHnswSq)]
+    fn test_vector_index_details_roundtrip(
+        #[case] combo: Combo,
+        #[values(DistanceType::L2, DistanceType::Cosine)] metric: DistanceType,
+    ) {
+        use crate::index::vector::StageParams;
+        use lance_index::vector::bq::RQRotationType;
+
+        let params = build_roundtrip_params(combo, metric);
+
+        let any = vector_index_details(&params);
+        let restored = vector_params_from_details(&any)
+            .expect("non-empty details should round-trip to params");
+
+        assert_eq!(restored.metric_type, metric);
+        assert_eq!(restored.index_type(), params.index_type());
+
+        let StageParams::Ivf(ivf) = &restored.stages[0] else {
+            panic!("first stage should be IVF for combo {:?}", combo);
+        };
+        assert_eq!(ivf.max_iters, 100);
+        assert_eq!(ivf.sample_rate, 512);
+        assert_eq!(ivf.target_partition_size, Some(2048));
+        assert_eq!(ivf.shuffle_partition_batches, 4096);
+        assert_eq!(ivf.shuffle_partition_concurrency, 4);
+
+        match combo {
+            Combo::IvfFlat => {
+                assert_eq!(restored.stages.len(), 1);
+            }
+            Combo::IvfPq => {
+                let StageParams::PQ(pq) = &restored.stages[1] else {
+                    panic!("expected PQ stage");
+                };
+                assert_eq!(pq.num_sub_vectors, 8);
+                assert_eq!(pq.num_bits, 8);
+                assert_eq!(pq.max_iters, 75);
+                assert_eq!(pq.sample_rate, 128);
+                assert_eq!(pq.kmeans_redos, 3);
+            }
+            Combo::IvfSq => {
+                let StageParams::SQ(sq) = &restored.stages[1] else {
+                    panic!("expected SQ stage");
+                };
+                assert_eq!(sq.num_bits, 8);
+                assert_eq!(sq.sample_rate, 128);
+            }
+            Combo::IvfRqMatrix | Combo::IvfRqFast => {
+                let StageParams::RQ(rq) = &restored.stages[1] else {
+                    panic!("expected RQ stage");
+                };
+                assert_eq!(rq.num_bits, 1);
+                let expected = match combo {
+                    Combo::IvfRqMatrix => RQRotationType::Matrix,
+                    Combo::IvfRqFast => RQRotationType::Fast,
+                    _ => unreachable!(),
+                };
+                assert_eq!(rq.rotation_type, expected);
+            }
+            Combo::IvfHnswFlat => {
+                let StageParams::Hnsw(hnsw) = &restored.stages[1] else {
+                    panic!("expected HNSW stage");
+                };
+                assert_eq!(hnsw.m, 30);
+                assert_eq!(hnsw.ef_construction, 200);
+                assert_eq!(hnsw.max_level, 5);
+            }
+            Combo::IvfHnswPq => {
+                let StageParams::Hnsw(hnsw) = &restored.stages[1] else {
+                    panic!("expected HNSW stage");
+                };
+                assert_eq!(hnsw.m, 30);
+                assert_eq!(hnsw.ef_construction, 200);
+                assert_eq!(hnsw.max_level, 5);
+                let StageParams::PQ(pq) = &restored.stages[2] else {
+                    panic!("expected PQ stage");
+                };
+                assert_eq!(pq.num_sub_vectors, 8);
+                assert_eq!(pq.num_bits, 8);
+            }
+            Combo::IvfHnswSq => {
+                let StageParams::Hnsw(hnsw) = &restored.stages[1] else {
+                    panic!("expected HNSW stage");
+                };
+                assert_eq!(hnsw.m, 30);
+                assert_eq!(hnsw.ef_construction, 200);
+                assert_eq!(hnsw.max_level, 5);
+                let StageParams::SQ(sq) = &restored.stages[2] else {
+                    panic!("expected SQ stage");
+                };
+                assert_eq!(sq.num_bits, 8);
+            }
+        }
     }
 
     #[test]

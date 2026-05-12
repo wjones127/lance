@@ -66,9 +66,7 @@ use uuid::Uuid;
 use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
 };
-pub(crate) use vector::details::{
-    vector_index_details, vector_index_details_default, vector_params_from_details,
-};
+pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
@@ -4147,10 +4145,22 @@ mod tests {
             "Vector",
             "Should have inferred a specific index type"
         );
+        assert_eq!(
+            descriptions[0].index_type(),
+            "IVF_HNSW_SQ",
+            "Inferred type should match the originally-built index"
+        );
         let inferred_type = descriptions[0].index_type().to_string();
         let details_json: serde_json::Value =
             serde_json::from_str(&descriptions[0].details().unwrap()).unwrap();
         assert_eq!(details_json["metric_type"], "COSINE");
+        assert_eq!(details_json["compression"]["type"], "sq");
+        assert!(
+            details_json["hnsw"]["max_connections"].is_number(),
+            "Inferred HNSW config should have max_connections; got {details_json}"
+        );
+        assert!(details_json["hnsw"]["construction_ef"].is_number());
+        assert!(details_json["hnsw"]["max_level"].is_number());
 
         // -- Part 2: Migration persists inferred details --
         let mut dataset = dataset;
