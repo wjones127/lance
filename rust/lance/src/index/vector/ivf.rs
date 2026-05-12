@@ -2351,16 +2351,15 @@ fn build_segment_plan(
         None => infer_source_index_version(&group)?,
     };
 
-    let index_details = first.index_details.as_ref().ok_or_else(|| {
-        Error::index(format!("Segment '{}' is missing index details", first.uuid))
-    })?;
+    // Legacy source segments may not carry index_details. Fall back to an empty
+    // placeholder; `needs_vector_details_inference` will pick this up on the
+    // next manifest load and populate the real details from the index files.
+    let index_details = match first.index_details.as_ref() {
+        Some(d) => d.clone(),
+        None => Arc::new(crate::index::vector::details::vector_index_details_default()),
+    };
 
-    let segment = IndexSegment::new(
-        segment_uuid,
-        fragment_bitmap,
-        index_details.clone(),
-        index_version,
-    );
+    let segment = IndexSegment::new(segment_uuid, fragment_bitmap, index_details, index_version);
 
     Ok(IndexSegmentPlan::new(
         segment,

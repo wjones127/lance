@@ -670,6 +670,11 @@ impl IndexDescriptionImpl {
 
         let index_type = if details.is_vector() {
             derive_vector_index_type(index_details)
+        } else if let Some(system_type) = lance_index::infer_system_index_type(example_metadata) {
+            // System indices (frag-reuse, mem-wal) are identified by name, not
+            // by a plugin entry, so the plugin lookup below would return
+            // "Unknown" otherwise.
+            system_type.to_string()
         } else {
             // We attempted to infer the index type when we loaded the indices,
             // so if we hit this branch the index type is truly unknown.
