@@ -1264,6 +1264,8 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
+    // Wrap in an async block so `?` returns into `row_addrs_result` and we can
+    // run cleanup before propagating the error.
     let row_addrs_result: Result<Option<Vec<u8>>> = async {
         if let Some(row_ids_rx) = row_ids_rx {
             let captured_ids = row_ids_rx

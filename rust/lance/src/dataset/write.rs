@@ -540,6 +540,8 @@ pub async fn do_write_fragments(
     let mut rows_completed: u64 = 0;
     let mut files_written: u32 = 0;
 
+    // Wrap the loop in an async block so `?` returns into `loop_result` and we
+    // can run cleanup before propagating the error.
     let loop_result: Result<()> = async {
         while let Some(batch_chunk) = buffered_reader.next().await {
             let batch_chunk = batch_chunk?;
@@ -643,14 +645,20 @@ pub async fn do_write_fragments(
 
 /// Best-effort cleanup of data files for fragments that were written but not committed.
 ///
-/// Only cleans up files in the dataset's default storage (base_id == None). Files
-/// written to external bases are skipped because we don't have their object stores here.
+/// Contract:
+/// - Errors from individual `delete` calls are logged and swallowed, never returned —
+///   callers should propagate the original write error.
+/// - Only files in the dataset's default storage (`base_id == None`) are deleted;
+///   files in external bases are skipped because we don't have their object stores here.
+/// - Safe to call with an empty slice.
+/// - Must be called before the fragments are committed, otherwise live data may be deleted.
 pub(crate) async fn cleanup_data_fragments(
     object_store: &ObjectStore,
     base_dir: &Path,
     fragments: &[Fragment],
 ) {
     let data_dir = base_dir.child(DATA_DIR);
+    let mut skipped_external = 0usize;
     for fragment in fragments {
         for file in &fragment.files {
             if file.base_id.is_none() {
@@ -659,14 +667,16 @@ pub(crate) async fn cleanup_data_fragments(
                     log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
                 }
             } else {
-                log::warn!(
-                    "Unable to clean up orphaned data file '{}' in external base {}: \
-                     cleanup not supported for external bases",
-                    file.path,
-                    file.base_id.unwrap()
-                );
+                skipped_external += 1;
             }
         }
+    }
+    if skipped_external > 0 {
+        log::warn!(
+            "Skipped cleanup of {} orphaned data file(s) in external bases: \
+             cleanup not supported for external bases",
+            skipped_external
+        );
     }
 }
 
