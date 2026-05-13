@@ -597,25 +597,15 @@ pub async fn do_write_fragments(
     .await;
 
     if let Err(e) = loop_result {
-        let in_progress_path = writer
-            .as_ref()
-            .filter(|w| w.base_id().is_none())
-            .map(|w| w.path().to_owned());
-        // Drop the writer before deleting: closes any open file handle (some
-        // platforms can't delete open files) and aborts in-progress multipart
-        // uploads via `ObjectWriter::drop`.
-        drop(writer.take());
-        cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
+        if let Some(w) = writer.take() {
+            w.abort().await;
+        }
+        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
         return Err(e);
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        let in_progress_path = if writer.base_id().is_none() {
-            Some(writer.path().to_owned())
-        } else {
-            None
-        };
         match writer.finish().await {
             Ok((num_rows, data_file)) => {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
@@ -634,7 +624,8 @@ pub async fn do_write_fragments(
                 }
             }
             Err(e) => {
-                cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
+                writer.abort().await;
+                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
                 return Err(e);
             }
         }
@@ -677,23 +668,6 @@ pub(crate) async fn cleanup_data_fragments(
              cleanup not supported for external bases",
             skipped_external
         );
-    }
-}
-
-/// Best-effort cleanup of a partially-failed write: deletes all completed fragment
-/// data files plus an optional in-progress file that was never finished.
-async fn cleanup_partial_write(
-    object_store: &ObjectStore,
-    base_dir: &Path,
-    fragments: &[Fragment],
-    in_progress_filename: Option<String>,
-) {
-    cleanup_data_fragments(object_store, base_dir, fragments).await;
-    if let Some(filename) = in_progress_filename {
-        let path = base_dir.child(DATA_DIR).child(filename.as_str());
-        if let Err(e) = object_store.delete(&path).await {
-            log::warn!("Failed to clean up in-progress data file '{}': {}", path, e);
-        }
     }
 }
 
@@ -1034,11 +1008,11 @@ pub trait GenericWriter: Send {
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
-    /// Returns the relative filename (without directory) of the file being written.
-    fn path(&self) -> &str;
-    /// Returns the base ID if this writer is writing to an external base, or None
-    /// for the dataset's default storage.
-    fn base_id(&self) -> Option<u32>;
+    /// Abort writing: drop any open handle, abort any in-progress multipart
+    /// upload, and best-effort delete the partial file. Errors are logged and
+    /// swallowed. Files written to external bases are skipped (we don't have
+    /// access to their object stores).
+    async fn abort(self: Box<Self>);
 }
 
 struct V1WriterAdapter<M>
@@ -1048,6 +1022,8 @@ where
     writer: PreviousFileWriter<M>,
     path: String,
     base_id: Option<u32>,
+    object_store: ObjectStore,
+    full_path: Path,
 }
 
 #[async_trait::async_trait]
@@ -1073,11 +1049,15 @@ where
             ),
         ))
     }
-    fn path(&self) -> &str {
-        &self.path
-    }
-    fn base_id(&self) -> Option<u32> {
-        self.base_id
+    async fn abort(self: Box<Self>) {
+        let base_id = self.base_id;
+        let object_store = self.object_store.clone();
+        let full_path = self.full_path.clone();
+        // Drop the writer before deleting: closes any open file handle (some
+        // platforms can't delete open files) and aborts any in-progress
+        // multipart upload via `ObjectWriter::drop`.
+        drop(self);
+        delete_partial_file_if_local(base_id, object_store, full_path).await;
     }
 }
 
@@ -1086,6 +1066,8 @@ struct V2WriterAdapter {
     path: String,
     base_id: Option<u32>,
     preprocessor: Option<BlobPreprocessor>,
+    object_store: ObjectStore,
+    full_path: Path,
 }
 
 #[async_trait::async_trait]
@@ -1135,11 +1117,34 @@ impl GenericWriter for V2WriterAdapter {
         );
         Ok((num_rows, data_file))
     }
-    fn path(&self) -> &str {
-        &self.path
+    async fn abort(self: Box<Self>) {
+        let base_id = self.base_id;
+        let object_store = self.object_store.clone();
+        let full_path = self.full_path.clone();
+        // Drop the writer before deleting: closes any open file handle (some
+        // platforms can't delete open files) and aborts any in-progress
+        // multipart upload via `ObjectWriter::drop`.
+        drop(self);
+        delete_partial_file_if_local(base_id, object_store, full_path).await;
     }
-    fn base_id(&self) -> Option<u32> {
-        self.base_id
+}
+
+/// Best-effort delete of a partial data file. External-base files are skipped
+/// because we don't have access to their object stores here.
+async fn delete_partial_file_if_local(
+    base_id: Option<u32>,
+    object_store: ObjectStore,
+    full_path: Path,
+) {
+    if base_id.is_some() {
+        return;
+    }
+    if let Err(e) = object_store.delete(&full_path).await {
+        log::warn!(
+            "Failed to clean up in-progress data file '{}': {}",
+            full_path,
+            e
+        );
     }
 }
 
@@ -1214,6 +1219,8 @@ async fn open_writer_with_options(
             .await?,
             path: filename,
             base_id,
+            object_store: object_store.clone(),
+            full_path: full_path.clone(),
         })
     } else {
         let writer = object_store.create(&full_path).await?;
@@ -1247,6 +1254,8 @@ async fn open_writer_with_options(
             path: filename,
             base_id,
             preprocessor,
+            object_store: object_store.clone(),
+            full_path: full_path.clone(),
         };
         Box::new(writer_adapter) as Box<dyn GenericWriter>
     };
