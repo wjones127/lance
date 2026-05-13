@@ -3409,4 +3409,51 @@ mod tests {
             "All data files (including completed ones) should be cleaned up on failure"
         );
     }
+
+    /// Verifies the external-base branch in `cleanup_data_fragments`: files with
+    /// `base_id == Some(_)` are skipped (logged but not deleted via the dataset's
+    /// object store), while same-fragment files with `base_id == None` are deleted.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_skips_external_base() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+
+        // Create a real local data file we expect to be cleaned up.
+        let data_dir = base_dir.child(DATA_DIR);
+        let local_filename = "local.lance";
+        let local_path = data_dir.child(local_filename);
+        object_store.put(&local_path, b"x").await.unwrap();
+        // Sanity check: file is on disk.
+        assert_eq!(count_data_files(test_uri), 1);
+
+        let mut external_file = DataFile::new_unstarted("external.lance", 2, 1);
+        external_file.base_id = Some(42);
+        let local_file = DataFile::new_unstarted(local_filename, 2, 1);
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![external_file, local_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        cleanup_data_fragments(&object_store, &base_dir, &fragments).await;
+
+        // The local file should be removed; the external file is skipped without
+        // erroring (its base store isn't known here).
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "Local data file should be deleted by cleanup"
+        );
+    }
 }
