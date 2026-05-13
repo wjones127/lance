@@ -3983,6 +3983,7 @@ class LanceDataset(pa.dataset.Dataset):
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        commit_timeout: Optional[timedelta] = timedelta(minutes=5),
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -4055,6 +4056,10 @@ class LanceDataset(pa.dataset.Dataset):
             Must be provided together with namespace_client.
         base_store_params : dict of str to dict, optional
             Runtime-only object store parameters keyed by base path URI.
+        commit_timeout : timedelta, optional
+            Maximum time to wait for the commit operation (including retries on
+            conflict) to complete. Defaults to 5 minutes. Pass ``None`` to
+            disable the timeout entirely. Must be a positive duration.
 
         Returns
         -------
@@ -4134,6 +4139,7 @@ class LanceDataset(pa.dataset.Dataset):
                 namespace_client=namespace_client,
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
+                commit_timeout=commit_timeout,
             )
         elif isinstance(operation, LanceOperation.BaseOperation):
             new_ds = _Dataset.commit(
@@ -4150,6 +4156,7 @@ class LanceDataset(pa.dataset.Dataset):
                 namespace_client=namespace_client,
                 table_id=table_id,
                 namespace_client_managed_versioning=namespace_client_managed_versioning,
+                commit_timeout=commit_timeout,
             )
         else:
             raise TypeError(
@@ -4179,6 +4186,7 @@ class LanceDataset(pa.dataset.Dataset):
         detached: Optional[bool] = False,
         max_retries: int = 20,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        commit_timeout: Optional[timedelta] = timedelta(minutes=5),
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 
@@ -4223,6 +4231,10 @@ class LanceDataset(pa.dataset.Dataset):
             The maximum number of retries to perform when committing the dataset.
         base_store_params : dict of str to dict, optional
             Runtime-only object store parameters keyed by base path URI.
+        commit_timeout : timedelta, optional
+            Maximum time to wait for the commit operation (including retries on
+            conflict) to complete. Defaults to 5 minutes. Pass ``None`` to
+            disable the timeout entirely. Must be a positive duration.
 
         Returns
         -------
@@ -4259,6 +4271,7 @@ class LanceDataset(pa.dataset.Dataset):
             enable_v2_manifest_paths=enable_v2_manifest_paths,
             detached=detached,
             max_retries=max_retries,
+            commit_timeout=commit_timeout,
         )
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds

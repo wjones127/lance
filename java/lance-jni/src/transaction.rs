@@ -609,6 +609,32 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
+/// Parse the Java `Optional<Long>` (passed as a possibly-null boxed `Long` of
+/// milliseconds) describing the commit timeout. A null Java value falls back to
+/// [`lance::dataset::DEFAULT_COMMIT_TIMEOUT`]; a negative value disables the
+/// timeout; zero is rejected.
+fn parse_commit_timeout(
+    env: &mut JNIEnv,
+    commit_timeout_millis_obj: &JObject,
+) -> Result<Option<std::time::Duration>> {
+    if commit_timeout_millis_obj.is_null() {
+        return Ok(Some(lance::dataset::DEFAULT_COMMIT_TIMEOUT));
+    }
+    let millis = env
+        .call_method(commit_timeout_millis_obj, "longValue", "()J", &[])?
+        .j()?;
+    if millis < 0 {
+        Ok(None)
+    } else if millis == 0 {
+        Err(Error::input_error(
+            "commit timeout must be a positive duration; pass a negative value to disable"
+                .to_string(),
+        ))
+    } else {
+        Ok(Some(std::time::Duration::from_millis(millis as u64)))
+    }
+}
+
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
@@ -626,6 +652,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: jboolean,
+    commit_timeout_millis_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -643,6 +670,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
+            commit_timeout_millis_obj,
         )
     )
 }
@@ -662,7 +690,9 @@ fn inner_commit_to_dataset<'local>(
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: bool,
+    commit_timeout_millis_obj: JObject,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(env, &commit_timeout_millis_obj)?;
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
@@ -780,6 +810,7 @@ fn inner_commit_to_dataset<'local>(
             max_retries,
             skip_auto_cleanup,
             commit_handler,
+            commit_timeout,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -1383,6 +1414,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     max_retries: jint,
     skip_auto_cleanup: jboolean,
     namespace_client_managed_versioning: jboolean,
+    commit_timeout_millis_obj: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1401,6 +1433,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             max_retries as u32,
             skip_auto_cleanup != 0,
             namespace_client_managed_versioning != 0,
+            commit_timeout_millis_obj,
         )
     )
 }
@@ -1421,7 +1454,9 @@ fn inner_commit_to_uri<'local>(
     max_retries: u32,
     skip_auto_cleanup: bool,
     namespace_client_managed_versioning: bool,
+    commit_timeout_millis_obj: JObject,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(env, &commit_timeout_millis_obj)?;
     let uri_str: String = uri.extract(env)?;
 
     // Extract write params from parameter
@@ -1520,7 +1555,8 @@ fn inner_commit_to_uri<'local>(
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
         .with_detached(detached)
-        .enable_v2_manifest_paths(enable_v2_manifest_paths);
+        .enable_v2_manifest_paths(enable_v2_manifest_paths)
+        .with_timeout(commit_timeout);
 
     if let Some(use_stable) = use_stable_row_ids {
         builder = builder.use_stable_row_ids(use_stable);
