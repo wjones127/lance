@@ -9143,7 +9143,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let routed_uri = format!("file-object-store://{}", test_uri);
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
 
         let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
         let mut dataset = Dataset::write(
