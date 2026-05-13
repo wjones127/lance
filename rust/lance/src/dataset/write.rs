@@ -597,25 +597,15 @@ pub async fn do_write_fragments(
     .await;
 
     if let Err(e) = loop_result {
-        let in_progress_path = writer
-            .as_ref()
-            .filter(|w| w.base_id().is_none())
-            .map(|w| w.path().to_owned());
-        // Drop the writer before deleting: closes any open file handle (some
-        // platforms can't delete open files) and aborts in-progress multipart
-        // uploads via `ObjectWriter::drop`.
+        // Drop the writer so its in-progress file is cleaned up (LocalWriter
+        // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
+        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
         return Err(e);
     }
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
-        let in_progress_path = if writer.base_id().is_none() {
-            Some(writer.path().to_owned())
-        } else {
-            None
-        };
         match writer.finish().await {
             Ok((num_rows, data_file)) => {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
@@ -634,7 +624,8 @@ pub async fn do_write_fragments(
                 }
             }
             Err(e) => {
-                cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
+                drop(writer);
+                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
                 return Err(e);
             }
         }
@@ -677,23 +668,6 @@ pub(crate) async fn cleanup_data_fragments(
              cleanup not supported for external bases",
             skipped_external
         );
-    }
-}
-
-/// Best-effort cleanup of a partially-failed write: deletes all completed fragment
-/// data files plus an optional in-progress file that was never finished.
-async fn cleanup_partial_write(
-    object_store: &ObjectStore,
-    base_dir: &Path,
-    fragments: &[Fragment],
-    in_progress_filename: Option<String>,
-) {
-    cleanup_data_fragments(object_store, base_dir, fragments).await;
-    if let Some(filename) = in_progress_filename {
-        let path = base_dir.clone().join(DATA_DIR).join(filename.as_str());
-        if let Err(e) = object_store.delete(&path).await {
-            log::warn!("Failed to clean up in-progress data file '{}': {}", path, e);
-        }
     }
 }
 
@@ -1034,11 +1008,6 @@ pub trait GenericWriter: Send {
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
-    /// Returns the relative filename (without directory) of the file being written.
-    fn path(&self) -> &str;
-    /// Returns the base ID if this writer is writing to an external base, or None
-    /// for the dataset's default storage.
-    fn base_id(&self) -> Option<u32>;
 }
 
 struct V1WriterAdapter<M>
@@ -1072,12 +1041,6 @@ where
                 self.base_id,
             ),
         ))
-    }
-    fn path(&self) -> &str {
-        &self.path
-    }
-    fn base_id(&self) -> Option<u32> {
-        self.base_id
     }
 }
 
@@ -1134,12 +1097,6 @@ impl GenericWriter for V2WriterAdapter {
             self.base_id,
         );
         Ok((num_rows, data_file))
-    }
-    fn path(&self) -> &str {
-        &self.path
-    }
-    fn base_id(&self) -> Option<u32> {
-        self.base_id
     }
 }
 
