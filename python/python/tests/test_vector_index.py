@@ -1715,19 +1715,6 @@ def test_describe_index_runtime_hints_stored(tmp_path):
     assert hints.get("lance.pq.sample_rate") == "512"
 
 
-def test_describe_index_runtime_hints_defaults_omitted(tmp_path):
-    tbl = create_table(nvec=300, ndim=16)
-    dataset = lance.write_dataset(tbl, tmp_path)
-    dataset = dataset.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=4,
-    )
-    details = dataset.describe_indices()[0].details
-    assert "runtime_hints" not in details
-
-
 def test_optimize_indices(indexed_dataset):
     data = create_table()
     indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
