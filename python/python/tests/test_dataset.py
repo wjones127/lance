@@ -1680,6 +1680,31 @@ def test_commit_timeout(tmp_path: Path):
     assert dataset_with_timeout.version == dataset_no_timeout.version + 1
 
 
+def test_commit_timeout_fires(tmp_path: Path):
+    """A commit_lock that blocks longer than the timeout makes the commit fail."""
+    from datetime import timedelta
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "timeout_fires"
+    dataset = lance.write_dataset(table, base_dir)
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    @contextlib.contextmanager
+    def slow_lock(_version: int):
+        time.sleep(2)
+        yield
+
+    with pytest.raises(OSError, match="timed out"):
+        lance.LanceDataset.commit(
+            dataset,
+            append,
+            read_version=1,
+            commit_lock=slow_lock,
+            commit_timeout=timedelta(milliseconds=50),
+        )
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

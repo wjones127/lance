@@ -74,9 +74,8 @@ public class CommitBuilder {
   private String storageFormat;
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
-  // null → use Rust default (5 minutes). Sentinel boxed Long is sent across JNI:
-  // null = default, -1 = disable, positive = timeout in millis.
-  private Long commitTimeoutMillis;
+  // -1 disables the timeout; any positive value is the timeout in millis.
+  private long commitTimeoutMillis = Duration.ofMinutes(5).toMillis();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -252,7 +251,6 @@ public class CommitBuilder {
    */
   public CommitBuilder commitTimeout(Duration timeout) {
     if (timeout == null) {
-      // -1 millis is the sentinel for "disabled" across JNI.
       this.commitTimeoutMillis = -1L;
     } else {
       Preconditions.checkArgument(
@@ -329,7 +327,7 @@ public class CommitBuilder {
       Object namespace,
       Object tableId,
       boolean namespaceClientManagedVersioning,
-      Long commitTimeoutMillis);
+      long commitTimeoutMillis);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -345,5 +343,5 @@ public class CommitBuilder {
       int maxRetries,
       boolean skipAutoCleanup,
       boolean namespaceClientManagedVersioning,
-      Long commitTimeoutMillis);
+      long commitTimeoutMillis);
 }

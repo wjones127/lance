@@ -15,7 +15,7 @@ use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -609,29 +609,16 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
-/// Parse the Java `Optional<Long>` (passed as a possibly-null boxed `Long` of
-/// milliseconds) describing the commit timeout. A null Java value falls back to
-/// [`lance::dataset::DEFAULT_COMMIT_TIMEOUT`]; a negative value disables the
-/// timeout; zero is rejected.
-fn parse_commit_timeout(
-    env: &mut JNIEnv,
-    commit_timeout_millis_obj: &JObject,
-) -> Result<Option<std::time::Duration>> {
-    if commit_timeout_millis_obj.is_null() {
-        return Ok(Some(lance::dataset::DEFAULT_COMMIT_TIMEOUT));
-    }
-    let millis = env
-        .call_method(commit_timeout_millis_obj, "longValue", "()J", &[])?
-        .j()?;
+/// Translate the Java `commitTimeoutMillis` sentinel into an
+/// `Option<Duration>` for [`CommitBuilder::with_timeout`]. The Java side is
+/// the source of truth for the default (5 minutes) and for rejecting
+/// zero/negative-from-the-user inputs; here `< 0` simply means "disabled" and
+/// any other value is the timeout in milliseconds.
+fn parse_commit_timeout(millis: i64) -> Option<std::time::Duration> {
     if millis < 0 {
-        Ok(None)
-    } else if millis == 0 {
-        Err(Error::input_error(
-            "commit timeout must be a positive duration; pass a negative value to disable"
-                .to_string(),
-        ))
+        None
     } else {
-        Ok(Some(std::time::Duration::from_millis(millis as u64)))
+        Some(std::time::Duration::from_millis(millis as u64))
     }
 }
 
@@ -652,7 +639,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: jboolean,
-    commit_timeout_millis_obj: JObject,
+    commit_timeout_millis: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -670,7 +657,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
-            commit_timeout_millis_obj,
+            commit_timeout_millis,
         )
     )
 }
@@ -690,9 +677,9 @@ fn inner_commit_to_dataset<'local>(
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: bool,
-    commit_timeout_millis_obj: JObject,
+    commit_timeout_millis: jlong,
 ) -> Result<JObject<'local>> {
-    let commit_timeout = parse_commit_timeout(env, &commit_timeout_millis_obj)?;
+    let commit_timeout = parse_commit_timeout(commit_timeout_millis);
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
@@ -1414,7 +1401,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     max_retries: jint,
     skip_auto_cleanup: jboolean,
     namespace_client_managed_versioning: jboolean,
-    commit_timeout_millis_obj: JObject,
+    commit_timeout_millis: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1433,7 +1420,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             max_retries as u32,
             skip_auto_cleanup != 0,
             namespace_client_managed_versioning != 0,
-            commit_timeout_millis_obj,
+            commit_timeout_millis,
         )
     )
 }
@@ -1454,9 +1441,9 @@ fn inner_commit_to_uri<'local>(
     max_retries: u32,
     skip_auto_cleanup: bool,
     namespace_client_managed_versioning: bool,
-    commit_timeout_millis_obj: JObject,
+    commit_timeout_millis: jlong,
 ) -> Result<JObject<'local>> {
-    let commit_timeout = parse_commit_timeout(env, &commit_timeout_millis_obj)?;
+    let commit_timeout = parse_commit_timeout(commit_timeout_millis);
     let uri_str: String = uri.extract(env)?;
 
     // Extract write params from parameter

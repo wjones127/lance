@@ -764,6 +764,13 @@ mod tests {
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
     }
 
+    #[test]
+    fn test_commit_timeout_default_is_five_minutes() {
+        let builder = CommitBuilder::new("memory://default-timeout");
+        assert_eq!(builder.timeout, Some(DEFAULT_COMMIT_TIMEOUT));
+        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(300));
+    }
+
     #[tokio::test]
     async fn test_commit_timeout_zero_rejected() {
         let dataset = Arc::new(
@@ -828,6 +835,50 @@ mod tests {
             .execute(sample_transaction(1))
             .await;
         let err = res.expect_err("commit should time out");
+        assert!(
+            matches!(&err, Error::IO { .. }) && err.to_string().contains("timed out"),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_timeout_applies_to_execute_batch() {
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_secs(5),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://batch-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let res = CommitBuilder::new(Arc::new(dataset))
+            .with_timeout(Some(Duration::from_millis(50)))
+            .execute_batch(vec![sample_transaction(1)])
+            .await;
+        let Err(err) = res else {
+            panic!("commit should time out");
+        };
         assert!(
             matches!(&err, Error::IO { .. }) && err.to_string().contains("timed out"),
             "got {err:?}"

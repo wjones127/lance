@@ -26,6 +26,7 @@ import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CommitBuilderTimeoutTest extends OperationTestBase {
 
@@ -83,6 +84,35 @@ public class CommitBuilderTimeoutTest extends OperationTestBase {
             new CommitBuilder(dataset).commitTimeout(Duration.ofMinutes(5)).execute(txn)) {
           assertEquals(2, committed.version());
         }
+      }
+    }
+  }
+
+  /** A 1-nanosecond timeout fires before any local filesystem commit can finish. */
+  @Test
+  void testTimeoutFires(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fires").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      FragmentMetadata fragment = testDataset.createNewFragment(10);
+      try (Transaction txn =
+          new Transaction.Builder()
+              .readVersion(dataset.version())
+              .operation(Append.builder().fragments(Collections.singletonList(fragment)).build())
+              .build()) {
+        RuntimeException ex =
+            assertThrows(
+                RuntimeException.class,
+                () ->
+                    new CommitBuilder(dataset)
+                        .commitTimeout(Duration.ofNanos(1))
+                        .execute(txn)
+                        .close());
+        assertTrue(
+            ex.getMessage().toLowerCase().contains("timed out"),
+            "expected timeout error, got: " + ex.getMessage());
       }
     }
   }
