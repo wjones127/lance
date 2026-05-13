@@ -221,11 +221,6 @@ message VectorIndexDetails {
     FlatCompression flat = 8;
   }
 
-  // The version of the index file format. Useful for maintaining backwards
-  // compatibility when introducing breaking changes to the index format.
-  // 0 means unset (legacy index).
-  uint32 index_version = 7;
-
   // Runtime hints: optional build preferences that don't affect index structure.
   // Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
   // Unrecognized keys must be silently ignored by all runtimes.

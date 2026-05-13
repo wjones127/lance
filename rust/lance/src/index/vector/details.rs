@@ -96,75 +96,52 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
     let mut compression = None;
     let mut runtime_hints: HashMap<String, String> = params.runtime_hints.clone();
 
-    // Only write hints that differ from their defaults, keeping the map minimal.
-    // Absence of a key means "use your default".
     for stage in &params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
                 if let Some(tps) = ivf.target_partition_size {
                     target_partition_size = tps as u64;
                 }
-                if ivf.max_iters != 50 {
-                    runtime_hints
-                        .insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
-                }
-                if ivf.sample_rate != 256 {
-                    runtime_hints.insert(
-                        "lance.ivf.sample_rate".to_string(),
-                        ivf.sample_rate.to_string(),
-                    );
-                }
-                if ivf.shuffle_partition_batches != 1024 * 10 {
-                    runtime_hints.insert(
-                        "lance.ivf.shuffle_partition_batches".to_string(),
-                        ivf.shuffle_partition_batches.to_string(),
-                    );
-                }
-                if ivf.shuffle_partition_concurrency != 2 {
-                    runtime_hints.insert(
-                        "lance.ivf.shuffle_partition_concurrency".to_string(),
-                        ivf.shuffle_partition_concurrency.to_string(),
-                    );
-                }
+                runtime_hints.insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
+                runtime_hints.insert(
+                    "lance.ivf.sample_rate".to_string(),
+                    ivf.sample_rate.to_string(),
+                );
+                runtime_hints.insert(
+                    "lance.ivf.shuffle_partition_batches".to_string(),
+                    ivf.shuffle_partition_batches.to_string(),
+                );
+                runtime_hints.insert(
+                    "lance.ivf.shuffle_partition_concurrency".to_string(),
+                    ivf.shuffle_partition_concurrency.to_string(),
+                );
             }
             StageParams::Hnsw(hnsw) => {
                 hnsw_index_config = Some(hnsw.into());
-                let default_prefetch: Option<usize> = Some(2);
-                if hnsw.prefetch_distance != default_prefetch {
-                    let val = match hnsw.prefetch_distance {
-                        Some(v) => v.to_string(),
-                        None => "none".to_string(),
-                    };
-                    runtime_hints.insert("lance.hnsw.prefetch_distance".to_string(), val);
-                }
+                let val = match hnsw.prefetch_distance {
+                    Some(v) => v.to_string(),
+                    None => "none".to_string(),
+                };
+                runtime_hints.insert("lance.hnsw.prefetch_distance".to_string(), val);
             }
             StageParams::PQ(pq) => {
                 compression = Some(Compression::Pq(pq.into()));
-                if pq.max_iters != 50 {
-                    runtime_hints
-                        .insert("lance.pq.max_iters".to_string(), pq.max_iters.to_string());
-                }
-                if pq.sample_rate != 256 {
-                    runtime_hints.insert(
-                        "lance.pq.sample_rate".to_string(),
-                        pq.sample_rate.to_string(),
-                    );
-                }
-                if pq.kmeans_redos != 1 {
-                    runtime_hints.insert(
-                        "lance.pq.kmeans_redos".to_string(),
-                        pq.kmeans_redos.to_string(),
-                    );
-                }
+                runtime_hints.insert("lance.pq.max_iters".to_string(), pq.max_iters.to_string());
+                runtime_hints.insert(
+                    "lance.pq.sample_rate".to_string(),
+                    pq.sample_rate.to_string(),
+                );
+                runtime_hints.insert(
+                    "lance.pq.kmeans_redos".to_string(),
+                    pq.kmeans_redos.to_string(),
+                );
             }
             StageParams::SQ(sq) => {
                 compression = Some(Compression::Sq(sq.into()));
-                if sq.sample_rate != 256 {
-                    runtime_hints.insert(
-                        "lance.sq.sample_rate".to_string(),
-                        sq.sample_rate.to_string(),
-                    );
-                }
+                runtime_hints.insert(
+                    "lance.sq.sample_rate".to_string(),
+                    sq.sample_rate.to_string(),
+                );
             }
             StageParams::RQ(rq) => {
                 compression = Some(Compression::Rq(rq.into()));
@@ -172,15 +149,18 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         }
     }
 
+    runtime_hints.insert(
+        "lance.skip_transpose".to_string(),
+        params.skip_transpose.to_string(),
+    );
+
     let compression = compression.or(Some(Compression::Flat(FlatCompression {})));
-    let index_version = params.index_type().version() as u32;
 
     let details = VectorIndexDetails {
         metric_type: metric_type.into(),
         target_partition_size,
         hnsw_index_config,
         compression,
-        index_version,
         runtime_hints,
     };
     prost_types::Any::from_msg(&details).unwrap()
@@ -202,6 +182,10 @@ pub fn vector_index_details_default() -> prost_types::Any {
 pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorIndexParams) {
     fn parse<T: FromStr>(hints: &HashMap<String, String>, key: &str) -> Option<T> {
         hints.get(key)?.parse().ok()
+    }
+
+    if let Some(v) = parse::<bool>(hints, "lance.skip_transpose") {
+        params.skip_transpose = v;
     }
 
     for stage in &mut params.stages {
@@ -565,7 +549,6 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         target_partition_size: 0,
         hnsw_index_config: None,
         compression,
-        index_version: 0,
         runtime_hints: Default::default(),
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
@@ -705,7 +688,6 @@ async fn convert_v3_metadata_to_details(
         target_partition_size: 0,
         hnsw_index_config,
         compression,
-        index_version: 0,
         runtime_hints: Default::default(),
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
@@ -755,7 +737,6 @@ mod tests {
             target_partition_size: 0,
             hnsw_index_config: hnsw,
             compression,
-            index_version: 0,
             runtime_hints: Default::default(),
         };
         prost_types::Any::from_msg(&details).unwrap()
@@ -905,7 +886,6 @@ mod tests {
                 target_partition_size: 5000,
                 hnsw_index_config: None,
                 compression: None,
-                index_version: 0,
                 runtime_hints: Default::default(),
             };
             prost_types::Any::from_msg(&d).unwrap()
@@ -1114,13 +1094,17 @@ mod tests {
                 .map(|s| s.as_str()),
             Some("3")
         );
-        // Default values should not appear in the map
+        // No HNSW stage in this IVF+PQ params, so no prefetch_distance hint.
         assert!(
             !details
                 .runtime_hints
                 .contains_key("lance.hnsw.prefetch_distance")
         );
-        assert!(!details.runtime_hints.contains_key("lance.skip_transpose"));
+        // skip_transpose is recorded even when false.
+        assert_eq!(
+            details.runtime_hints.get("lance.skip_transpose"),
+            Some(&"false".to_string())
+        );
 
         // Roundtrip: apply hints back to a fresh params struct
         let mut restored = VectorIndexParams::with_ivf_pq_params(
@@ -1149,25 +1133,102 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_hints_defaults_omitted() {
-        use crate::index::vector::VectorIndexParams;
+    fn test_runtime_hints_roundtrip_hnsw_sq_skip_transpose() {
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
         use lance_index::vector::ivf::builder::IvfBuildParams;
-        use lance_index::vector::pq::builder::PQBuildParams;
+        use lance_index::vector::sq::builder::SQBuildParams;
         use lance_linalg::distance::DistanceType;
 
-        // All defaults — hints map should be empty
-        let params = VectorIndexParams::with_ivf_pq_params(
+        // Non-default values for hints that aren't covered by the IVF+PQ test:
+        // hnsw.prefetch_distance, sq.sample_rate, and the top-level skip_transpose.
+        let hnsw = HnswBuildParams {
+            m: 20,
+            ef_construction: 150,
+            max_level: 6,
+            prefetch_distance: Some(4),
+        };
+        let mut params = VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             IvfBuildParams::default(),
-            PQBuildParams {
-                num_sub_vectors: 8,
+            hnsw,
+            SQBuildParams {
                 num_bits: 8,
-                ..Default::default()
+                sample_rate: 128,
             },
         );
+        params.skip_transpose = true;
+
         let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
-        assert!(details.runtime_hints.is_empty());
+        assert_eq!(
+            details.runtime_hints.get("lance.hnsw.prefetch_distance"),
+            Some(&"4".to_string())
+        );
+        assert_eq!(
+            details.runtime_hints.get("lance.sq.sample_rate"),
+            Some(&"128".to_string())
+        );
+        assert_eq!(
+            details.runtime_hints.get("lance.skip_transpose"),
+            Some(&"true".to_string())
+        );
+
+        // Roundtrip back into a fresh params struct
+        let mut restored = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::default(),
+            HnswBuildParams::default(),
+            SQBuildParams::default(),
+        );
+        assert!(!restored.skip_transpose);
+        apply_runtime_hints(&details.runtime_hints, &mut restored);
+
+        assert!(restored.skip_transpose);
+        let StageParams::Hnsw(restored_hnsw) = &restored.stages[1] else {
+            panic!("expected HNSW stage");
+        };
+        assert_eq!(restored_hnsw.prefetch_distance, Some(4));
+        let StageParams::SQ(restored_sq) = &restored.stages[2] else {
+            panic!("expected SQ stage");
+        };
+        assert_eq!(restored_sq.sample_rate, 128);
+    }
+
+    #[test]
+    fn test_runtime_hints_prefetch_distance_none_roundtrip() {
+        use crate::index::vector::{StageParams, VectorIndexParams};
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+        use lance_index::vector::ivf::builder::IvfBuildParams;
+        use lance_linalg::distance::DistanceType;
+
+        // prefetch_distance = None is distinguishable from "default Some(2)"
+        // via the "none" sentinel — verify it round-trips.
+        let hnsw = HnswBuildParams {
+            m: 16,
+            ef_construction: 100,
+            max_level: 5,
+            prefetch_distance: None,
+        };
+        let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
+
+        let any = vector_index_details(&params);
+        let details = any.to_msg::<VectorIndexDetails>().unwrap();
+        assert_eq!(
+            details.runtime_hints.get("lance.hnsw.prefetch_distance"),
+            Some(&"none".to_string())
+        );
+
+        let mut restored = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            IvfBuildParams::default(),
+            HnswBuildParams::default(),
+        );
+        apply_runtime_hints(&details.runtime_hints, &mut restored);
+        let StageParams::Hnsw(restored_hnsw) = &restored.stages[1] else {
+            panic!("expected HNSW stage");
+        };
+        assert_eq!(restored_hnsw.prefetch_distance, None);
     }
 
     #[test]
