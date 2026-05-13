@@ -42,8 +42,6 @@ use crate::session::Session;
 use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
-
-pub use super::progress::{WriteProgressFn, WriteStats};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 
@@ -54,6 +52,7 @@ pub mod merge_insert;
 mod retry;
 pub mod update;
 
+pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::CommitBuilder;
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
@@ -218,6 +217,13 @@ pub struct WriteParams {
 
     pub progress: Arc<dyn WriteFragmentProgress>,
 
+    /// Optional callback invoked after each batch is written.
+    ///
+    /// Receives cumulative [`WriteStats`] so callers can render a progress bar
+    /// or compute throughput. The callback must be cheap and non-blocking;
+    /// spawn a task if you need async work.
+    pub write_progress: Option<WriteProgressFn>,
+
     /// If present, dataset will use this to update the latest version
     ///
     /// If not set, the default will be based on the object store.  Generally this will
@@ -321,6 +327,7 @@ impl Default for WriteParams {
             store_params: None,
             base_store_params: None,
             progress: Arc::new(NoopFragmentWriteProgress::new()),
+            write_progress: None,
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
@@ -592,19 +599,22 @@ pub async fn do_write_fragments(
             .as_ref()
             .filter(|w| w.base_id().is_none())
             .map(|w| w.path().to_owned());
+        // Drop the writer before deleting: closes any open file handle (some
+        // platforms can't delete open files) and aborts in-progress multipart
+        // uploads via `ObjectWriter::drop`.
         drop(writer.take());
         cleanup_partial_write(&object_store, base_dir, &fragments, in_progress_path).await;
         return Err(e);
     }
 
     // Complete the final writer
-    if let Some(mut w) = writer.take() {
-        let in_progress_path = if w.base_id().is_none() {
-            Some(w.path().to_owned())
+    if let Some(mut writer) = writer.take() {
+        let in_progress_path = if writer.base_id().is_none() {
+            Some(writer.path().to_owned())
         } else {
             None
         };
-        match w.finish().await {
+        match writer.finish().await {
             Ok((num_rows, data_file)) => {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
                 bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
@@ -1425,13 +1435,11 @@ async fn new_source_iter(
 
 struct SpillStreamIter {
     receiver: SpillReceiver,
-    #[allow(dead_code)] // Exists to keep the SpillSender alive
-    sender_handle: tokio::task::JoinHandle<SpillSender>,
+    _sender_handle: tokio::task::JoinHandle<SpillSender>,
     // This temp dir is used to store the spilled data. It is kept alive by
     // this struct. When this struct is dropped, the Drop implementation of
     // tempfile::TempDir will delete the temp dir.
-    #[allow(dead_code)] // Exists to keep the temp dir alive
-    tmp_dir: TempDir,
+    _tmp_dir: TempDir,
 }
 
 impl SpillStreamIter {
@@ -1475,8 +1483,8 @@ impl SpillStreamIter {
 
         Ok(Self {
             receiver,
-            tmp_dir,
-            sender_handle,
+            _tmp_dir: tmp_dir,
+            _sender_handle: sender_handle,
         })
     }
 }
