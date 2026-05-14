@@ -74,8 +74,8 @@ public class CommitBuilder {
   private String storageFormat;
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
-  // -1 disables the timeout; any positive value is the timeout in millis.
-  private long commitTimeoutMillis = Duration.ofMinutes(5).toMillis();
+  // -1 disables the timeout; any positive value is the timeout in nanoseconds.
+  private long commitTimeoutNanos = Duration.ofMinutes(5).toNanos();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -251,12 +251,12 @@ public class CommitBuilder {
    */
   public CommitBuilder commitTimeout(Duration timeout) {
     if (timeout == null) {
-      this.commitTimeoutMillis = -1L;
+      this.commitTimeoutNanos = -1L;
     } else {
       Preconditions.checkArgument(
           !timeout.isZero() && !timeout.isNegative(),
           "commit timeout must be a positive duration; pass null to disable");
-      this.commitTimeoutMillis = timeout.toMillis();
+      this.commitTimeoutNanos = timeout.toNanos();
     }
     return this;
   }
@@ -287,7 +287,7 @@ public class CommitBuilder {
               namespaceClient,
               tableId,
               namespaceClientManagedVersioning,
-              commitTimeoutMillis);
+              commitTimeoutNanos);
       result.setAllocator(dataset.allocator());
       return result;
     }
@@ -307,7 +307,7 @@ public class CommitBuilder {
               maxRetries,
               skipAutoCleanup,
               namespaceClientManagedVersioning,
-              commitTimeoutMillis);
+              commitTimeoutNanos);
       result.setAllocator(allocator);
       return result;
     }
@@ -327,7 +327,7 @@ public class CommitBuilder {
       Object namespace,
       Object tableId,
       boolean namespaceClientManagedVersioning,
-      long commitTimeoutMillis);
+      long commitTimeoutNanos);
 
   private static native Dataset nativeCommitToUri(
       String uri,
@@ -343,5 +343,5 @@ public class CommitBuilder {
       int maxRetries,
       boolean skipAutoCleanup,
       boolean namespaceClientManagedVersioning,
-      long commitTimeoutMillis);
+      long commitTimeoutNanos);
 }
