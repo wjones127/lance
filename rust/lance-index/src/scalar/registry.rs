@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_core::{Result, cache::LanceCache};
+use lance_core::{
+    Result,
+    cache::{LanceCache, UnsizedCacheKey},
+};
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
@@ -158,6 +162,43 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
+    /// Look up a previously-opened index in the cache.
+    ///
+    /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
+    /// Plugins whose index has a serializable representation should override this
+    /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
+    /// representation under a sized [`CacheKey`](lance_core::cache::CacheKey) with
+    /// a codec, and reconstruct the index here. `index_store` and
+    /// `frag_reuse_index` are provided so the override can rebuild the index
+    /// without re-reading metadata.
+    async fn get_from_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+        key: Cow<'_, str>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Ok(cache
+            .get_unsized_with_key(&ScalarIndexCacheKey { key })
+            .await)
+    }
+
+    /// Store a freshly-opened index in the cache.
+    ///
+    /// The default implementation stores the `Arc<dyn ScalarIndex>` in-memory.
+    /// See [`get_from_cache`](Self::get_from_cache) for when to override.
+    async fn put_in_cache(
+        &self,
+        cache: &LanceCache,
+        key: Cow<'_, str>,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey { key }, index)
+            .await;
+        Ok(())
+    }
+
     /// Optional hook allowing a plugin to provide statistics without loading the index.
     async fn load_statistics(
         &self,
@@ -178,5 +219,27 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     fn details_as_json(&self, _details: &prost_types::Any) -> Result<serde_json::Value> {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))
+    }
+}
+
+/// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
+///
+/// Used by the default [`ScalarIndexPlugin::get_from_cache`] /
+/// [`ScalarIndexPlugin::put_in_cache`] implementations. Trait objects cannot be
+/// serialized, so this is an [`UnsizedCacheKey`] with no codec — plugins that
+/// want a persistable cache entry override those methods with a sized key.
+pub struct ScalarIndexCacheKey<'a> {
+    pub key: Cow<'a, str>,
+}
+
+impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
+    type ValueType = dyn ScalarIndex;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.key.as_ref())
+    }
+
+    fn type_name() -> &'static str {
+        "ScalarIndex"
     }
 }

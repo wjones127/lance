@@ -44,9 +44,13 @@ use futures::{
     future::BoxFuture,
     stream::{self},
 };
+use lance_arrow::ipc::{
+    read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream,
+    write_len_prefixed_bytes,
+};
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheKey, LanceCache, WeakLanceCache},
+    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
     error::LanceOptionExt,
     utils::{
         mask::NullableRowAddrSet,
@@ -998,6 +1002,133 @@ impl CacheKey for BTreePageKey {
     fn type_name() -> &'static str {
         "BTreePage"
     }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<FlatIndex>())
+    }
+}
+
+/// The serializable state of a [`BTreeIndex`].
+///
+/// A `BTreeIndex` holds non-serializable infrastructure (an `IndexStore`, a
+/// cache handle, a fragment-reuse index). `BTreeIndexState` captures just the
+/// data needed to rebuild it: the `page_lookup.lance` batch (from which
+/// [`BTreeIndex::try_from_serialized`] reconstructs the in-memory lookup with
+/// no IO) plus the page batch size and range-partition map.
+#[derive(Debug, Clone)]
+pub struct BTreeIndexState {
+    lookup_batch: RecordBatch,
+    batch_size: u64,
+    ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
+}
+
+impl DeepSizeOf for BTreeIndexState {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // `ranges_to_files` is tiny and `RangeInclusiveMap` is not `DeepSizeOf`;
+        // the lookup batch dominates, matching how `BTreeIndex` accounts for itself.
+        self.lookup_batch.get_array_memory_size()
+    }
+}
+
+/// Header preceding the lookup batch in the [`BTreeIndexState`] wire format.
+#[derive(Serialize, Deserialize)]
+struct BTreeIndexStateHeader {
+    version: u32,
+    batch_size: u64,
+    /// Each entry is `(range_start, range_end, file_path, start_offset)`.
+    ranges_to_files: Option<Vec<(u32, u32, String, u32)>>,
+}
+
+const BTREE_INDEX_STATE_VERSION: u32 = 1;
+
+impl BTreeIndexState {
+    fn reconstruct(
+        &self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let index = BTreeIndex::try_from_serialized(
+            self.lookup_batch.clone(),
+            store,
+            index_cache,
+            self.batch_size,
+            self.ranges_to_files.clone(),
+            frag_reuse_index,
+        )?;
+        Ok(Arc::new(index) as Arc<dyn ScalarIndex>)
+    }
+}
+
+impl CacheCodecImpl for BTreeIndexState {
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        // Format: [len-prefixed header JSON][lookup batch IPC stream]
+        let ranges_to_files = self.ranges_to_files.as_ref().map(|ranges| {
+            ranges
+                .iter()
+                .map(|(range, (path, offset))| {
+                    (*range.start(), *range.end(), path.clone(), *offset)
+                })
+                .collect()
+        });
+        let header = BTreeIndexStateHeader {
+            version: BTREE_INDEX_STATE_VERSION,
+            batch_size: self.batch_size,
+            ranges_to_files,
+        };
+        let header = serde_json::to_vec(&header)
+            .map_err(|e| Error::io(format!("BTreeIndexState header: {e}")))?;
+        write_len_prefixed_bytes(writer, &header)?;
+        write_ipc_stream(&self.lookup_batch, writer)?;
+        Ok(())
+    }
+
+    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
+        let mut offset = 0;
+        let header = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let header: BTreeIndexStateHeader = serde_json::from_slice(&header)
+            .map_err(|e| Error::io(format!("BTreeIndexState header: {e}")))?;
+        if header.version != BTREE_INDEX_STATE_VERSION {
+            return Err(Error::io(format!(
+                "BTreeIndexState: unsupported version {} (expected {})",
+                header.version, BTREE_INDEX_STATE_VERSION
+            )));
+        }
+        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let ranges_to_files = header.ranges_to_files.map(|ranges| {
+            Arc::new(
+                ranges
+                    .into_iter()
+                    .map(|(start, end, path, off)| (start..=end, (path, off)))
+                    .collect(),
+            )
+        });
+        Ok(Self {
+            lookup_batch,
+            batch_size: header.batch_size,
+            ranges_to_files,
+        })
+    }
+}
+
+/// Cache key for a [`BTreeIndexState`]. The cache it is used with is already
+/// namespaced per-index, so the key string is a constant.
+struct BTreeIndexStateKey;
+
+impl CacheKey for BTreeIndexStateKey {
+    type ValueType = BTreeIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "BTreeIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<BTreeIndexState>())
+    }
 }
 
 /// Note: this is very similar to the IVF index except we store the IVF part in a btree
@@ -1040,13 +1171,20 @@ pub struct BTreeIndex {
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+
+    /// The raw lookup batch this index was built from (the contents of
+    /// `page_lookup.lance`). Retained so the index can be serialized into a
+    /// cache as a [`BTreeIndexState`] without re-reading it from storage.
+    lookup_batch: RecordBatch,
 }
 
 impl DeepSizeOf for BTreeIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         // We don't include the index cache, or anything stored in it. For example:
         // sub_index and fri.
-        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
+        self.page_lookup.deep_size_of_children(context)
+            + self.store.deep_size_of_children(context)
+            + self.lookup_batch.get_array_memory_size()
     }
 }
 
@@ -1060,6 +1198,7 @@ impl BTreeIndex {
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        lookup_batch: RecordBatch,
     ) -> Self {
         Self {
             page_lookup,
@@ -1069,6 +1208,7 @@ impl BTreeIndex {
             batch_size,
             ranges_to_files,
             frag_reuse_index,
+            lookup_batch,
         }
     }
 
@@ -1158,6 +1298,7 @@ impl BTreeIndex {
                 batch_size,
                 ranges_to_files,
                 frag_reuse_index,
+                data,
             ));
         }
 
@@ -1199,18 +1340,19 @@ impl BTreeIndex {
         let last_max = ScalarValue::try_from_array(&maxs, data.num_rows() - 1)?;
         map.entry(OrderableScalarValue(last_max)).or_default();
 
-        let data_type = mins.data_type();
+        let data_type = mins.data_type().clone();
 
         let page_lookup = Arc::new(BTreeLookup::new(map, null_pages, all_null_pages));
 
         Ok(Self::new(
             page_lookup,
             store,
-            data_type.clone(),
+            data_type,
             WeakLanceCache::from(index_cache),
             batch_size,
             ranges_to_files,
             frag_reuse_index,
+            data,
         ))
     }
 
@@ -2753,6 +2895,43 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+        _key: std::borrow::Cow<'_, str>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&BTreeIndexStateKey).await else {
+            return Ok(None);
+        };
+        Ok(Some(state.reconstruct(
+            index_store,
+            cache,
+            frag_reuse_index,
+        )?))
+    }
+
+    async fn put_in_cache(
+        &self,
+        cache: &LanceCache,
+        _key: std::borrow::Cow<'_, str>,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
+            Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
+        })?;
+        let state = BTreeIndexState {
+            lookup_batch: btree.lookup_batch.clone(),
+            batch_size: btree.batch_size,
+            ranges_to_files: btree.ranges_to_files.clone(),
+        };
+        cache
+            .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2791,9 +2970,14 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_BTREE_BATCH_SIZE, OrderableScalarValue, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
+        OrderableScalarValue, part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
+    use crate::scalar::registry::ScalarIndexPlugin;
+    use arrow_array::RecordBatch;
+    use lance_core::cache::{CacheCodecImpl, CacheKey};
+    use rangemap::RangeInclusiveMap;
+    use std::borrow::Cow;
 
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -4768,5 +4952,128 @@ mod tests {
             }
             _ => panic!("BTree search should return Exact"),
         }
+    }
+
+    fn sample_lookup_batch() -> RecordBatch {
+        record_batch!(
+            ("min", Int32, [Some(0), Some(10), Some(20)]),
+            ("max", Int32, [Some(9), Some(19), Some(29)]),
+            ("null_count", UInt32, [0, 2, 0]),
+            ("page_idx", UInt32, [0, 1, 2])
+        )
+        .unwrap()
+    }
+
+    fn assert_state_roundtrips(state: &BTreeIndexState) {
+        let mut buf = Vec::new();
+        state.serialize(&mut buf).unwrap();
+        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        assert_eq!(restored.lookup_batch, state.lookup_batch);
+        assert_eq!(restored.batch_size, state.batch_size);
+        assert_eq!(restored.ranges_to_files, state.ranges_to_files);
+    }
+
+    #[test]
+    fn test_btree_page_key_codec() {
+        // FlatIndex pages can be serialized by a persistent cache backend.
+        assert!(BTreePageKey::codec().is_some());
+    }
+
+    #[test]
+    fn test_btree_index_state_roundtrip() {
+        // Not range-partitioned.
+        assert_state_roundtrips(&BTreeIndexState {
+            lookup_batch: sample_lookup_batch(),
+            batch_size: DEFAULT_BTREE_BATCH_SIZE,
+            ranges_to_files: None,
+        });
+
+        // Range-partitioned across multiple files.
+        let ranges: RangeInclusiveMap<u32, (String, u32)> = [
+            (0..=99, ("part_0_page_file.lance".to_string(), 0)),
+            (100..=199, ("part_1_page_file.lance".to_string(), 100)),
+        ]
+        .into_iter()
+        .collect();
+        assert_state_roundtrips(&BTreeIndexState {
+            lookup_batch: sample_lookup_batch(),
+            batch_size: 8192,
+            ranges_to_files: Some(Arc::new(ranges)),
+        });
+
+        // Empty index.
+        assert_state_roundtrips(&BTreeIndexState {
+            lookup_batch: RecordBatch::new_empty(sample_lookup_batch().schema()),
+            batch_size: DEFAULT_BTREE_BATCH_SIZE,
+            ranges_to_files: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_state_reconstruct_and_plugin_cache() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(1000), BatchCount::from(5));
+        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Round-trip the state through the codec and reconstruct an index from it.
+        let state = BTreeIndexState {
+            lookup_batch: index.lookup_batch.clone(),
+            batch_size: index.batch_size,
+            ranges_to_files: index.ranges_to_files.clone(),
+        };
+        let mut buf = Vec::new();
+        state.serialize(&mut buf).unwrap();
+        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let reconstructed = restored
+            .reconstruct(test_store.clone(), &LanceCache::no_cache(), None)
+            .unwrap();
+        assert_eq!(
+            reconstructed
+                .as_any()
+                .downcast_ref::<BTreeIndex>()
+                .unwrap()
+                .page_lookup,
+            index.page_lookup
+        );
+
+        // The plugin's put/get hooks round-trip through a real cache + the codec.
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let plugin = BTreeIndexPlugin;
+        plugin
+            .put_in_cache(&cache, Cow::Borrowed("idx"), index.clone())
+            .await
+            .unwrap();
+        let from_cache = plugin
+            .get_from_cache(test_store.clone(), None, &cache, Cow::Borrowed("idx"))
+            .await
+            .unwrap()
+            .expect("index should be served from the cache");
+
+        // Searches against the cached index match the original.
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int32(Some(100))),
+            std::ops::Bound::Excluded(ScalarValue::Int32(Some(200))),
+        );
+        let expected = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let actual = from_cache
+            .search(&query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
     }
 }
