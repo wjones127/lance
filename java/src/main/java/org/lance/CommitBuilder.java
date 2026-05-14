@@ -242,8 +242,8 @@ public class CommitBuilder {
    * Set a timeout for the commit operation.
    *
    * <p>If the commit (including retries on conflict) does not complete within {@code timeout},
-   * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely.
-   * The default is 5 minutes.
+   * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely. The
+   * default is 5 minutes.
    *
    * @param timeout the commit timeout, or {@code null} to disable
    * @return this builder instance

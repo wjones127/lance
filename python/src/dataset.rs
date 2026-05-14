@@ -2712,7 +2712,7 @@ impl Dataset {
                 commit_lock.map(|cl| cl.py()),
                 builder.execute(transaction.0),
             )?
-            .infer_error()?;
+            .io_or_timeout_error()?;
 
         let uri = ds.uri().to_string();
         Ok(Self {
@@ -2776,7 +2776,7 @@ impl Dataset {
 
         let res = rt()
             .block_on(None, builder.execute_batch(transactions))?
-            .infer_error()?;
+            .io_or_timeout_error()?;
         let uri = res.dataset.uri().to_string();
         let ds = Self {
             ds: Arc::new(res.dataset),

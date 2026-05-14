@@ -68,6 +68,11 @@ pub trait PythonErrorExt<T> {
     fn io_error(self) -> PyResult<T>;
     /// Convert to PyTimeoutError
     fn timeout_error(self) -> PyResult<T>;
+    /// Convert to PyTimeoutError for `Error::Timeout`, otherwise PyIoError.
+    ///
+    /// Used by call sites that historically mapped every `lance::Error` to
+    /// PyIoError but should surface timeouts distinctly.
+    fn io_or_timeout_error(self) -> PyResult<T>;
 }
 
 impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
@@ -118,5 +123,12 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
 
     fn timeout_error(self) -> PyResult<T> {
         self.map_err(|err| PyTimeoutError::new_err(err.to_string()))
+    }
+
+    fn io_or_timeout_error(self) -> PyResult<T> {
+        match &self {
+            Err(LanceError::Timeout { .. }) => self.timeout_error(),
+            _ => self.io_error(),
+        }
     }
 }

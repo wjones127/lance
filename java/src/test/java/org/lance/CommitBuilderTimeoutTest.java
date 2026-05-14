@@ -59,8 +59,7 @@ public class CommitBuilderTimeoutTest extends OperationTestBase {
               .readVersion(dataset.version())
               .operation(Append.builder().fragments(Collections.singletonList(fragment)).build())
               .build()) {
-        try (Dataset committed =
-            new CommitBuilder(dataset).commitTimeout(null).execute(txn)) {
+        try (Dataset committed = new CommitBuilder(dataset).commitTimeout(null).execute(txn)) {
           assertEquals(2, committed.version());
         }
       }
