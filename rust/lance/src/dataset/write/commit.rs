@@ -881,25 +881,41 @@ mod tests {
         assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
 
+    /// `with_timeout(None)` must let a commit run unbounded. Uses a throttled
+    /// store so the commit takes real wall-clock time — long enough that the
+    /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
     #[tokio::test]
     async fn test_commit_timeout_none_disables() {
-        let dataset = Arc::new(
-            InsertBuilder::new("memory://no-timeout")
-                .execute(vec![
-                    RecordBatch::try_new(
-                        Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                            "i",
-                            DataType::Int32,
-                            false,
-                        )])),
-                        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-                    )
-                    .unwrap(),
-                ])
-                .await
+        let throttled = Arc::new(ThrottledStoreWrapper {
+            config: ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(200),
+                ..Default::default()
+            },
+        });
+        let write_params = WriteParams {
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(throttled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://no-timeout")
+            .with_params(&write_params)
+            .execute(vec![
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "i",
+                        DataType::Int32,
+                        false,
+                    )])),
+                    vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+                )
                 .unwrap(),
-        );
-        let new_ds = CommitBuilder::new(dataset.clone())
+            ])
+            .await
+            .unwrap();
+
+        let new_ds = CommitBuilder::new(Arc::new(dataset))
             .with_timeout(None)
             .execute(sample_transaction(1))
             .await
