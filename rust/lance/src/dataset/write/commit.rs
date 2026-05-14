@@ -214,7 +214,10 @@ impl<'a> CommitBuilder<'a> {
                 "CommitBuilder timeout must be non-zero; pass `None` to disable",
             ));
         }
-        let fut = self.execute_inner(transaction);
+        // Box the inner future so wrapping it in `tokio::time::Timeout` does
+        // not deepen the future type — downstream `async fn`s that await
+        // `execute` otherwise hit the compiler's layout-query depth limit.
+        let fut = Box::pin(self.execute_inner(transaction));
         match timeout {
             Some(t) => match tokio::time::timeout(t, fut).await {
                 Ok(res) => res,
