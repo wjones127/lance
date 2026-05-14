@@ -187,8 +187,8 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// - [`Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
     ///   when [`Self::execute`] is called, not here).
-    /// - [`Error::IO`] with a "Commit timed out" message if the operation does
-    ///   not complete within the timeout.
+    /// - [`Error::Timeout`] if the operation does not complete within the
+    ///   timeout.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
@@ -218,9 +218,7 @@ impl<'a> CommitBuilder<'a> {
         match timeout {
             Some(t) => match tokio::time::timeout(t, fut).await {
                 Ok(res) => res,
-                // Mapped to `Error::IO` so it flows through the IO/retry
-                // handling that callers already apply to commit failures.
-                Err(_) => Err(Error::io(format!(
+                Err(_) => Err(Error::timeout(format!(
                     "Commit timed out after {:?}. Increase the timeout via \
                      CommitBuilder::with_timeout or pass `None` to disable.",
                     t
@@ -839,10 +837,7 @@ mod tests {
             .execute(sample_transaction(1))
             .await;
         let err = res.expect_err("commit should time out");
-        assert!(
-            matches!(&err, Error::IO { .. }) && err.to_string().contains("timed out"),
-            "got {err:?}"
-        );
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
 
     #[tokio::test]
@@ -883,10 +878,7 @@ mod tests {
         let Err(err) = res else {
             panic!("commit should time out");
         };
-        assert!(
-            matches!(&err, Error::IO { .. }) && err.to_string().contains("timed out"),
-            "got {err:?}"
-        );
+        assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
 
     #[tokio::test]

@@ -102,9 +102,9 @@ public class CommitBuilderTimeoutTest extends OperationTestBase {
               .readVersion(dataset.version())
               .operation(Append.builder().fragments(Collections.singletonList(fragment)).build())
               .build()) {
-        RuntimeException ex =
+        LanceTimeoutException ex =
             assertThrows(
-                RuntimeException.class,
+                LanceTimeoutException.class,
                 () ->
                     new CommitBuilder(dataset)
                         .commitTimeout(Duration.ofNanos(1))

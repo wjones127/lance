@@ -1656,8 +1656,8 @@ def test_commit_timeout(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
-    # A zero duration reaches Rust and is rejected as invalid input (PyIOError).
-    with pytest.raises(OSError, match="non-zero"):
+    # A zero duration reaches Rust and is rejected as invalid input.
+    with pytest.raises(ValueError, match="non-zero"):
         lance.LanceDataset.commit(
             dataset, append, read_version=1, commit_timeout=timedelta(0)
         )
@@ -1701,7 +1701,7 @@ def test_commit_timeout_fires(tmp_path: Path):
         time.sleep(2)
         yield
 
-    with pytest.raises(OSError, match="timed out"):
+    with pytest.raises(TimeoutError, match="timed out"):
         lance.LanceDataset.commit(
             dataset,
             append,

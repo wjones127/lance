@@ -2712,7 +2712,7 @@ impl Dataset {
                 commit_lock.map(|cl| cl.py()),
                 builder.execute(transaction.0),
             )?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .infer_error()?;
 
         let uri = ds.uri().to_string();
         Ok(Self {
@@ -2776,7 +2776,7 @@ impl Dataset {
 
         let res = rt()
             .block_on(None, builder.execute_batch(transactions))?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .infer_error()?;
         let uri = res.dataset.uri().to_string();
         let ds = Self {
             ds: Arc::new(res.dataset),
