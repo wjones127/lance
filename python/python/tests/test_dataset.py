@@ -1656,10 +1656,16 @@ def test_commit_timeout(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
-    # Zero / negative durations are rejected.
-    with pytest.raises((ValueError, OSError)):
+    # A zero duration reaches Rust and is rejected as invalid input (PyIOError).
+    with pytest.raises(OSError, match="non-zero"):
         lance.LanceDataset.commit(
             dataset, append, read_version=1, commit_timeout=timedelta(0)
+        )
+
+    # A negative duration is rejected by PyO3's timedelta -> Duration conversion.
+    with pytest.raises(ValueError):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(seconds=-1)
         )
 
     # None disables the timeout.

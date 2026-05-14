@@ -93,6 +93,8 @@ if TYPE_CHECKING:
         Iterable[float],
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
+# Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
+_DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=5)
 _BLOB_PANDAS_MODE_LAZY = "lazy"
 _BLOB_PANDAS_MODE_BYTES = "bytes"
 _BLOB_PANDAS_MODE_DESCRIPTIONS = "descriptions"
@@ -3983,7 +3985,7 @@ class LanceDataset(pa.dataset.Dataset):
         table_id: Optional[List[str]] = None,
         namespace_client_managed_versioning: bool = False,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
-        commit_timeout: Optional[timedelta] = timedelta(minutes=5),
+        commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -4186,7 +4188,7 @@ class LanceDataset(pa.dataset.Dataset):
         detached: Optional[bool] = False,
         max_retries: int = 20,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
-        commit_timeout: Optional[timedelta] = timedelta(minutes=5),
+        commit_timeout: Optional[timedelta] = _DEFAULT_COMMIT_TIMEOUT,
     ) -> BulkCommitResult:
         """Create a new version of dataset with multiple transactions.
 

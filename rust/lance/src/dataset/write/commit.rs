@@ -177,16 +177,18 @@ impl<'a> CommitBuilder<'a> {
 
     /// Set a timeout for the commit operation.
     ///
-    /// If the commit (including retries on conflict) does not complete within
-    /// the provided duration, [`Self::execute`] / [`Self::execute_batch`] will
-    /// return an error. Pass `None` to disable the timeout entirely.
+    /// The timeout bounds the *entire* [`Self::execute`] / [`Self::execute_batch`]
+    /// call, including all conflict retries — it is not applied per attempt.
+    /// Pass `None` to disable the timeout entirely.
     ///
     /// The default is 5 minutes (see [`DEFAULT_COMMIT_TIMEOUT`]).
     ///
     /// # Errors
     ///
-    /// Returns an [`Error::InvalidInput`] when [`Self::execute`] is called if
-    /// `timeout` is `Some(Duration::ZERO)`.
+    /// - [`Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
+    ///   when [`Self::execute`] is called, not here).
+    /// - [`Error::IO`] with a "Commit timed out" message if the operation does
+    ///   not complete within the timeout.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
@@ -216,6 +218,8 @@ impl<'a> CommitBuilder<'a> {
         match timeout {
             Some(t) => match tokio::time::timeout(t, fut).await {
                 Ok(res) => res,
+                // Mapped to `Error::IO` so it flows through the IO/retry
+                // handling that callers already apply to commit failures.
                 Err(_) => Err(Error::io(format!(
                     "Commit timed out after {:?}. Increase the timeout via \
                      CommitBuilder::with_timeout or pass `None` to disable.",
