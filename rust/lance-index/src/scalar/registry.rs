@@ -164,6 +164,9 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Look up a previously-opened index in the cache.
     ///
+    /// `cache` is already per-index namespaced by the caller, so a plugin's key
+    /// only needs to disambiguate entries within a single index.
+    ///
     /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
     /// Plugins whose index has a serializable representation should override this
     /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
@@ -176,25 +179,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         _index_store: Arc<dyn IndexStore>,
         _frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
-        key: Cow<'_, str>,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        Ok(cache
-            .get_unsized_with_key(&ScalarIndexCacheKey { key })
-            .await)
+        Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
     }
 
     /// Store a freshly-opened index in the cache.
     ///
+    /// `cache` is already per-index namespaced; see
+    /// [`get_from_cache`](Self::get_from_cache).
+    ///
     /// The default implementation stores the `Arc<dyn ScalarIndex>` in-memory.
-    /// See [`get_from_cache`](Self::get_from_cache) for when to override.
-    async fn put_in_cache(
-        &self,
-        cache: &LanceCache,
-        key: Cow<'_, str>,
-        index: Arc<dyn ScalarIndex>,
-    ) -> Result<()> {
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
         cache
-            .insert_unsized_with_key(&ScalarIndexCacheKey { key }, index)
+            .insert_unsized_with_key(&ScalarIndexCacheKey, index)
             .await;
         Ok(())
     }
@@ -225,18 +222,18 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 /// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
 ///
 /// Used by the default [`ScalarIndexPlugin::get_from_cache`] /
-/// [`ScalarIndexPlugin::put_in_cache`] implementations. Trait objects cannot be
-/// serialized, so this is an [`UnsizedCacheKey`] with no codec — plugins that
-/// want a persistable cache entry override those methods with a sized key.
-pub struct ScalarIndexCacheKey<'a> {
-    pub key: Cow<'a, str>,
-}
+/// [`ScalarIndexPlugin::put_in_cache`] implementations. The cache is already
+/// per-index namespaced by the caller, so a constant key suffices. Trait objects
+/// cannot be serialized, so this is an [`UnsizedCacheKey`] with no codec —
+/// plugins that want a persistable cache entry override those methods with a
+/// sized key.
+pub struct ScalarIndexCacheKey;
 
-impl UnsizedCacheKey for ScalarIndexCacheKey<'_> {
+impl UnsizedCacheKey for ScalarIndexCacheKey {
     type ValueType = dyn ScalarIndex;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Borrowed(self.key.as_ref())
+        Cow::Borrowed("scalar_index")
     }
 
     fn type_name() -> &'static str {

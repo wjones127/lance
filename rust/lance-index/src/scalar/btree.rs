@@ -2937,7 +2937,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
-        _key: std::borrow::Cow<'_, str>,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BTreeIndexStateKey).await else {
             return Ok(None);
@@ -2949,12 +2948,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )?))
     }
 
-    async fn put_in_cache(
-        &self,
-        cache: &LanceCache,
-        _key: std::borrow::Cow<'_, str>,
-        index: Arc<dyn ScalarIndex>,
-    ) -> Result<()> {
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
         let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
             Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
         })?;
@@ -3013,7 +3007,6 @@ mod tests {
     use arrow_array::RecordBatch;
     use lance_core::cache::{CacheCodecImpl, CacheKey};
     use rangemap::RangeInclusiveMap;
-    use std::borrow::Cow;
 
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
@@ -5090,12 +5083,9 @@ mod tests {
         // The plugin's put/get hooks round-trip through a real cache + the codec.
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin
-            .put_in_cache(&cache, Cow::Borrowed("idx"), index.clone())
-            .await
-            .unwrap();
+        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
         let from_cache = plugin
-            .get_from_cache(test_store.clone(), None, &cache, Cow::Borrowed("idx"))
+            .get_from_cache(test_store.clone(), None, &cache)
             .await
             .unwrap()
             .expect("index should be served from the cache");
@@ -5258,12 +5248,9 @@ mod tests {
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin
-            .put_in_cache(&cache, Cow::Borrowed("idx"), index.clone())
-            .await
-            .unwrap();
+        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
         let from_cache = plugin
-            .get_from_cache(store.clone(), None, &cache, Cow::Borrowed("idx"))
+            .get_from_cache(store.clone(), None, &cache)
             .await
             .unwrap()
             .expect("index should be served from the cache");

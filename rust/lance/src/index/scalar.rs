@@ -8,7 +8,6 @@ pub(crate) mod inverted;
 
 pub use inverted::{load_segment_details, load_segments};
 
-use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 
 use crate::index::DatasetIndexExt;
@@ -400,16 +399,8 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&uuid_str, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    // The index cache is namespaced per-index, so the plugin's cache key only
-    // needs to disambiguate within a single index's entries.
-    let key = Cow::Borrowed(uuid_str.as_str());
     if let Some(index) = plugin
-        .get_from_cache(
-            index_store.clone(),
-            frag_reuse_index.clone(),
-            &index_cache,
-            key.clone(),
-        )
+        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
         .await?
     {
         return Ok(index);
@@ -422,9 +413,7 @@ pub async fn open_scalar_index(
     tracing::info!(target: TRACE_IO_EVENTS, index_uuid = uuid_str, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
     metrics.record_index_load();
 
-    plugin
-        .put_in_cache(&index_cache, key, index.clone())
-        .await?;
+    plugin.put_in_cache(&index_cache, index.clone()).await?;
     Ok(index)
 }
 
