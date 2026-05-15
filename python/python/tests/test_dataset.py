@@ -1685,17 +1685,10 @@ def test_commit_timeout(tmp_path: Path):
     )
     assert dataset_with_timeout.version == dataset_no_timeout.version + 1
 
-    # A 1-microsecond timeout fires before the commit's first object-store
-    # write can finish, and surfaces as a TimeoutError.
-    fragment3 = lance.fragment.LanceFragment.create(base_dir, table)
-    append3 = lance.LanceOperation.Append([fragment3])
-    with pytest.raises(TimeoutError, match="timed out"):
-        lance.LanceDataset.commit(
-            dataset_with_timeout,
-            append3,
-            read_version=dataset_with_timeout.version,
-            commit_timeout=timedelta(microseconds=1),
-        )
+    # Timeout *firing* behavior is covered by the Rust test
+    # `test_commit_timeout_triggers`, which uses a throttled store for a
+    # reliable trigger; reproducing it from Python without exposing
+    # throttling would be flaky on fast runners.
 
 
 def test_append_with_commit(tmp_path: Path):
