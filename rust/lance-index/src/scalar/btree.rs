@@ -1212,6 +1212,12 @@ pub struct BTreeIndex {
     /// The raw lookup batch this index was built from (the contents of
     /// `page_lookup.lance`). Retained so the index can be serialized into a
     /// cache as a [`BTreeIndexState`] without re-reading it from storage.
+    ///
+    /// TODO: this duplicates the min/max values already held in `page_lookup`.
+    /// A follow-up could rewrite `BTreeLookup` to query this batch directly
+    /// (binary search on the sorted `min` column + linear scan, type-dispatched
+    /// per column type), eliminating the duplication and making this batch the
+    /// single source of truth.
     lookup_batch: RecordBatch,
 }
 
