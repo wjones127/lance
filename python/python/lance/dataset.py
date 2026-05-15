@@ -94,7 +94,7 @@ if TYPE_CHECKING:
     ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
-_DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=5)
+_DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
 _BLOB_PANDAS_MODE_LAZY = "lazy"
 _BLOB_PANDAS_MODE_BYTES = "bytes"
 _BLOB_PANDAS_MODE_DESCRIPTIONS = "descriptions"
@@ -4060,7 +4060,7 @@ class LanceDataset(pa.dataset.Dataset):
             Runtime-only object store parameters keyed by base path URI.
         commit_timeout : timedelta, optional
             Maximum time to wait for the commit operation (including retries on
-            conflict) to complete. Defaults to 5 minutes. Pass ``None`` to
+            conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
             disable the timeout entirely. Must be a positive duration.
 
         Returns
@@ -4235,7 +4235,7 @@ class LanceDataset(pa.dataset.Dataset):
             Runtime-only object store parameters keyed by base path URI.
         commit_timeout : timedelta, optional
             Maximum time to wait for the commit operation (including retries on
-            conflict) to complete. Defaults to 5 minutes. Pass ``None`` to
+            conflict) to complete. Defaults to 30 minutes. Pass ``None`` to
             disable the timeout entirely. Must be a positive duration.
 
         Returns

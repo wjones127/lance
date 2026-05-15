@@ -75,7 +75,7 @@ public class CommitBuilder {
   private int maxRetries = 0;
   private boolean skipAutoCleanup = false;
   // -1 disables the timeout; any positive value is the timeout in nanoseconds.
-  private long commitTimeoutNanos = Duration.ofMinutes(5).toNanos();
+  private long commitTimeoutNanos = Duration.ofMinutes(30).toNanos();
 
   /**
    * Create a commit builder for committing against an existing dataset.
@@ -243,7 +243,7 @@ public class CommitBuilder {
    *
    * <p>If the commit (including retries on conflict) does not complete within {@code timeout},
    * {@link #execute(Transaction)} will fail. Pass {@code null} to disable the timeout entirely. The
-   * default is 5 minutes.
+   * default is 30 minutes.
    *
    * @param timeout the commit timeout, or {@code null} to disable
    * @return this builder instance

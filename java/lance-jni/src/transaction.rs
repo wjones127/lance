@@ -611,7 +611,7 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
 
 /// Translate the Java `commitTimeoutNanos` sentinel into an
 /// `Option<Duration>` for [`CommitBuilder::with_timeout`]. The Java side is
-/// the source of truth for the default (5 minutes) and for rejecting
+/// the source of truth for the default (30 minutes) and for rejecting
 /// zero/negative-from-the-user inputs; here `< 0` simply means "disabled" and
 /// any other value is the timeout in nanoseconds.
 fn parse_commit_timeout(nanos: i64) -> Option<std::time::Duration> {

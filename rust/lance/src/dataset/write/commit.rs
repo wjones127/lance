@@ -52,7 +52,7 @@ pub struct CommitBuilder<'a> {
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
-pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
@@ -181,7 +181,7 @@ impl<'a> CommitBuilder<'a> {
     /// call, including all conflict retries — it is not applied per attempt.
     /// Pass `None` to disable the timeout entirely.
     ///
-    /// The default is 5 minutes (see [`DEFAULT_COMMIT_TIMEOUT`]).
+    /// The default is 30 minutes (see [`DEFAULT_COMMIT_TIMEOUT`]).
     ///
     /// # Errors
     ///
@@ -770,10 +770,10 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_timeout_default_is_five_minutes() {
+    fn test_commit_timeout_default_is_thirty_minutes() {
         let builder = CommitBuilder::new("memory://default-timeout");
         assert_eq!(builder.timeout, Some(DEFAULT_COMMIT_TIMEOUT));
-        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(1800));
     }
 
     #[tokio::test]
