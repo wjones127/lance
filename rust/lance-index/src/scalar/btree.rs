@@ -1011,7 +1011,7 @@ impl CacheKey for BTreePageKey {
 /// A `BTreeIndex` holds non-serializable infrastructure (an `IndexStore`, a
 /// cache handle, a fragment-reuse index). `BTreeIndexState` captures just the
 /// data needed to rebuild it: the `page_lookup.lance` batch (from which
-/// [`BTreeIndex::try_from_serialized`] reconstructs the in-memory lookup with
+/// `BTreeIndex::try_from_serialized` reconstructs the in-memory lookup with
 /// no IO) plus the page batch size and range-partition map.
 #[derive(Debug, Clone)]
 pub struct BTreeIndexState {
