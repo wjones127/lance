@@ -1001,6 +1001,7 @@ impl CacheKey for BTreePageKey {
     }
 
     fn codec() -> Option<CacheCodec> {
+        // Pages are cached as `FlatIndex` values (see `ValueType` above).
         Some(CacheCodec::from_impl::<FlatIndex>())
     }
 }
