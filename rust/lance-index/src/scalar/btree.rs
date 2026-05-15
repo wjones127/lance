@@ -5074,6 +5074,175 @@ mod tests {
             .search(&query, &NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_btree_index_state_rejects_unknown_version() {
+        // Hand-craft a header with an unsupported version. The deserializer reads the header
+        // before the lookup batch, so the trailing bytes don't matter.
+        let header = br#"{"version":999,"batch_size":1000,"ranges_to_files":null}"#;
+        let mut buf = Vec::new();
+        lance_arrow::ipc::write_len_prefixed_bytes(&mut buf, header).unwrap();
+
+        let err = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("999") && msg.contains("BTreeIndexState"),
+            "expected error to mention the unsupported version 999, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // value == _rowid for all rows in [0, 1000).
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(1000), BatchCount::from(1));
+        train_btree_index(stream, test_store.as_ref(), 1000, None, None)
+            .await
+            .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let state = BTreeIndexState {
+            lookup_batch: index.lookup_batch.clone(),
+            batch_size: index.batch_size,
+            ranges_to_files: index.ranges_to_files.clone(),
+        };
+
+        // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
+        // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
+        // the FragReuseIndex through to the rebuilt BTreeIndex.
+        let frag_reuse_index = Arc::new(FragReuseIndex::new(
+            Uuid::new_v4(),
+            vec![HashMap::from([(0u64, Some(5000u64))])],
+            FragReuseIndexDetails { versions: vec![] },
+        ));
+        let reconstructed = state
+            .reconstruct(
+                test_store.clone(),
+                &LanceCache::no_cache(),
+                Some(frag_reuse_index),
+            )
+            .unwrap();
+
+        let result = reconstructed
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(0))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = match &result {
+            SearchResult::Exact(set) => set
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect(),
+            other => panic!("expected Exact, got {other:?}"),
+        };
+        assert_eq!(
+            row_ids,
+            vec![5000],
+            "frag_reuse_index remap was not applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_index_state_range_partitioned_plugin_cache_roundtrip() {
+        // Build a range-partitioned BTree (two range partitions merged into one index) and
+        // round-trip it through the plugin's cache hooks. This exercises the
+        // `ranges_to_files = Some` path end-to-end through serialize/deserialize/reconstruct.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let half = DEFAULT_BTREE_BATCH_SIZE;
+        let total = (2 * half) as i32;
+
+        // Partition 0: values/rowids [0, half).
+        let part0 = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(half), BatchCount::from(1));
+        train_btree_index(part0, store.as_ref(), half, None, Some(0u32))
+            .await
+            .unwrap();
+
+        // Partition 1: values/rowids [half, 2*half).
+        let values: Vec<i32> = (half as i32..total).collect();
+        let row_ids: Vec<u64> = (half..total as u64).collect();
+        let part1 = gen_batch()
+            .col("value", array::cycle::<Int32Type>(values))
+            .col("_rowid", array::cycle::<UInt64Type>(row_ids))
+            .into_df_stream(RowCount::from(half), BatchCount::from(1));
+        train_btree_index(part1, store.as_ref(), half, None, Some(1u32))
+            .await
+            .unwrap();
+
+        super::merge_metadata_files(
+            store.as_ref(),
+            &[
+                part_page_data_file_path(0 << 32),
+                part_page_data_file_path(1 << 32),
+            ],
+            &[
+                part_lookup_file_path(0 << 32),
+                part_lookup_file_path(1 << 32),
+            ],
+            Some(1usize),
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            index.ranges_to_files.is_some(),
+            "test setup should produce a range-partitioned index",
+        );
+
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let plugin = BTreeIndexPlugin;
+        plugin
+            .put_in_cache(&cache, Cow::Borrowed("idx"), index.clone())
+            .await
+            .unwrap();
+        let from_cache = plugin
+            .get_from_cache(store.clone(), None, &cache, Cow::Borrowed("idx"))
+            .await
+            .unwrap()
+            .expect("index should be served from the cache");
+
+        // Search a value from each range partition and confirm both paths agree.
+        for value in [0i32, total - 1] {
+            let query = SargableQuery::Equals(ScalarValue::Int32(Some(value)));
+            let expected = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+            let actual = from_cache
+                .search(&query, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_eq!(expected, actual, "value {value}");
+        }
     }
 }
