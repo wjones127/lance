@@ -13,6 +13,9 @@
 
 use crate::format::pb;
 
+#[allow(dead_code)] // Prototype scaffolding; not yet wired into the public API.
+mod actions;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transaction {
     /// Crate-local representation backing: protobuf Transaction.
