@@ -648,12 +648,12 @@ pub(crate) async fn cleanup_data_fragments(
     base_dir: &Path,
     fragments: &[Fragment],
 ) {
-    let data_dir = base_dir.child(DATA_DIR);
+    let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
         for file in &fragment.files {
             if file.base_id.is_none() {
-                let path = data_dir.child(file.path.as_str());
+                let path = data_dir.clone().join(file.path.as_str());
                 if let Err(e) = object_store.delete(&path).await {
                     log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
                 }
@@ -3401,9 +3401,9 @@ mod tests {
                 .unwrap();
 
         // Create a real local data file we expect to be cleaned up.
-        let data_dir = base_dir.child(DATA_DIR);
+        let data_dir = base_dir.clone().join(DATA_DIR);
         let local_filename = "local.lance";
-        let local_path = data_dir.child(local_filename);
+        let local_path = data_dir.clone().join(local_filename);
         object_store.put(&local_path, b"x").await.unwrap();
         // Sanity check: file is on disk.
         assert_eq!(count_data_files(test_uri), 1);
