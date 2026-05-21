@@ -194,6 +194,74 @@ def test_load_indices(indexed_dataset: lance.LanceDataset):
     assert scalar_idx is not None
 
 
+def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
+    """Lock down the backwards-compatible shape of the deprecated list_indices().
+
+    list_indices() returns a list of plain dicts (one per index segment), not
+    Index dataclasses. This characterization test guards the dict keys and
+    values so the deprecated method stays backwards compatible.
+    """
+    with pytest.warns(DeprecationWarning):
+        indices = indexed_dataset.list_indices()
+
+    assert len(indices) == 2
+    by_name = {idx["name"]: idx for idx in indices}
+    assert set(by_name) == {"vector_idx", "meta_idx"}
+
+    expected_keys = {
+        "name",
+        "type",
+        "uuid",
+        "fields",
+        "version",
+        "fragment_ids",
+        "base_id",
+    }
+    for idx in indices:
+        assert set(idx) == expected_keys
+        assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
+        assert isinstance(idx["fields"], list)
+        assert isinstance(idx["fragment_ids"], set)
+        assert isinstance(idx["version"], int)
+        assert idx["type"] != "Unknown"
+        assert idx["base_id"] is None
+
+    vector_idx = by_name["vector_idx"]
+    assert vector_idx["type"] == "IVF_PQ"
+    assert vector_idx["fields"] == ["vector"]
+    assert vector_idx["fragment_ids"] == {0}
+
+    meta_idx = by_name["meta_idx"]
+    assert meta_idx["type"] == "BTree"
+    assert meta_idx["fields"] == ["meta"]
+    assert meta_idx["fragment_ids"] == {0}
+
+
+def test_list_indices_nested_field_path(tmp_path):
+    """list_indices() reports nested fields as full dotted paths."""
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("meta", pa.struct([pa.field("lang", pa.string())])),
+        ]
+    )
+    data = pa.table(
+        {
+            "id": [1, 2, 3],
+            "meta": [{"lang": "en"}, {"lang": "fr"}, {"lang": "en"}],
+        },
+        schema=schema,
+    )
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index(column="meta.lang", index_type="BTREE")
+
+    with pytest.warns(DeprecationWarning):
+        indices = ds.list_indices()
+
+    assert len(indices) == 1
+    assert indices[0]["fields"] == ["meta.lang"]
+
+
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
     sample_meta = data_table["meta"][50]
     expected_price = data_table["price"][50]
