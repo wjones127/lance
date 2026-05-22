@@ -684,7 +684,8 @@ pub struct PyIndexDescription {
     pub index_type: String,
     /// The ids of the fields that the index is built on
     pub fields: Vec<u32>,
-    /// The names of the fields that the index is built on
+    /// The full paths of the fields that the index is built on
+    /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
     /// The number of rows indexed by the index
     pub num_rows_indexed: u64,

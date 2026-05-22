@@ -262,6 +262,86 @@ def test_list_indices_nested_field_path(tmp_path):
     assert indices[0]["fields"] == ["meta.lang"]
 
 
+def _commit_index(ds, index):
+    """Commit a single raw Index entry via the CreateIndex operation."""
+    return lance.LanceDataset.commit(
+        ds.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=ds.version,
+    )
+
+
+def test_list_indices_index_without_details(tmp_path):
+    """An index whose manifest entry has no index details (e.g. committed by an
+    older writer) is still reported on a best-effort basis: describe_indices()
+    does not error, and the type is reported as "Unknown"."""
+    from lance.dataset import Index
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].name == "legacy_idx"
+    assert described[0].index_type == "Unknown"
+    assert described[0].type_url == ""
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert len(listed) == 1
+    assert listed[0]["name"] == "legacy_idx"
+    assert listed[0]["type"] == "Unknown"
+
+
+def test_list_indices_legacy_vector_index_without_details(tmp_path):
+    """A legacy vector index predates VectorIndexDetails: it has no index
+    details but stores a monolithic index file. Its type is recognized as
+    "Vector" from the index file rather than reported as "Unknown"."""
+    from lance.dataset import Index, IndexFile
+
+    data = pa.table({"id": range(100), "val": range(100)})
+    ds = lance.write_dataset(data, tmp_path)
+
+    field_id = ds.schema.get_field_index("id")
+    fragment_ids = {f.fragment_id for f in ds.get_fragments()}
+    ds = _commit_index(
+        ds,
+        Index(
+            uuid=str(uuid.uuid4()),
+            name="legacy_vector_idx",
+            fields=[field_id],
+            dataset_version=ds.version,
+            fragment_ids=fragment_ids,
+            index_version=0,
+            # "index.idx" is the legacy monolithic index file name; its presence
+            # is how a pre-details vector index is recognized.
+            files=[IndexFile(path="index.idx", size_bytes=0)],
+        ),
+    )
+
+    described = ds.describe_indices()
+    assert len(described) == 1
+    assert described[0].index_type == "Vector"
+
+    with pytest.warns(DeprecationWarning):
+        listed = ds.list_indices()
+    assert listed[0]["type"] == "Vector"
+
+
 def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa.Table):
     sample_meta = data_table["meta"][50]
     expected_price = data_table["price"][50]
