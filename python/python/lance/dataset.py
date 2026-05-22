@@ -956,16 +956,14 @@ class LanceDataset(pa.dataset.Dataset):
         """Check out the latest version of the current branch."""
         self._ds.checkout_latest()
 
-    def list_indices(self) -> List[Dict[str, Any]]:
+    def list_indices(self) -> List[IndexInformation]:
         """
         Returns index information for all indices in the dataset.
 
         This method is deprecated.  Use describe_indices() instead, which returns
         richer per-index information.
 
-        Each returned dict describes one index segment with the keys ``name``,
-        ``type``, ``uuid``, ``fields``, ``version``, ``fragment_ids`` and
-        ``base_id``.
+        Each returned :class:`IndexInformation` describes one index segment.
         """
         warnings.warn(
             "The 'list_indices' method is deprecated. It may be removed in a future "
@@ -5221,6 +5219,19 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+
+
+class IndexInformation(TypedDict):
+    """Information about a single index segment, as returned by
+    :meth:`LanceDataset.list_indices`."""
+
+    name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+    base_id: Optional[int]
 
 
 class AutoCleanupConfig(TypedDict):
