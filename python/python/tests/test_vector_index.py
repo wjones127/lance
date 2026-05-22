@@ -1797,7 +1797,7 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
     assert results == results_no_scalar_index
 
 
-def test_load_indices(dataset):
+def test_describe_indices(dataset):
     indices = dataset.describe_indices()
     assert len(indices) == 0
 

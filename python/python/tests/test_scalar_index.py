@@ -186,7 +186,7 @@ def btree_comparison_datasets(tmp_path):
     }
 
 
-def test_load_indices(indexed_dataset: lance.LanceDataset):
+def test_describe_indices_vector_and_scalar(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.describe_indices()
     vec_idx = next(idx for idx in indices if "VectorIndex" in idx.type_url)
     scalar_idx = next(idx for idx in indices if idx.index_type == "BTree")
@@ -4412,7 +4412,7 @@ def test_nested_field_btree_index(tmp_path):
     # Verify index was created
     indices = dataset.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["lang"]
+    assert indices[0].field_names == ["meta.lang"]
     assert indices[0].index_type == "BTree"
 
     # Test query using the index - filter for English language
@@ -4513,7 +4513,7 @@ def test_nested_field_fts_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["text"]
+    assert indices[0].field_names == ["data.text"]
     assert indices[0].index_type == "Inverted"
 
     # Test full text search on nested field
@@ -4587,7 +4587,7 @@ def test_nested_field_bitmap_index(tmp_path):
     # Verify index was created
     indices = ds.describe_indices()
     assert len(indices) == 1
-    assert indices[0].field_names == ["color"]
+    assert indices[0].field_names == ["attributes.color"]
     assert indices[0].index_type == "Bitmap"
 
     # Test equality query
