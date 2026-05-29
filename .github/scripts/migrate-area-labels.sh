@@ -97,8 +97,8 @@ rename_label python "A-python" "Python bindings"
 rename_label vector "A-index" "Vector index, linalg, tokenizer"
 merge_label indexes "A-index"
 
-rename_label file-storage "A-encoding" "Encoding, IO, file format"
-merge_label format "A-encoding"
+rename_label file-storage "A-encoding" "Encoding, IO, file reader/writer"
+rename_label format "A-format" "On-disk format: protos and format spec docs"
 
 rename_label dependencies "A-deps" "Dependency updates"
 merge_label "python:uv" "A-deps"

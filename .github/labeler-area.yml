@@ -28,7 +28,14 @@ A-encoding:
           - "rust/lance-encoding/**"
           - "rust/lance-io/**"
           - "rust/lance-file/**"
+
+# On-disk format: the proto definitions and the format spec docs. A change here
+# also gets A-docs when it touches docs/src/format/**, which is intended.
+A-format:
+  - changed-files:
+      - any-glob-to-any-file:
           - "protos/**"
+          - "docs/src/format/**"
 
 # Lockfiles are intentionally not excluded: a pure dependency bump gets both
 # A-python and A-deps. Over-labeling beats dropping the area signal on PRs that
