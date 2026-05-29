@@ -29,8 +29,8 @@ A-encoding:
           - "rust/lance-io/**"
           - "rust/lance-file/**"
 
-# On-disk format: the proto definitions and the format spec docs. A change here
-# also gets A-docs when it touches docs/src/format/**, which is intended.
+# On-disk format: the proto definitions and the format spec docs. Format docs
+# are excluded from A-docs (see below) so format changes get A-format only.
 A-format:
   - changed-files:
       - any-glob-to-any-file:
@@ -45,10 +45,16 @@ A-python:
       - any-glob-to-any-file:
           - "python/**"
 
+# Format spec docs (docs/src/format/**) are excluded so they get A-format only.
+# Caveat: a PR that touches both format docs and other docs in the same change
+# won't get A-docs, since the exclusion applies across all changed files.
 A-docs:
-  - changed-files:
-      - any-glob-to-any-file:
-          - "docs/**"
+  - all:
+      - changed-files:
+          - any-glob-to-any-file:
+              - "docs/**"
+          - all-globs-to-all-files:
+              - "!docs/src/format/**"
 
 A-ci:
   - changed-files:
