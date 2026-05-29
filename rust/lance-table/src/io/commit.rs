@@ -921,8 +921,54 @@ pub trait CommitLease: Send + Sync {
     async fn release(&self, success: bool) -> std::result::Result<(), CommitError>;
 }
 
+/// Guards a [CommitLease] so the lock is released even if the commit future is
+/// dropped (e.g. cancelled by a commit timeout) before reaching an explicit
+/// release.
+///
+/// [CommitLease::release] is async and cannot be awaited from `Drop`, so on the
+/// drop path we spawn a best-effort background task that releases the lock with
+/// `success = false`. Without this, a cancelled commit would leak the lock until
+/// the lease's own TTL expired, blocking other writers in the meantime.
+struct LeaseGuard<L: CommitLease + 'static> {
+    lease: Option<L>,
+}
+
+impl<L: CommitLease + 'static> LeaseGuard<L> {
+    fn new(lease: L) -> Self {
+        Self { lease: Some(lease) }
+    }
+
+    /// Explicitly release the lease, consuming the guard so `Drop` is a no-op.
+    async fn release(mut self, success: bool) -> std::result::Result<(), CommitError> {
+        let lease = self
+            .lease
+            .take()
+            .expect("LeaseGuard released more than once");
+        lease.release(success).await
+    }
+}
+
+impl<L: CommitLease + 'static> Drop for LeaseGuard<L> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            // The guard was dropped without an explicit release, meaning the
+            // commit future was cancelled while holding the lock. We can't await
+            // in `Drop`, so spawn a best-effort release. If there is no runtime,
+            // leave the lease for its TTL to reclaim.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = lease.release(false).await;
+                });
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl<T: CommitLock + Send + Sync> CommitHandler for T {
+impl<T: CommitLock + Send + Sync> CommitHandler for T
+where
+    T::Lease: 'static,
+{
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -934,9 +980,11 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
-        // NOTE: once we have the lease we cannot use ? to return errors, since
-        // we must release the lease before returning.
-        let lease = self.lock(manifest.version).await?;
+        // Hold the lease in a guard so the lock is released even if this future
+        // is cancelled before we reach an explicit release below. The explicit
+        // releases are still preferred since they report the correct success
+        // flag and surface release errors; the guard only covers cancellation.
+        let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
         // Head the location and make sure it's not already committed
         match object_store.inner.head(&path).await {
@@ -973,7 +1021,10 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
 }
 
 #[async_trait::async_trait]
-impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
+impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T>
+where
+    T::Lease: 'static,
+{
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -1371,5 +1422,105 @@ mod tests {
                 "{url} should route to ConditionalPutCommitHandler",
             );
         }
+    }
+
+    /// A [CommitLock] whose lease records whether it was released, so we can
+    /// assert the lock does not leak when the commit future is cancelled.
+    #[derive(Debug)]
+    struct TrackingLock {
+        released: Arc<AtomicBool>,
+    }
+
+    struct TrackingLease {
+        released: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLock for TrackingLock {
+        type Lease = TrackingLease;
+        async fn lock(&self, _version: u64) -> std::result::Result<Self::Lease, CommitError> {
+            Ok(TrackingLease {
+                released: self.released.clone(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommitLease for TrackingLease {
+        async fn release(&self, _success: bool) -> std::result::Result<(), CommitError> {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A manifest writer that never completes, simulating a hung object store.
+    fn hanging_manifest_writer<'a>(
+        _object_store: &'a ObjectStore,
+        _manifest: &'a mut Manifest,
+        _indices: Option<Vec<IndexMetadata>>,
+        _path: &'a Path,
+        _transaction: Option<Transaction>,
+    ) -> BoxFuture<'a, Result<WriteResult>> {
+        Box::pin(async move {
+            future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+
+    /// Cancelling a commit (as a commit timeout does) while the lock is held must
+    /// still release the lock; otherwise it leaks until the lease's TTL expires.
+    #[tokio::test]
+    async fn test_commit_lock_released_on_cancellation() {
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use lance_file::version::LanceFileVersion;
+
+        use crate::format::DataStorageFormat;
+
+        let released = Arc::new(AtomicBool::new(false));
+        let lock = TrackingLock {
+            released: released.clone(),
+        };
+
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("test");
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Stable),
+            HashMap::new(),
+        );
+
+        // The commit will hang on the manifest writer while holding the lock.
+        // Cancel it the same way a commit timeout would: drop the future.
+        let commit_fut = lock.commit(
+            &mut manifest,
+            None,
+            &base_path,
+            &object_store,
+            hanging_manifest_writer,
+            ManifestNamingScheme::V2,
+            None,
+        );
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), commit_fut).await;
+        assert!(timed_out.is_err(), "commit should not have completed");
+
+        // The drop guard releases the lock on a background task; wait for it.
+        for _ in 0..100 {
+            if released.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released.load(Ordering::SeqCst),
+            "lock must be released after the commit future is cancelled"
+        );
     }
 }
