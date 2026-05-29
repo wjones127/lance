@@ -52,16 +52,19 @@ jobs:
             const body = [
               MARKER,
               '> [!IMPORTANT]',
-              '> **This PR modifies the Lance format specification.**',
+              '> **This PR touches the Lance format specification.**',
               '>',
-              '> Changes to the format specification — the `.proto` definitions and the',
-              '> spec docs under `docs/src/format/` — require a PMC vote before merge.',
+              '> Substantive changes to the format specification — the `.proto` definitions',
+              '> and the spec docs under `docs/src/format/` — require a PMC vote before merge.',
+              '> Minor edits such as typo fixes, wording, or formatting are excluded; use your',
+              '> judgment.',
               '>',
+              '> If this is a meaningful format change:',
               '> - Start a vote following the [Lance community voting process](https://lance.org/community/voting/).',
               '>   Format specification modifications need **3 binding +1 votes** (excluding the',
               '>   proposer), held on GitHub Discussions, with a minimum voting period of **1 week**.',
-              '> - Once the vote passes, **link the completed vote in this PR**. This PR should',
-              '>   not be merged until the vote is linked.',
+              '> - Once the vote passes, **link the completed vote in this PR**. It should not be',
+              '>   merged until the vote is linked.',
             ].join('\n');
 
             await github.rest.issues.createComment({
