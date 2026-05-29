@@ -30,23 +30,18 @@ A-encoding:
           - "rust/lance-file/**"
           - "protos/**"
 
-# Excludes python lockfiles so a pure dependency bump is tagged A-deps only.
-# Note: a PR that touches both python code and python/uv.lock|Cargo.lock will
-# not get A-python, since the exclusion applies across all changed files.
+# Lockfiles are intentionally not excluded: a pure dependency bump gets both
+# A-python and A-deps. Over-labeling beats dropping the area signal on PRs that
+# touch python code alongside a lockfile.
 A-python:
-  - all:
-      - changed-files:
-          - any-glob-to-any-file:
-              - "python/**"
-          - all-globs-to-all-files:
-              - "!python/uv.lock"
-              - "!python/Cargo.lock"
+  - changed-files:
+      - any-glob-to-any-file:
+          - "python/**"
 
 A-docs:
   - changed-files:
       - any-glob-to-any-file:
           - "docs/**"
-          - "**/*.md"
 
 A-ci:
   - changed-files:
