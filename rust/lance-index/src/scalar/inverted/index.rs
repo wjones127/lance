@@ -6653,10 +6653,15 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // 150 tokens => more than two default (64-token cap) groups, so the
-        // comparison exercises the partition_point math at group boundaries.
+        // A small token cap forces several groups regardless of the default,
+        // so the comparison exercises the partition_point math at group
+        // boundaries.
         let num_tokens = 150u32;
         let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
         for t in 0..num_tokens {
             builder.tokens.add(format!("t{t}"));
             let mut pl = PostingListBuilder::new(false);
@@ -6848,10 +6853,15 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // 130 rare tokens (one doc each, spanning >2 groups) plus one common
-        // token in every doc, so scoring must index into the right group slot.
+        // 130 rare tokens (one doc each) plus one common token in every doc; a
+        // small token cap spreads them across several groups so scoring must
+        // index into the right group slot.
         let num_rare = 130u32;
         let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
         for t in 0..num_rare {
             builder.tokens.add(format!("t{t}"));
             builder.posting_lists.push(PostingListBuilder::new(false));

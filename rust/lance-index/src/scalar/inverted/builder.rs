@@ -89,7 +89,7 @@ static LANCE_FTS_POSTING_GROUP_TARGET_BYTES: LazyLock<usize> = LazyLock::new(|| 
 // tiny terms.
 static LANCE_FTS_POSTING_GROUP_MAX_TOKENS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
-        .unwrap_or_else(|_| "64".to_string())
+        .unwrap_or_else(|_| "256".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
 });
