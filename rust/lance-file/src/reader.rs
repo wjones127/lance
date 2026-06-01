@@ -105,6 +105,18 @@ pub struct CachedFileMetadata {
     pub minor_version: u16,
     /// The actual total file size in bytes, as reported by the object store.
     pub file_size_bytes: u64,
+    /// The tail region of the file captured during open, spanning
+    /// `[tail_offset, tail_offset + tail_bytes.len())` (which always ends at EOF).
+    ///
+    /// `read_all_metadata` already reads this window (bounded by the object
+    /// store block size) to decode the footer, GBO table, schema, and column
+    /// metadata.  Because all global buffers are laid out contiguously starting
+    /// at the schema, small/medium files keep every global buffer inside this
+    /// window.  Retaining it lets `read_global_buffer` serve those buffers with
+    /// zero additional I/O.  `Bytes` is cheap to hold and slices are zero-copy.
+    pub tail_bytes: Bytes,
+    /// The file offset at which `tail_bytes` begins.
+    pub tail_offset: u64,
 }
 
 impl CachedFileMetadata {
@@ -166,7 +178,12 @@ impl DeepSizeOf for CachedFileMetadata {
             })
             .sum();
 
-        schema_size + buffers_size + column_metadatas_size + column_infos_size
+        // tail_bytes retains the captured tail window for zero-IO global buffer reads.
+        schema_size
+            + buffers_size
+            + column_metadatas_size
+            + column_infos_size
+            + self.tail_bytes.len()
     }
 }
 
@@ -480,12 +497,22 @@ impl FileReader {
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len())))?;
-        self.scheduler
-            .submit_single(
-                buffer_desc.position..buffer_desc.position + buffer_desc.size,
-                0,
-            )
-            .await
+        let start = buffer_desc.position;
+        let end = buffer_desc.position + buffer_desc.size;
+
+        // If the buffer lives entirely within the tail region we already captured
+        // when opening the file, serve it from memory with no additional I/O.  All
+        // global buffers are laid out contiguously starting at the schema, so this
+        // hits for any file whose metadata + buffer region fits in the tail window.
+        let tail_offset = self.metadata.tail_offset;
+        let tail = &self.metadata.tail_bytes;
+        if start >= tail_offset && end <= tail_offset + tail.len() as u64 {
+            let begin = (start - tail_offset) as usize;
+            let stop = (end - tail_offset) as usize;
+            return Ok(tail.slice(begin..stop));
+        }
+
+        self.scheduler.submit_single(start..end, 0).await
     }
 
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
@@ -661,6 +688,7 @@ impl FileReader {
     pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
         // 1. read the footer
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
         let file_version = LanceFileVersion::try_from_major_minor(
@@ -715,6 +743,8 @@ impl FileReader {
             major_version: footer.major_version,
             minor_version: footer.minor_version,
             file_size_bytes: file_len,
+            tail_bytes,
+            tail_offset,
         })
     }
 
@@ -2335,10 +2365,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_global_buffers() {
-        let fs = FsFixture::default();
-
+    async fn write_file_with_global_buffer(fs: &FsFixture, buffer: Bytes) {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
                 "foo",
@@ -2349,21 +2376,36 @@ mod tests {
 
         let mut file_writer = FileWriter::try_new(
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
-            lance_schema.clone(),
+            lance_schema,
             FileWriterOptions::default(),
         )
         .unwrap();
 
-        let test_bytes = Bytes::from_static(b"hello");
-
-        let buf_index = file_writer
-            .add_global_buffer(test_bytes.clone())
-            .await
-            .unwrap();
-
+        let buf_index = file_writer.add_global_buffer(buffer).await.unwrap();
         assert_eq!(buf_index, 1);
 
         file_writer.finish().await.unwrap();
+    }
+
+    /// A global buffer that fits inside the tail region captured at open is served
+    /// from memory with no additional I/O.  A buffer larger than that window cannot
+    /// fit and falls back to a dedicated read.  Both must round-trip correctly.
+    #[rstest]
+    #[case::within_tail_window(true)]
+    #[case::outside_tail_window(false)]
+    #[tokio::test]
+    async fn test_read_global_buffer(#[case] within_window: bool) {
+        let fs = FsFixture::default();
+
+        let block_size = fs.object_store.block_size();
+        let buffer = if within_window {
+            Bytes::from_static(b"hello")
+        } else {
+            Bytes::from(vec![7u8; 2 * block_size])
+        };
+        let expected_read_iops = if within_window { 0 } else { 1 };
+
+        write_file_with_global_buffer(&fs, buffer.clone()).await;
 
         let file_scheduler = fs
             .scheduler
@@ -2371,7 +2413,7 @@ mod tests {
             .await
             .unwrap();
         let file_reader = FileReader::try_open(
-            file_scheduler.clone(),
+            file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             &test_cache(),
@@ -2380,8 +2422,14 @@ mod tests {
         .await
         .unwrap();
 
+        // Reset the IO counters so we only measure the read_global_buffer call.
+        fs.object_store.io_stats_incremental();
+
         let buf = file_reader.read_global_buffer(1).await.unwrap();
-        assert_eq!(buf, test_bytes);
+        assert_eq!(buf, buffer);
+
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(stats.read_iops, expected_read_iops);
     }
 
     #[rstest]
