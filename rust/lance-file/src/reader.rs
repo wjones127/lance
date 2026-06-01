@@ -105,18 +105,19 @@ pub struct CachedFileMetadata {
     pub minor_version: u16,
     /// The actual total file size in bytes, as reported by the object store.
     pub file_size_bytes: u64,
-    /// The tail region of the file captured during open, spanning
-    /// `[tail_offset, tail_offset + tail_bytes.len())` (which always ends at EOF).
+    /// User global buffers (index >= 1) whose bytes were already captured by the
+    /// tail read that `read_all_metadata` performs at open, keyed by buffer index.
     ///
-    /// `read_all_metadata` already reads this window (bounded by the object
-    /// store block size) to decode the footer, GBO table, schema, and column
-    /// metadata.  Because all global buffers are laid out contiguously starting
-    /// at the schema, small/medium files keep every global buffer inside this
-    /// window.  Retaining it lets `read_global_buffer` serve those buffers with
-    /// zero additional I/O.  `Bytes` is cheap to hold and slices are zero-copy.
-    pub tail_bytes: Bytes,
-    /// The file offset at which `tail_bytes` begins.
-    pub tail_offset: u64,
+    /// All global buffers are laid out contiguously starting at the schema, so on
+    /// small/medium files they land inside the captured tail window. Retaining
+    /// those bytes lets `read_global_buffer` serve them with zero additional I/O.
+    /// The bytes are copied out of the tail (rather than sliced) so the much
+    /// larger tail allocation can be dropped — we only hold what we will serve.
+    ///
+    /// The schema (buffer 0) is excluded: it is already decoded at open and is
+    /// not fetched through `read_global_buffer`. Buffers that fall outside the
+    /// window (large files) are absent here and fall back to a dedicated read.
+    pub retained_global_buffers: BTreeMap<u32, Bytes>,
 }
 
 impl CachedFileMetadata {
@@ -178,12 +179,18 @@ impl DeepSizeOf for CachedFileMetadata {
             })
             .sum();
 
-        // tail_bytes retains the captured tail window for zero-IO global buffer reads.
+        // Global buffer bytes retained for zero-IO reads (copied out of the tail).
+        let retained_buffers_size: usize = self
+            .retained_global_buffers
+            .values()
+            .map(|buf| buf.len())
+            .sum();
+
         schema_size
             + buffers_size
             + column_metadatas_size
             + column_infos_size
-            + self.tail_bytes.len()
+            + retained_buffers_size
     }
 }
 
@@ -497,22 +504,20 @@ impl FileReader {
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len())))?;
-        let start = buffer_desc.position;
-        let end = buffer_desc.position + buffer_desc.size;
 
-        // If the buffer lives entirely within the tail region we already captured
-        // when opening the file, serve it from memory with no additional I/O.  All
-        // global buffers are laid out contiguously starting at the schema, so this
-        // hits for any file whose metadata + buffer region fits in the tail window.
-        let tail_offset = self.metadata.tail_offset;
-        let tail = &self.metadata.tail_bytes;
-        if start >= tail_offset && end <= tail_offset + tail.len() as u64 {
-            let rel_start = (start - tail_offset) as usize;
-            let rel_end = (end - tail_offset) as usize;
-            return Ok(tail.slice(rel_start..rel_end));
+        // If the buffer's bytes were captured by the tail read at open, serve them
+        // from memory with no additional I/O. Larger buffers (outside the window)
+        // are not retained and fall back to a dedicated read.
+        if let Some(bytes) = self.metadata.retained_global_buffers.get(&index) {
+            return Ok(bytes.clone());
         }
 
-        self.scheduler.submit_single(start..end, 0).await
+        self.scheduler
+            .submit_single(
+                buffer_desc.position..buffer_desc.position + buffer_desc.size,
+                0,
+            )
+            .await
     }
 
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
@@ -730,6 +735,30 @@ impl FileReader {
 
         let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
+        // The tail read above already pulled in any global buffer that lives within
+        // the captured window. Copy those user buffers (index >= 1; the schema at 0
+        // is decoded above and never fetched via read_global_buffer) out of the tail
+        // so read_global_buffer can serve them without I/O. We copy rather than slice
+        // so the much larger tail allocation can be released once decoding is done.
+        let tail_end = tail_offset + tail_bytes.len() as u64;
+        let retained_global_buffers = gbo_table
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(index, buffer)| {
+                let start = buffer.position;
+                let end = buffer.position + buffer.size;
+                if start >= tail_offset && end <= tail_end {
+                    let rel_start = (start - tail_offset) as usize;
+                    let rel_end = (end - tail_offset) as usize;
+                    let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
+                    Some((index as u32, bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
             column_metadatas,
@@ -743,8 +772,7 @@ impl FileReader {
             major_version: footer.major_version,
             minor_version: footer.minor_version,
             file_size_bytes: file_len,
-            tail_bytes,
-            tail_offset,
+            retained_global_buffers,
         })
     }
 
@@ -2422,6 +2450,12 @@ mod tests {
         .await
         .unwrap();
 
+        // The user buffer should be retained only when it fits the tail window, and
+        // the schema (buffer 0) is never retained.
+        let retained = &file_reader.metadata().retained_global_buffers;
+        assert!(!retained.contains_key(&0), "schema must not be retained");
+        assert_eq!(retained.contains_key(&1), within_window);
+
         // Reset the IO counters so we only measure the read_global_buffer call.
         fs.object_store.io_stats_incremental();
 
@@ -2430,6 +2464,36 @@ mod tests {
 
         let stats = fs.object_store.io_stats_incremental();
         assert_eq!(stats.read_iops, expected_read_iops);
+    }
+
+    /// A file whose only global buffer is the schema (i.e. a plain data file, the
+    /// common case) must retain nothing — there is no user buffer to serve.
+    #[tokio::test]
+    async fn test_read_global_buffer_no_user_buffers() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, LanceFileVersion::V2_1).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = file_reader.metadata();
+        assert_eq!(metadata.file_buffers.len(), 1, "expected only the schema");
+        assert!(
+            metadata.retained_global_buffers.is_empty(),
+            "a file with no user global buffers must retain nothing"
+        );
     }
 
     #[rstest]
