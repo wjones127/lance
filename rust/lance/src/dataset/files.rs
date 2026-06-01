@@ -57,6 +57,19 @@ struct FileRow<'a> {
     file_type: FileType,
 }
 
+/// Resolve the base URI a file lives under. Files referenced from a shallow
+/// clone carry a `base_id` pointing into `manifest.base_paths`; otherwise they
+/// live under this dataset's own `base_uri`.
+fn resolve_base_uri<'a>(
+    manifest: &'a lance_table::format::Manifest,
+    base_id: Option<u32>,
+    base_uri: &'a str,
+) -> &'a str {
+    base_id
+        .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
+        .unwrap_or(base_uri)
+}
+
 fn manifest_file_rows<'a>(
     manifest: &'a lance_table::format::Manifest,
     base_uri: &'a str,
@@ -94,10 +107,7 @@ fn manifest_file_rows<'a>(
 
     let data_files = manifest.fragments.iter().flat_map(move |fragment| {
         fragment.files.iter().map(move |data_file| {
-            let effective_base_uri = data_file
-                .base_id
-                .and_then(|id| manifest.base_paths.get(&id).map(|bp| bp.path.as_str()))
-                .unwrap_or(base_uri);
+            let effective_base_uri = resolve_base_uri(manifest, data_file.base_id, base_uri);
             FileRow {
                 version: manifest.version,
                 base_uri: Cow::Borrowed(effective_base_uri),
@@ -110,7 +120,7 @@ fn manifest_file_rows<'a>(
     let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
         fragment.deletion_file.as_ref().map(|del_file| FileRow {
             version: manifest.version,
-            base_uri: Cow::Borrowed(base_uri),
+            base_uri: Cow::Borrowed(resolve_base_uri(manifest, del_file.base_id, base_uri)),
             path: Cow::Owned(relative_deletion_file_path(fragment.id, del_file)),
             file_type: FileType::DeletionFile,
         })
@@ -998,7 +1008,10 @@ mod tests {
     fn test_manifest_file_rows_per_file_base_id() {
         use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
         use lance_io::utils::CachedFileSize;
-        use lance_table::format::{BasePath, DataFile, DataStorageFormat, Fragment, Manifest};
+        use lance_table::format::{
+            BasePath, DataFile, DataStorageFormat, DeletionFile, DeletionFileType, Fragment,
+            Manifest,
+        };
 
         let schema = LanceSchema {
             fields: vec![LanceField::try_from(&Field::new("id", DataType::Int32, false)).unwrap()],
@@ -1023,7 +1036,15 @@ mod tests {
                 // No base_id -> falls back to the dataset base_uri.
                 mk_file("c.lance", None),
             ],
-            deletion_file: None,
+            // Deletion files also carry a base_id when they originate from a
+            // shallow clone, and must resolve against base_paths too.
+            deletion_file: Some(DeletionFile {
+                read_version: 1,
+                id: 7,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: Some(2),
+            }),
             row_id_meta: None,
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
@@ -1058,6 +1079,13 @@ mod tests {
         assert_eq!(by_path.get("data/a.lance"), Some(&"s3://bucket-a/root"));
         assert_eq!(by_path.get("data/b.lance"), Some(&"s3://bucket-b/root"));
         assert_eq!(by_path.get("data/c.lance"), Some(&"memory://main"));
+
+        let deletion = rows
+            .iter()
+            .find(|r| matches!(r.file_type, FileType::DeletionFile))
+            .expect("deletion file row");
+        assert_eq!(deletion.path.as_ref(), "_deletions/0-1-7.bin");
+        assert_eq!(deletion.base_uri.as_ref(), "s3://bucket-b/root");
     }
 
     #[tokio::test]
