@@ -507,9 +507,9 @@ impl FileReader {
         let tail_offset = self.metadata.tail_offset;
         let tail = &self.metadata.tail_bytes;
         if start >= tail_offset && end <= tail_offset + tail.len() as u64 {
-            let begin = (start - tail_offset) as usize;
-            let stop = (end - tail_offset) as usize;
-            return Ok(tail.slice(begin..stop));
+            let rel_start = (start - tail_offset) as usize;
+            let rel_end = (end - tail_offset) as usize;
+            return Ok(tail.slice(rel_start..rel_end));
         }
 
         self.scheduler.submit_single(start..end, 0).await
@@ -2494,5 +2494,37 @@ mod tests {
             deep_size > num_columns * 50,
             "deep_size_of ({deep_size}) should scale with column count ({num_columns})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_global_buffer_out_of_range() {
+        let fs = FsFixture::default();
+
+        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // The file has two global buffers (schema at 0, "hello" at 1); index 2 is
+        // out of range and must surface a descriptive error rather than panicking.
+        let err = file_reader.read_global_buffer(2).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains('2'), "error should mention the index: {msg}");
     }
 }
