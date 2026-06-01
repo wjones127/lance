@@ -115,8 +115,10 @@ impl Default for PostingGroupConfig {
 
 /// Accumulates posting-list group boundaries at write time. Tokens are pushed
 /// in row order; a group is cut once its serialized bytes reach
-/// `target_bytes` or it holds `max_tokens` posting lists. A single posting
-/// list larger than the target lands in its own group (the clamp case).
+/// `target_bytes` or it holds `max_tokens` posting lists. A posting list
+/// larger than the target that *starts* a group occupies that group alone (the
+/// clamp case); one encountered mid-group is absorbed and closes that group, so
+/// a single term is never split across groups.
 #[derive(Debug)]
 pub(crate) struct PostingGroupAccumulator {
     config: PostingGroupConfig,

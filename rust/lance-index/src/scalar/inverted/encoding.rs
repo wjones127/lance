@@ -236,7 +236,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 }
 
 #[inline]
-pub(super) fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
+fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
     while value >= 0x80 {
         dst.push((value as u8) | 0x80);
         value >>= 7;
@@ -818,6 +818,16 @@ mod tests {
             let decoded = decode_group_starts(&encoded).unwrap();
             assert_eq!(decoded, case, "roundtrip mismatch for {case:?}");
         }
+    }
+
+    #[test]
+    fn test_decode_group_starts_rejects_overflow() {
+        // A crafted buffer whose deltas sum past u32::MAX must error rather
+        // than wrap. Encodes u32::MAX followed by a +1 delta.
+        let mut buf = Vec::new();
+        encode_varint_u32(&mut buf, u32::MAX);
+        encode_varint_u32(&mut buf, 1);
+        assert!(decode_group_starts(&buf).is_err());
     }
 
     #[test]

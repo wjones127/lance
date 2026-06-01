@@ -2090,6 +2090,9 @@ impl PostingListReader {
     /// so the group range is also the physical row range.
     fn group_range_for_token(&self, token_id: u32) -> Option<(u32, u32)> {
         let starts = self.group_starts.as_ref()?;
+        // partition_point returns the count of group starts <= token_id, so the
+        // owning group begins at index k - 1 and the next start (if any) is its
+        // exclusive end.
         let k = starts.partition_point(|&s| s <= token_id);
         // k == 0 means token_id precedes the first group start, which cannot
         // happen for a valid token in a grouped index (the first group starts
@@ -2098,6 +2101,9 @@ impl PostingListReader {
             return None;
         }
         let start = starts[k - 1];
+        // The last group runs to the final row. In v2 the token count equals
+        // the row count, so this matches the `end` prewarm derives from the
+        // posting count, keeping warm- and cold-cache group keys identical.
         let end = starts
             .get(k)
             .copied()
@@ -6691,6 +6697,141 @@ mod tests {
                 g.max_score(),
                 f.max_score(),
                 "max_score mismatch for token {token}",
+            );
+        }
+    }
+
+    /// An empty partition writes no group-offsets buffer, so its reader takes
+    /// the per-token fallback path (issue #7040).
+    #[tokio::test]
+    async fn test_empty_partition_has_no_group_offsets() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        assert!(
+            !reader
+                .schema()
+                .metadata
+                .contains_key(POSTING_GROUP_OFFSETS_BUF_KEY),
+            "empty partition must not write the group-offsets metadata key",
+        );
+
+        let posting_reader = PostingListReader::try_new(reader, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            posting_reader.group_starts.is_none(),
+            "reader for an empty partition must use the per-token fallback path",
+        );
+        assert!(posting_reader.is_empty());
+    }
+
+    /// A posting list that alone exceeds the group target lands in its own
+    /// `[t, t+1)` group (the clamp case) and reads back intact (issue #7040).
+    #[tokio::test]
+    async fn test_oversized_term_is_own_group_on_read() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A tiny byte target so a modest posting trips the clamp without
+        // needing a huge fixture; the surrounding tiny terms regroup after it.
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 50,
+            max_tokens: 1000,
+        };
+        let big_docs = 30u32;
+        builder.tokens.add("big".to_owned());
+        let mut big = PostingListBuilder::new(false);
+        for d in 0..big_docs {
+            big.add(d, PositionRecorder::Count(1));
+        }
+        builder.posting_lists.push(big);
+        for t in 1..5u32 {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(0, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+        }
+        for d in 0..big_docs as u64 {
+            builder.docs.append(1000 + d, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let posting_reader = PostingListReader::try_new(reader, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            posting_reader.group_range_for_token(0),
+            Some((0, 1)),
+            "an oversized term must occupy its own single-row group",
+        );
+        let big = posting_reader
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(big.len(), big_docs as usize);
+        // A trailing tiny term (in the next, multi-token group) still reads back.
+        let tiny = posting_reader
+            .posting_list(2, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(tiny.len(), 1);
+    }
+
+    /// When the group offsets are absent, prewarm populates per-token
+    /// `PostingListKey` entries (the fallback path), matching what the read
+    /// path then looks up (issue #7040).
+    #[tokio::test]
+    async fn test_prewarm_fallback_populates_per_token_entries() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let num_tokens = 3u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for t in 0..num_tokens {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(t, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+            builder.docs.append(1000 + t as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let stripped: Arc<dyn IndexReader> = Arc::new(GroupKeyStrippingReader::new(reader));
+        let cache = LanceCache::with_capacity(1 << 20);
+        let posting_reader = PostingListReader::try_new(stripped, &cache).await.unwrap();
+        assert!(posting_reader.group_starts.is_none());
+
+        posting_reader.prewarm_posting_lists(false).await.unwrap();
+
+        for token_id in 0..num_tokens {
+            assert!(
+                posting_reader
+                    .index_cache
+                    .get_with_key(&PostingListKey { token_id })
+                    .await
+                    .is_some(),
+                "fallback prewarm should populate per-token entry {token_id}",
             );
         }
     }
