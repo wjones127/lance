@@ -2101,13 +2101,12 @@ impl PostingListReader {
             return None;
         }
         let start = starts[k - 1];
-        // The last group runs to the final row. In v2 the token count equals
-        // the row count, so this matches the `end` prewarm derives from the
-        // posting count, keeping warm- and cold-cache group keys identical.
-        let end = starts
-            .get(k)
-            .copied()
-            .unwrap_or(self.reader.num_rows() as u32);
+        // The last group runs to the final posting list. `self.len()` is the
+        // authoritative posting-list count (offsets length for v1, row count for
+        // v2), and prewarm derives the same `end` from it — so warm- and
+        // cold-cache group keys are identical by construction, not by the
+        // incidental v2 `num_rows == token_count` equality.
+        let end = starts.get(k).copied().unwrap_or(self.len() as u32);
         Some((start, end))
     }
 
@@ -2275,11 +2274,11 @@ impl PostingListReader {
         // grouping is active (issue #7040), per-token entries otherwise.
         match self.group_starts.as_ref() {
             Some(starts) => {
+                // The read path derives the last group's `end` from `self.len()`;
+                // match it here so both produce identical `PostingListGroupKey`s.
+                debug_assert_eq!(postings_by_token.len(), self.len());
                 for (k, &start) in starts.iter().enumerate() {
-                    let end = starts
-                        .get(k + 1)
-                        .copied()
-                        .unwrap_or(postings_by_token.len() as u32);
+                    let end = starts.get(k + 1).copied().unwrap_or(self.len() as u32);
                     let group = PostingListGroup::new(
                         postings_by_token[start as usize..end as usize].to_vec(),
                     );
@@ -6704,6 +6703,74 @@ mod tests {
                 "max_score mismatch for token {token}",
             );
         }
+    }
+
+    /// Prewarm must populate exactly the `PostingListGroupKey`s the read path
+    /// looks up — in particular the final group, whose `end` both paths derive
+    /// from `self.len()`. If those derivations drifted (e.g. one used
+    /// `num_rows()` and the other the loaded posting count), the last group's
+    /// warm entry would be missing and prewarm silently wasted (issue #7040).
+    #[tokio::test]
+    async fn test_prewarm_group_keys_match_read_path() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Small token cap so the partition spans several groups regardless of
+        // the default, exercising every group boundary including the last.
+        let num_tokens = 150u32;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.group_config = PostingGroupConfig {
+            target_bytes: 4096,
+            max_tokens: 32,
+        };
+        for t in 0..num_tokens {
+            builder.tokens.add(format!("t{t}"));
+            let mut pl = PostingListBuilder::new(false);
+            pl.add(t, PositionRecorder::Count(1));
+            builder.posting_lists.push(pl);
+            builder.docs.append(1000 + t as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        // A real (strong) cache must outlive the reader's weak handle so the
+        // prewarmed entries are still resolvable below.
+        let cache = LanceCache::with_capacity(1 << 20);
+        let posting_reader = PostingListReader::try_new(reader, &cache).await.unwrap();
+        assert!(
+            posting_reader
+                .group_starts
+                .as_ref()
+                .is_some_and(|s| s.len() > 1),
+            "fixture should span multiple groups",
+        );
+
+        posting_reader.prewarm_posting_lists(false).await.unwrap();
+
+        for token in 0..num_tokens {
+            let (start, end) = posting_reader.group_range_for_token(token).unwrap();
+            assert!(
+                posting_reader
+                    .index_cache
+                    .get_with_key(&PostingListGroupKey { start, end })
+                    .await
+                    .is_some(),
+                "prewarm did not populate group [{start}, {end}) that the read \
+                 path requests for token {token}",
+            );
+        }
+
+        let (_, last_end) = posting_reader
+            .group_range_for_token(num_tokens - 1)
+            .unwrap();
+        assert_eq!(
+            last_end, num_tokens,
+            "the last group must end at the posting count ({num_tokens})",
+        );
     }
 
     /// An empty partition writes no group-offsets buffer, so its reader takes
