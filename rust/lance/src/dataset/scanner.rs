@@ -829,14 +829,14 @@ pub struct Scanner {
     /// Which version of the relational algebra to use when generating the physical plan
     relational_algebra_version: u32,
 
-    /// Target number of output partitions for the physical optimizer.
+    /// Target degree of parallelism for the physical optimizer.
     ///
     /// This is passed as `ConfigOptions::execution::target_partitions` to the
     /// physical optimizer (e.g. `EnforceDistribution`), which uses it to decide
-    /// how many partitions to target when inserting exchange nodes.
+    /// how many parallel partitions to target when inserting exchange nodes.
     ///
     /// Defaults to `get_num_compute_intensive_cpus()`.
-    target_partitions: Option<usize>,
+    target_parallelism: Option<usize>,
 
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
@@ -1062,7 +1062,7 @@ impl Scanner {
             explicit_projection: false,
             autoproject_scoring_columns: true,
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
-            target_partitions: None,
+            target_parallelism: None,
         };
         scanner.apply_blob_handling();
         scanner
@@ -1392,11 +1392,10 @@ impl Scanner {
     /// Set the target number of partitions for the physical optimizer.
     ///
     /// Overrides the default (`get_num_compute_intensive_cpus()`). Used by
-    /// `EnforceDistribution` and similar rules to decide how many partitions to
-    /// target when inserting exchange nodes. Set to 1 in tests that assert
-    /// specific plan shapes.
-    pub fn target_partitions(&mut self, n: usize) -> &mut Self {
-        self.target_partitions = Some(n);
+    /// `EnforceDistribution` and similar rules to decide how many parallel
+    /// partitions to use. Set to 1 in tests that assert specific plan shapes.
+    pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
+        self.target_parallelism = Some(n);
         self
     }
 
@@ -2640,7 +2639,7 @@ impl Scanner {
             let optimizer = get_physical_optimizer();
             let mut options = ConfigOptions::default();
             options.execution.target_partitions = self
-                .target_partitions
+                .target_parallelism
                 .unwrap_or_else(get_num_compute_intensive_cpus);
             for rule in optimizer.rules {
                 plan = rule.optimize(plan, &options)?;
@@ -2707,7 +2706,7 @@ impl Scanner {
         let optimizer = get_physical_optimizer();
         let mut options = ConfigOptions::default();
         options.execution.target_partitions = self
-            .target_partitions
+            .target_parallelism
             .unwrap_or_else(get_num_compute_intensive_cpus);
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
@@ -8310,9 +8309,9 @@ mod test {
         expected: &str,
     ) -> Result<()> {
         let mut scan = dataset.scan();
-        // Pin target_partitions=1 so EnforceDistribution produces deterministic plans
+        // Pin target_parallelism=1 so EnforceDistribution produces deterministic plans
         // regardless of the machine's CPU count.
-        scan.target_partitions(1);
+        scan.target_parallelism(1);
         plan(&mut scan)?;
         let exec_plan = scan.create_plan().await?;
         assert_plan_node_equals(exec_plan, expected).await
