@@ -20,6 +20,7 @@ use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
+use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -92,7 +93,7 @@ use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
-use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment, PyIndexSegmentPlan};
+use crate::indices::{PyIndexConfig, PyIndexDescription, PyIndexSegment};
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
 use crate::scanner::ScanStatistics;
@@ -169,7 +170,8 @@ fn writer_config_from_kwargs(
     async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
-) -> Option<lance::dataset::mem_wal::ShardWriterConfig> {
+    hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
+) -> PyResult<Option<lance::dataset::mem_wal::ShardWriterConfig>> {
     use std::time::Duration;
 
     let mut config = lance::dataset::mem_wal::ShardWriterConfig::default();
@@ -226,7 +228,30 @@ fn writer_config_from_kwargs(
         config = config.with_stats_log_interval(stats_log_interval_from_millis(v));
         any = true;
     }
-    any.then_some(config)
+    if let Some(overrides) = hnsw_params {
+        // {index_name: {param: value}} -> HnswBuildParams, rejecting unknown
+        // keys so typos surface instead of being silently ignored.
+        for (index_name, params) in overrides {
+            let mut build = HnswBuildParams::default();
+            for (key, value) in params {
+                match key.as_str() {
+                    "num_edges" => build = build.num_edges(value as usize),
+                    "ef_construction" => build = build.ef_construction(value as usize),
+                    "max_level" => build = build.max_level(value as u16),
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown HNSW build param '{}' for index '{}'; \
+                             expected one of 'num_edges', 'ef_construction', 'max_level'",
+                            other, index_name
+                        )));
+                    }
+                }
+            }
+            config = config.with_hnsw_params(index_name, build);
+            any = true;
+        }
+    }
+    Ok(any.then_some(config))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
@@ -459,36 +484,6 @@ impl MergeInsertBuilder {
     }
 }
 
-#[pyclass(
-    name = "IndexSegmentBuilder",
-    module = "lance",
-    subclass,
-    skip_from_py_object
-)]
-#[derive(Clone)]
-pub struct PyIndexSegmentBuilder {
-    dataset: Arc<LanceDataset>,
-    index_type: Option<IndexType>,
-    segments: Vec<IndexMetadata>,
-    target_segment_bytes: Option<u64>,
-}
-
-impl PyIndexSegmentBuilder {
-    fn builder(&self) -> <LanceDataset as DatasetIndexExt>::IndexSegmentBuilder<'_> {
-        let mut builder = self
-            .dataset
-            .create_index_segment_builder()
-            .with_segments(self.segments.clone());
-        if let Some(index_type) = self.index_type {
-            builder = builder.with_index_type(index_type);
-        }
-        if let Some(target_segment_bytes) = self.target_segment_bytes {
-            builder = builder.with_target_segment_bytes(target_segment_bytes);
-        }
-        builder
-    }
-}
-
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
     let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
         PyValueError::new_err(format!(
@@ -529,81 +524,6 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
-}
-
-#[pymethods]
-impl PyIndexSegmentBuilder {
-    fn with_index_type<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        index_type: &str,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        let normalized = index_type.to_uppercase();
-        slf.index_type = Some(match normalized.as_str() {
-            "INVERTED" | "FTS" => IndexType::Inverted,
-            "VECTOR" => IndexType::Vector,
-            "IVF_FLAT" => IndexType::IvfFlat,
-            "IVF_PQ" => IndexType::IvfPq,
-            "IVF_SQ" => IndexType::IvfSq,
-            "IVF_RQ" => IndexType::IvfRq,
-            "IVF_HNSW_FLAT" => IndexType::IvfHnswFlat,
-            "IVF_HNSW_PQ" => IndexType::IvfHnswPq,
-            "IVF_HNSW_SQ" => IndexType::IvfHnswSq,
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Unsupported index type for segment builder: {index_type}"
-                )));
-            }
-        });
-        Ok(slf)
-    }
-
-    fn with_segments<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        segments: &Bound<'_, PyAny>,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        let mut indices = Vec::new();
-        for item in segments.try_iter()? {
-            indices.push(item?.extract::<PyLance<IndexMetadata>>()?.0);
-        }
-        slf.segments = indices;
-        Ok(slf)
-    }
-
-    fn with_target_segment_bytes<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        bytes: u64,
-    ) -> PyResult<PyRefMut<'a, Self>> {
-        slf.target_segment_bytes = Some(bytes);
-        Ok(slf)
-    }
-
-    fn plan(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegmentPlan>>> {
-        let plans = rt()
-            .block_on(Some(py), self.builder().plan())?
-            .infer_error()?;
-        plans
-            .into_iter()
-            .map(|plan| Py::new(py, PyIndexSegmentPlan::from_inner(plan)))
-            .collect()
-    }
-
-    fn build(&self, py: Python<'_>, plan: &Bound<'_, PyAny>) -> PyResult<Py<PyIndexSegment>> {
-        let plan = plan.extract::<PyRef<'_, PyIndexSegmentPlan>>()?;
-        let segment = rt()
-            .block_on(Some(py), self.builder().build(&plan.inner))?
-            .infer_error()?;
-        Py::new(py, PyIndexSegment::from_inner(segment))
-    }
-
-    fn build_all(&self, py: Python<'_>) -> PyResult<Vec<Py<PyIndexSegment>>> {
-        let segments = rt()
-            .block_on(Some(py), self.builder().build_all())?
-            .infer_error()?;
-        segments
-            .into_iter()
-            .map(|segment| Py::new(py, PyIndexSegment::from_inner(segment)))
-            .collect()
-    }
 }
 
 impl MergeInsertBuilder {
@@ -2425,15 +2345,6 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
-    fn create_index_segment_builder(&self) -> PyResult<PyIndexSegmentBuilder> {
-        Ok(PyIndexSegmentBuilder {
-            dataset: self.ds.clone(),
-            index_type: None,
-            segments: Vec::new(),
-            target_segment_bytes: None,
-        })
-    }
-
     fn merge_existing_index_segments(
         &self,
         segments: Vec<PyLance<IndexMetadata>>,
@@ -2618,7 +2529,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_message = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit(
         dest: PyWriteDest,
         operation: PyLance<Operation>,
@@ -2633,6 +2544,7 @@ impl Dataset {
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
+        commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
         let mut transaction = Transaction::new(read_version.unwrap_or_default(), operation.0, None);
 
@@ -2655,13 +2567,14 @@ impl Dataset {
             namespace_client,
             table_id,
             namespace_client_managed_versioning,
+            commit_timeout,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false))]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, enable_stable_row_ids = None, namespace_client = None, table_id = None, namespace_client_managed_versioning = false, commit_timeout = None))]
     fn commit_transaction(
         dest: PyWriteDest,
         transaction: PyLance<Transaction>,
@@ -2674,6 +2587,7 @@ impl Dataset {
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         namespace_client_managed_versioning: bool,
+        commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<Self> {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
@@ -2714,7 +2628,8 @@ impl Dataset {
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
-            .with_max_retries(max_retries.unwrap_or(20));
+            .with_max_retries(max_retries.unwrap_or(20))
+            .with_timeout(commit_timeout);
 
         if let Some(enable) = enable_stable_row_ids {
             builder = builder.use_stable_row_ids(enable);
@@ -2733,7 +2648,7 @@ impl Dataset {
                 commit_lock.map(|cl| cl.py()),
                 builder.execute(transaction.0),
             )?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_timeout_error()?;
 
         let uri = ds.uri().to_string();
         Ok(Self {
@@ -2745,7 +2660,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[staticmethod]
-    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None, commit_timeout = None))]
     fn commit_batch(
         dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
@@ -2754,6 +2669,7 @@ impl Dataset {
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
+        commit_timeout: Option<std::time::Duration>,
     ) -> PyResult<(Self, PyLance<Transaction>)> {
         let accessor =
             crate::storage_options::create_accessor_from_storage_options(storage_options.clone())?;
@@ -2778,7 +2694,8 @@ impl Dataset {
         let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(true))
             .with_detached(detached.unwrap_or(false))
-            .with_max_retries(max_retries.unwrap_or(20));
+            .with_max_retries(max_retries.unwrap_or(20))
+            .with_timeout(commit_timeout);
 
         if let Some(store_params) = object_store_params {
             builder = builder.with_store_params(store_params);
@@ -2795,7 +2712,7 @@ impl Dataset {
 
         let res = rt()
             .block_on(None, builder.execute_batch(transactions))?
-            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+            .io_or_timeout_error()?;
         let uri = res.dataset.uri().to_string();
         let ds = Self {
             ds: Arc::new(res.dataset),
@@ -3205,6 +3122,7 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn initialize_mem_wal(
         &mut self,
@@ -3227,6 +3145,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<()> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3263,7 +3182,8 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        );
+            hnsw_params,
+        )?;
         let maintained_indexes = maintained_indexes.unwrap_or_default();
 
         let mut ds = Arc::clone(&self.ds);
@@ -3353,6 +3273,7 @@ impl Dataset {
         async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
+        hnsw_params=None,
     ))]
     fn mem_wal_writer(
         &self,
@@ -3371,6 +3292,7 @@ impl Dataset {
         async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
+        hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
     ) -> PyResult<crate::mem_wal::PyShardWriter> {
         use lance::dataset::mem_wal::DatasetMemWalExt;
 
@@ -3391,7 +3313,8 @@ impl Dataset {
             async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
-        )
+            hnsw_params,
+        )?
         .unwrap_or_default();
 
         let ds = self.ds.clone();
@@ -3609,7 +3532,7 @@ impl PyWriteDest {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum IndexProgressEventType {
     Start,
     Progress,
@@ -3765,7 +3688,20 @@ impl IndexProgressDispatcher {
 
     fn drain(&mut self) -> PyResult<()> {
         while let Ok(event) = self.receiver.try_recv() {
-            self.dispatch(event)?;
+            let is_complete = event.event == IndexProgressEventType::Complete;
+            if let Err(err) = self.dispatch(event) {
+                if is_complete {
+                    // Complete events are purely informational — the stage's work
+                    // is already done. Propagating a callback error here would
+                    // abort the operation after the real work has succeeded.
+                    log::warn!(
+                        "Ignoring progress callback error on stage-complete event: {}",
+                        err
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -4360,6 +4296,13 @@ fn prepare_vector_index_params(
             }
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
+        };
+
+        if let Some(r) = kwargs.get_item("rabitq_model")? {
+            let json: String = r.extract()?;
+            let meta: RabitQuantizationMetadata = serde_json::from_str(&json)
+                .map_err(|e| PyValueError::new_err(format!("Invalid rabitq_model JSON: {e}")))?;
+            rq_params.rotation = Some(meta);
         };
 
         if let Some(version) = kwargs.get_item("index_file_version")? {
