@@ -94,6 +94,7 @@ async fn open_fts_segments(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,
@@ -102,6 +103,7 @@ async fn search_segments(
     pre_filter: Arc<dyn PreFilter>,
     metrics: Arc<FtsIndexMetrics>,
     base_scorer: Arc<MemBM25Scorer>,
+    parallelism: usize,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     let mut candidates = std::collections::BinaryHeap::new();
@@ -128,7 +130,7 @@ async fn search_segments(
             }
         })
         .collect::<Vec<_>>();
-    let searches = stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus());
+    let searches = stream::iter(searches).buffer_unordered(parallelism);
     let mut searches = searches;
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {
@@ -432,6 +434,7 @@ impl ExecutionPlan for MatchQueryExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let params = self.params.clone();
         let ds = self.dataset.clone();
@@ -439,6 +442,9 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let parallelism = get_num_compute_intensive_cpus()
+            .min(target_partitions)
+            .max(1);
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
@@ -515,6 +521,7 @@ impl ExecutionPlan for MatchQueryExec {
                 pre_filter,
                 metrics.clone(),
                 base_scorer,
+                parallelism,
             )
             .await?;
             scores.iter_mut().for_each(|s| {
@@ -1316,6 +1323,10 @@ impl ExecutionPlan for PhraseQueryExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let target_partitions = context.session_config().target_partitions();
+        let parallelism = get_num_compute_intensive_cpus()
+            .min(target_partitions)
+            .max(1);
         let query = self.query.clone();
         let params = self.params.clone();
         let ds = self.dataset.clone();
@@ -1385,6 +1396,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 pre_filter,
                 metrics.clone(),
                 base_scorer,
+                parallelism,
             )
             .await?;
             metrics.baseline_metrics.record_output(doc_ids.len());
