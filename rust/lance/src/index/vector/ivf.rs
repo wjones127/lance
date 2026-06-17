@@ -10,7 +10,7 @@ use super::{
 };
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::vector::utils::{get_vector_dim, get_vector_type, make_index_memory_pool};
 use crate::{
     dataset::Dataset,
     index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
@@ -394,7 +394,14 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
+    let (memory_pool, memory_budget) = make_index_memory_pool();
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        num_partitions,
+        format_version,
+        None,
+        memory_budget,
+    );
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let merged_num = match index_type {
@@ -416,6 +423,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?
             } else {
@@ -434,6 +442,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?
             }
@@ -455,6 +464,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?
         }
@@ -475,6 +485,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?
         }
@@ -494,6 +505,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?
         }
@@ -515,6 +527,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?
             } else {
@@ -533,6 +546,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_existing_indices(existing_indices.clone())
                 .shuffle_data(unindexed)
                 .await?
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?
             }
@@ -554,6 +568,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?
         }
@@ -574,6 +589,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_existing_indices(existing_indices.clone())
             .shuffle_data(unindexed)
             .await?
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?
         }

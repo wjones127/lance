@@ -32,6 +32,7 @@ use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
 use object_store::path::Path;
 
+use datafusion::execution::memory_pool::MemoryPool;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
@@ -53,7 +54,7 @@ use lance_linalg::distance::*;
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use serde::Serialize;
 use tracing::instrument;
-use utils::get_vector_type;
+use utils::{get_vector_type, make_index_memory_pool};
 use uuid::Uuid;
 
 use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb, vector_index_details};
@@ -340,7 +341,13 @@ async fn prepare_vector_segment_build(
     progress: Arc<dyn IndexBuildProgress>,
     mode: &str,
     require_precomputed_ivf: bool,
-) -> Result<(DataType, IndexType, IvfBuildParams, Box<dyn Shuffler>)> {
+) -> Result<(
+    DataType,
+    IndexType,
+    IvfBuildParams,
+    Box<dyn Shuffler>,
+    Arc<dyn MemoryPool>,
+)> {
     let stages = &params.stages;
 
     if stages.is_empty() {
@@ -386,14 +393,16 @@ async fn prepare_vector_segment_build(
     let format_version = dataset_format_version(dataset);
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+    let (memory_pool, memory_budget) = make_index_memory_pool();
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         num_partitions,
         format_version,
         Some(progress),
+        memory_budget,
     );
 
-    Ok((element_type, index_type, ivf_params, shuffler))
+    Ok((element_type, index_type, ivf_params, shuffler, memory_pool))
 }
 
 /// Build a Distributed Vector Index for specific fragments
@@ -409,15 +418,16 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Uuid> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Distributed Vector Index",
-        true,
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, memory_pool) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Distributed Vector Index",
+            true,
+        )
+        .await?;
     let stages = &params.stages;
 
     let ivf_centroids = ivf_params
@@ -488,6 +498,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -508,6 +519,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_ivf(ivf_model)
                 .with_fragment_filter(fragment_filter)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -556,6 +568,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_transpose(false)
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -582,6 +595,7 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -609,6 +623,7 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -626,6 +641,7 @@ pub(crate) async fn build_distributed_vector_index(
                     )?
                     .with_fragment_filter(fragment_filter)
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -667,6 +683,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_transpose(false)
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -697,6 +714,7 @@ pub(crate) async fn build_distributed_vector_index(
             )?
             .with_fragment_filter(fragment_filter)
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -731,15 +749,16 @@ pub(crate) async fn build_vector_index(
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
-    let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
-        dataset,
-        column,
-        params,
-        progress.clone(),
-        "Build Vector Index",
-        false,
-    )
-    .await?;
+    let (element_type, index_type, ivf_params, shuffler, memory_pool) =
+        prepare_vector_segment_build(
+            dataset,
+            column,
+            params,
+            progress.clone(),
+            "Build Vector Index",
+            false,
+        )
+        .await?;
     let stages = &params.stages;
 
     match index_type {
@@ -757,6 +776,7 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -773,6 +793,7 @@ pub(crate) async fn build_vector_index(
                     frag_reuse_index,
                 )?
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -822,6 +843,7 @@ pub(crate) async fn build_vector_index(
                     builder
                         .with_transpose(!params.skip_transpose)
                         .with_progress(progress.clone())
+                        .with_memory_pool(memory_pool.clone())
                         .build()
                         .await?;
                 }
@@ -847,6 +869,7 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -873,6 +896,7 @@ pub(crate) async fn build_vector_index(
             builder
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
         }
@@ -897,6 +921,7 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -913,6 +938,7 @@ pub(crate) async fn build_vector_index(
                         frag_reuse_index,
                     )?
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -943,6 +969,7 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -971,6 +998,7 @@ pub(crate) async fn build_vector_index(
                 frag_reuse_index,
             )?
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -1040,11 +1068,13 @@ pub(crate) async fn build_vector_index_incremental(
 
     let temp_dir = TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+    let (memory_pool, memory_budget) = make_index_memory_pool();
     let shuffler = create_ivf_shuffler(
         temp_dir_path,
         ivf_model.num_partitions(),
         format_version,
         Some(progress.clone()),
+        memory_budget,
     );
 
     let index_dir = dataset.indices_dir().child(uuid);
@@ -1069,6 +1099,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -1086,6 +1117,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
             }
@@ -1113,6 +1145,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
         }
@@ -1131,6 +1164,7 @@ pub(crate) async fn build_vector_index_incremental(
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
+            .with_memory_pool(memory_pool.clone())
             .build()
             .await?;
         }
@@ -1151,6 +1185,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
+                .with_memory_pool(memory_pool.clone())
                 .build()
                 .await?;
         }
@@ -1179,6 +1214,7 @@ pub(crate) async fn build_vector_index_incremental(
                         .with_ivf(ivf_model)
                         .with_quantizer(quantizer.try_into()?)
                         .with_progress(progress.clone())
+                        .with_memory_pool(memory_pool.clone())
                         .build()
                         .await?;
                     }
@@ -1196,6 +1232,7 @@ pub(crate) async fn build_vector_index_incremental(
                         .with_ivf(ivf_model)
                         .with_quantizer(quantizer.try_into()?)
                         .with_progress(progress.clone())
+                        .with_memory_pool(memory_pool.clone())
                         .build()
                         .await?;
                     }
@@ -1214,6 +1251,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }
@@ -1231,6 +1269,7 @@ pub(crate) async fn build_vector_index_incremental(
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
+                    .with_memory_pool(memory_pool.clone())
                     .build()
                     .await?;
                 }

@@ -8,6 +8,7 @@ use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, UnboundedMemoryPool};
 use futures::StreamExt;
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
@@ -20,6 +21,28 @@ use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
+
+/// Create a memory pool for a single index build.
+///
+/// Reads `LANCE_INDEX_MEMORY_BUDGET` (bytes). If set to a non-zero value,
+/// returns a [`GreedyMemoryPool`] capped at that limit. Otherwise returns
+/// an [`UnboundedMemoryPool`] that imposes no limit (existing behavior).
+///
+/// The returned budget, if any, should be passed to `create_ivf_shuffler` so
+/// that the shuffler's batch size is derived from the same limit.
+pub(crate) fn make_index_memory_pool() -> (Arc<dyn MemoryPool>, Option<usize>) {
+    match std::env::var("LANCE_INDEX_MEMORY_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b > 0)
+    {
+        Some(budget) => {
+            log::info!("IVF index build: memory pool budget = {} bytes", budget);
+            (Arc::new(GreedyMemoryPool::new(budget)), Some(budget))
+        }
+        None => (Arc::new(UnboundedMemoryPool::default()), None),
+    }
+}
 
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.
 ///

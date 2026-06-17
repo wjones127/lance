@@ -16,6 +16,7 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
 use futures::{FutureExt, stream};
 use futures::{
     Stream,
@@ -155,6 +156,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     format_version: LanceFileVersion,
 
     progress: Arc<dyn IndexBuildProgress>,
+
+    // per-build memory pool for tracking and limiting memory usage during the build
+    memory_pool: Arc<dyn MemoryPool>,
 }
 
 type BuildStream<S, Q> =
@@ -200,6 +204,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             transpose_codes: true,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
+            memory_pool: Arc::new(UnboundedMemoryPool::default()),
         })
     }
 
@@ -266,6 +271,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             transpose_codes: true,
             format_version,
             progress: Arc::new(NoopIndexBuildProgress),
+            memory_pool: Arc::new(UnboundedMemoryPool::default()),
         })
     }
 
@@ -381,6 +387,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// Set progress callback for index building
     pub fn with_progress(&mut self, progress: Arc<dyn IndexBuildProgress>) -> &mut Self {
         self.progress = progress;
+        self
+    }
+
+    /// Set the memory pool for this build.
+    ///
+    /// Each partition build acquires a [`MemoryReservation`] from this pool before
+    /// loading partition data. [`MemoryPool::try_grow`] returning `Err` is the
+    /// spill signal (see issue #7300 for the actual spill reaction). When no pool
+    /// is provided the builder defaults to an [`UnboundedMemoryPool`] (no limit).
+    pub fn with_memory_pool(&mut self, pool: Arc<dyn MemoryPool>) -> &mut Self {
+        self.memory_pool = pool;
         self
     }
 
@@ -837,6 +854,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let distance_type = self.distance_type;
         let column = self.column.clone();
         let frag_reuse_index = self.frag_reuse_index.clone();
+        let memory_pool = self.memory_pool.clone();
         let build_iter =
             assign_batches
                 .into_iter()
@@ -849,6 +867,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let sub_index_params = sub_index_params.clone();
                     let column = column.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
+                    let memory_pool = memory_pool.clone();
                     let skip_existing_batches =
                         partition_adjustment == Some(PartitionAdjustment::Split(partition));
                     let partition = match partition_adjustment {
@@ -871,7 +890,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             .await?
                         };
 
-                        spawn_cpu(move || {
+                        // Acquire a memory reservation for this partition's working set.
+                        // try_grow returning Err is the spill signal (see #7300 for the
+                        // actual spill reaction; for now we log a warning and proceed).
+                        let batch_bytes: usize =
+                            batches.iter().map(|b| b.get_array_memory_size()).sum();
+                        let mut reservation = MemoryConsumer::new(format!(
+                            "IvfPartition[{}]",
+                            partition
+                        ))
+                        .register(&memory_pool);
+                        if batch_bytes > 0 {
+                            if let Err(e) = reservation.try_grow(batch_bytes) {
+                                log::warn!(
+                                    "memory pressure building partition {}: {}; continuing without reservation",
+                                    partition,
+                                    e
+                                );
+                            }
+                        }
+
+                        let result = spawn_cpu(move || {
+                            // reservation is held for the duration of the CPU-bound build
+                            // and freed on drop when this closure returns.
+                            let _reservation = reservation;
+
                             if let Some((assign_batch, deleted_row_ids)) = assign_batch {
                                 if !deleted_row_ids.is_empty() {
                                     let deleted_row_ids = HashSet::<u64>::from_iter(
@@ -911,7 +954,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             )?;
                             Ok(Some((storage, sub_index, loss)))
                         })
-                        .await
+                        .await;
+                        result
                     }
                 });
         Ok(stream::iter(build_iter)
