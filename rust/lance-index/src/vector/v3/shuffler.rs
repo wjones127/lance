@@ -419,10 +419,12 @@ impl TwoFileShuffler {
 ///
 /// Also returns per-partition row counts (derived from the same sorted keys at no
 /// extra cost).
+///
+/// Returns an error if any partition ID is out of range `[0, num_partitions)`.
 fn sort_to_interleave_indices(
     part_id_columns: &[&UInt32Array],
     num_partitions: usize,
-) -> (Vec<(usize, usize)>, Vec<u64>) {
+) -> Result<(Vec<(usize, usize)>, Vec<u64>)> {
     let total_rows: usize = part_id_columns.iter().map(|a| a.len()).sum();
     let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
     for (batch_idx, col) in part_id_columns.iter().enumerate() {
@@ -437,18 +439,16 @@ fn sort_to_interleave_indices(
     let mut interleave_indices = Vec::with_capacity(total_rows);
     for (part_id, batch_idx, row_idx) in &keys {
         let pid = *part_id as usize;
-        if pid < num_partitions {
-            partition_counts[pid] += 1;
-        } else {
-            log::warn!(
-                "Partition ID {} is out of range [0, {})",
-                pid,
-                num_partitions
-            );
+        if pid >= num_partitions {
+            return Err(Error::invalid_input(format!(
+                "partition ID {} is out of range [0, {})",
+                pid, num_partitions
+            )));
         }
+        partition_counts[pid] += 1;
         interleave_indices.push((*batch_idx as usize, *row_idx as usize));
     }
-    (interleave_indices, partition_counts)
+    Ok((interleave_indices, partition_counts))
 }
 
 #[async_trait::async_trait]
@@ -591,13 +591,9 @@ async fn flush_shuffle_batch(
         .collect();
 
     let np = num_partitions;
-    let (interleave_indices, batch_partition_counts) = spawn_cpu(move || {
-        Ok::<_, Error>(sort_to_interleave_indices(
-            &part_id_cols.iter().collect::<Vec<_>>(),
-            np,
-        ))
-    })
-    .await?;
+    let (interleave_indices, batch_partition_counts) =
+        spawn_cpu(move || sort_to_interleave_indices(&part_id_cols.iter().collect::<Vec<_>>(), np))
+            .await?;
 
     // Drop part-id column from source batches before interleaving.
     let source_batches: Vec<RecordBatch> = accumulated
@@ -1003,5 +999,66 @@ mod tests {
         assert_eq!(v, vec![30, 40, 80]);
 
         assert!((reader.total_loss().unwrap() - 6.0).abs() < 1e-10);
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_multi_batch_single_flush() {
+        // All three batches fit within the default batch_size_bytes, so they
+        // accumulate and are interleaved in a single flush group. This exercises
+        // the cross-batch interleave path.
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let num_partitions = 3;
+
+        let batch1 = make_batch(&[0, 1, 2], &[10, 20, 30], None);
+        let batch2 = make_batch(&[2, 0, 1], &[40, 50, 60], None);
+        let batch3 = make_batch(&[1, 2, 0], &[70, 80, 90], None);
+
+        // Large batch_size_bytes so all three batches flush together.
+        let shuffler =
+            TwoFileShuffler::new(output_dir, num_partitions).with_batch_size_bytes(1024 * 1024);
+        let stream = batches_to_stream(vec![batch1, batch2, batch3]);
+        let reader = shuffler.shuffle(stream).await.unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 3);
+        assert_eq!(reader.partition_size(1).unwrap(), 3);
+        assert_eq!(reader.partition_size(2).unwrap(), 3);
+
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        let vals: &Int32Array = p0.column_by_name("val").unwrap().as_primitive();
+        let mut v: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        v.sort();
+        assert_eq!(v, vec![10, 50, 90]);
+
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        let vals: &Int32Array = p1.column_by_name("val").unwrap().as_primitive();
+        let mut v: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        v.sort();
+        assert_eq!(v, vec![20, 60, 70]);
+
+        let p2 = collect_partition(reader.as_ref(), 2).await.unwrap();
+        let vals: &Int32Array = p2.column_by_name("val").unwrap().as_primitive();
+        let mut v: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        v.sort();
+        assert_eq!(v, vec![30, 40, 80]);
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_out_of_range_partition_id() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        // Row with partition ID 5 is out of range for num_partitions=3.
+        let batch = make_batch(&[0, 5, 1], &[10, 20, 30], None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, 3);
+        let stream = batches_to_stream(vec![batch]);
+        let Err(err) = shuffler.shuffle(stream).await else {
+            panic!("expected an error for out-of-range partition ID");
+        };
+        assert!(
+            err.to_string().contains("partition ID 5 is out of range"),
+            "unexpected error: {err}"
+        );
     }
 }
