@@ -410,6 +410,10 @@ impl TwoFileShuffler {
     }
 }
 
+/// `(batch_idx, row_idx)` pairs produced by [`sort_to_interleave_indices`], paired with
+/// per-partition row counts.
+type InterleaveResult = (Vec<(usize, usize)>, Vec<u64>);
+
 /// Sorts rows from multiple batches by partition ID and returns interleave indices.
 ///
 /// Builds a sort key of `(part_id, batch_idx, row_idx)` for every row across all
@@ -424,7 +428,7 @@ impl TwoFileShuffler {
 fn sort_to_interleave_indices(
     part_id_columns: &[&UInt32Array],
     num_partitions: usize,
-) -> Result<(Vec<(usize, usize)>, Vec<u64>)> {
+) -> Result<InterleaveResult> {
     let total_rows: usize = part_id_columns.iter().map(|a| a.len()).sum();
     let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
     for (batch_idx, col) in part_id_columns.iter().enumerate() {
