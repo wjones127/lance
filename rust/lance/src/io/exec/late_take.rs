@@ -4,23 +4,18 @@
 //! Late-materialization *logical* optimizer rule.
 //!
 //! Defers reading wide data columns that a row-reducing join only carries
-//! through, fetching them by `_rowaddr` *after* the row count has shrunk. Used
-//! by `merge_insert` to avoid scanning wide non-source columns for every target
-//! row of a selective partial-schema upsert.
+//! through, fetching them by `_rowaddr` *after* the row count has shrunk.
 //!
-//! Working at the logical level (rather than rewriting a physical
-//! `HashJoinExec` by position), a [`LateTakeNode`] is inserted above the join —
-//! fed by a projection that keeps only the columns carried past the join — and
-//! advertises an output schema of "carried columns plus the deferred columns
-//! appended". Its [`UserDefinedLogicalNodeCore::necessary_children_exprs`]
-//! reports that it does *not* need the deferred columns from its child, only
-//! `_rowaddr`. DataFusion's stock `OptimizeProjections` rule then prunes those
-//! columns from the scan automatically — no manual index remapping — and
-//! downstream column references resolve the deferred columns from the take by
-//! name.
+//! A [`LateTakeNode`] is inserted above the join — fed by a projection that
+//! keeps only the columns carried past the join — and advertises an output
+//! schema of "carried columns plus the deferred columns appended". Its
+//! [`UserDefinedLogicalNodeCore::necessary_children_exprs`] reports that it does
+//! *not* need the deferred columns from its child, only `_rowaddr`, so
+//! DataFusion's stock `OptimizeProjections` rule prunes them from the scan
+//! automatically and downstream references resolve the deferred columns from the
+//! take by name.
 //!
-//! The node lowers to the existing physical [`super::TakeExec`] via
-//! [`LateTakePlanner`].
+//! The node lowers to the physical [`super::TakeExec`] via [`LateTakePlanner`].
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -48,18 +43,11 @@ use super::TakeExec;
 use crate::Dataset;
 use crate::datafusion::dataframe::LanceTableProvider;
 
-/// Width/storage gate mirroring the scanner's late-materialization heuristic
-/// ([`crate::dataset::scanner::MaterializationStyle::Heuristic`]): a column is
-/// worth deferring only if it is "wide" for the backing storage — a
-/// variable-width type (strings, lists, vectors) or a fixed-width type above the
-/// per-row byte threshold (1KB on cloud storage, 10 bytes on local). Narrow
-/// columns are cheaper to read in the sequential scan than to re-fetch by
-/// address.
-///
-/// Without a join-cardinality estimate (tracked in #4583) we cannot gate on
-/// match selectivity, so we fall back to width alone. This covers the
-/// inherently selective backfill case the feature targets; a follow-up can
-/// incorporate cardinality once it is available.
+/// Width/storage gate: a column is worth deferring only if it is "wide" for the
+/// backing storage — a variable-width type (strings, lists, vectors) or a
+/// fixed-width type at or above the per-row byte threshold (1KB on cloud
+/// storage, 10 bytes on local). Narrow columns are cheaper to read in the
+/// sequential scan than to re-fetch by address.
 fn is_wide_column(field: &lance_core::datatypes::Field, is_cloud: bool) -> bool {
     if field.is_blob() {
         return false;
@@ -164,9 +152,14 @@ impl LateTakeNode {
         let input_schema = input.schema();
         let deferred_set: HashSet<&str> = deferred_columns.iter().map(|s| s.as_str()).collect();
 
+        // A field is deferred only when both its name and its qualifier match the
+        // deferred columns' relation; a same-named field from another relation is
+        // a distinct column and must stay in place.
         let mut qualified_fields: Vec<(Option<TableReference>, Arc<ArrowField>)> = input_schema
             .iter()
-            .filter(|(_, f)| !deferred_set.contains(f.name().as_str()))
+            .filter(|(q, f)| {
+                !(*q == qualifier.as_ref() && deferred_set.contains(f.name().as_str()))
+            })
             .map(|(q, f)| (q.cloned(), f.clone()))
             .collect();
 
@@ -260,10 +253,14 @@ impl UserDefinedLogicalNodeCore for LateTakeNode {
 
         // Output positions [0..passthrough_len) map back to these child indices,
         // in order; positions beyond are the appended (fetched) deferred columns.
+        // The deferred match is qualified: a same-named field from another
+        // relation is a distinct passthrough column, not a deferred one.
         let passthrough: Vec<usize> = input_schema
             .iter()
             .enumerate()
-            .filter(|(_, (_, f))| !deferred_set.contains(f.name().as_str()))
+            .filter(|(_, (q, f))| {
+                !(*q == self.qualifier.as_ref() && deferred_set.contains(f.name().as_str()))
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -867,6 +864,72 @@ mod tests {
             !has_late_take(&optimized),
             "duplicate output names must not be deferred"
         );
+    }
+
+    /// The deferred-column match is qualified: a same-named column from another
+    /// relation must not be dropped just because it shares a deferred name.
+    #[tokio::test]
+    async fn test_deferred_match_respects_qualifier() {
+        let (dataset, _tmp) = test_dataset().await;
+        let ctx = SessionContext::new();
+        let target = ctx
+            .read_lance_unordered(dataset.clone(), false, true)
+            .unwrap()
+            .alias("target")
+            .unwrap();
+        // The source relation also exposes a `payload` column.
+        let source_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("sid", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+        let source = ctx
+            .read_batch(source_batch)
+            .unwrap()
+            .alias("source")
+            .unwrap();
+        let input = target
+            .join(source, JoinType::Inner, &["id"], &["sid"], None)
+            .unwrap()
+            .into_unoptimized_plan();
+        let input_field_count = input.schema().fields().len();
+
+        // Defer only `target.payload`; `source.payload` is a distinct column.
+        let node = LateTakeNode::try_new(
+            input,
+            dataset,
+            vec!["payload".to_string()],
+            Some(TableReference::bare("target")),
+            false,
+        )
+        .unwrap();
+
+        let schema = UserDefinedLogicalNodeCore::schema(&node);
+        let target_ref = TableReference::bare("target");
+        let source_ref = TableReference::bare("source");
+        // `source.payload` survives (only the qualified `target.payload` is
+        // dropped from the passthrough), and `target.payload` is re-appended —
+        // so the output keeps the same field count as the input.
+        assert!(
+            schema
+                .index_of_column_by_name(Some(&source_ref), "payload")
+                .is_some(),
+            "source.payload must not be dropped by qualifier-blind matching"
+        );
+        assert!(
+            schema
+                .index_of_column_by_name(Some(&target_ref), "payload")
+                .is_some(),
+            "target.payload should be appended by the take"
+        );
+        assert_eq!(schema.fields().len(), input_field_count);
     }
 
     #[tokio::test]
