@@ -63,7 +63,7 @@ fn reindex_columns_by_name(
 /// match selectivity, so we fall back to width alone. This covers the
 /// inherently selective backfill case the feature targets; a follow-up can
 /// incorporate cardinality once it is available.
-fn is_wide_column(field: &lance_core::datatypes::Field, is_cloud: bool) -> bool {
+pub fn is_wide_column(field: &lance_core::datatypes::Field, is_cloud: bool) -> bool {
     if field.is_blob() {
         return false;
     }
