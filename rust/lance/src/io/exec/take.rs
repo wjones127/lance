@@ -219,11 +219,33 @@ impl TakeStream {
 
         let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
-        debug_assert!(
-            row_addrs.null_count() == 0,
-            "{} nulls in row addresses",
-            row_addrs.null_count()
-        );
+        // Rows with a null address have no row in the dataset to fetch. This
+        // happens for insert (source-only) rows in an outer-join take, where
+        // the target side contributes no `_rowaddr`. We fetch only the
+        // non-null addresses and, after reading, scatter the fetched columns
+        // back into the original row positions, leaving the taken columns NULL
+        // for the null-address rows.
+        let null_count = row_addrs.null_count();
+        let (row_addrs_arr, scatter_indices): (Arc<dyn Array>, Option<UInt32Array>) =
+            if null_count > 0 {
+                let mut compacted = Vec::with_capacity(row_addrs.len() - null_count);
+                let mut scatter = Vec::with_capacity(row_addrs.len());
+                for addr in row_addrs.iter() {
+                    if let Some(addr) = addr {
+                        scatter.push(Some(compacted.len() as u32));
+                        compacted.push(addr);
+                    } else {
+                        scatter.push(None);
+                    }
+                }
+                (
+                    Arc::new(UInt64Array::from(compacted)),
+                    Some(UInt32Array::from(scatter)),
+                )
+            } else {
+                (row_addrs_arr, None)
+            };
+        let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
         // Fast path: check if addresses are already sorted with no duplicates (common case).
         // This avoids all sorting, dedup, and permutation overhead.
@@ -319,7 +341,19 @@ impl TakeStream {
         let batches = futures.try_collect::<Vec<_>>().await?;
 
         if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+            match scatter_indices {
+                // Genuinely empty input (no rows at all).
+                None => return Ok(RecordBatch::new_empty(self.output_schema.clone())),
+                // Every address was null (e.g. an all-insert take): emit the
+                // input rows with NULL taken columns.
+                Some(scatter) => {
+                    let empty = RecordBatch::new_empty(Arc::new(ArrowSchema::from(
+                        self.fields_to_take.as_ref(),
+                    )));
+                    let new_data = scatter_taken(&empty, &scatter)?;
+                    return Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?);
+                }
+            }
         }
 
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
@@ -354,6 +388,14 @@ impl TakeStream {
             }
             (None, None) => {}
         }
+
+        // Scatter the fetched columns back to the caller's original row count,
+        // inserting NULLs for rows whose address was null.
+        let new_data = if let Some(scatter) = scatter_indices {
+            scatter_taken(&new_data, &scatter)?
+        } else {
+            new_data
+        };
 
         Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
@@ -399,6 +441,32 @@ impl TakeStream {
     }
 }
 
+/// Expand a batch of fetched ("taken") columns back to the caller's original
+/// row count using `scatter`: a map from each original row index to the
+/// position of that row within the fetched set, or null for rows that had no
+/// address (and therefore were not fetched).
+///
+/// The taken columns are returned as nullable, since null-address rows yield
+/// NULL values that a non-nullable field could not hold.
+fn scatter_taken(taken: &RecordBatch, scatter: &UInt32Array) -> DataFusionResult<RecordBatch> {
+    // Take per-column rather than via `take_record_batch` so we can attach a
+    // nullable schema before constructing the batch; otherwise `RecordBatch`
+    // validation would reject the new NULLs in non-nullable columns.
+    let columns = taken
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c, scatter, None))
+        .collect::<arrow::error::Result<Vec<_>>>()?;
+    let fields = taken
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| Arc::new(f.as_ref().clone().with_nullable(true)))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(ArrowSchema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 #[derive(Debug)]
 pub struct TakeExec {
     // The dataset to take from
@@ -415,6 +483,11 @@ pub struct TakeExec {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    // When true, the taken (extra) fields are marked nullable in the output
+    // schema even if the dataset declares them non-null. This is used when the
+    // take sits above an outer join, where rows with a null address (inserts)
+    // legitimately produce NULL taken values.
+    nullable_extra_fields: bool,
 }
 
 impl DisplayAs for TakeExec {
@@ -463,6 +536,27 @@ impl TakeExec {
         input: Arc<dyn ExecutionPlan>,
         projection: Projection,
     ) -> Result<Option<Self>> {
+        Self::try_new_impl(dataset, input, projection, false)
+    }
+
+    /// Like [`TakeExec::try_new`], but marks the taken (extra) fields nullable
+    /// in the output schema. Use this when the take sits above an outer join,
+    /// where rows with a null address (inserts) yield NULL taken values that a
+    /// non-nullable field could not hold.
+    pub fn try_new_nullable_extra(
+        dataset: Arc<Dataset>,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Projection,
+    ) -> Result<Option<Self>> {
+        Self::try_new_impl(dataset, input, projection, true)
+    }
+
+    fn try_new_impl(
+        dataset: Arc<Dataset>,
+        input: Arc<dyn ExecutionPlan>,
+        projection: Projection,
+        nullable_extra_fields: bool,
+    ) -> Result<Option<Self>> {
         let original_projection = projection.clone();
         let projection =
             projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
@@ -492,7 +586,30 @@ impl TakeExec {
             &input.schema(),
             &projection,
         ));
-        let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
+        let schema_to_take = projection.into_schema_ref();
+        let output_arrow = ArrowSchema::from(output_schema.as_ref());
+        let output_arrow = if nullable_extra_fields {
+            let extra_names = schema_to_take
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<HashSet<_>>();
+            let fields = output_arrow
+                .fields()
+                .iter()
+                .map(|f| {
+                    if extra_names.contains(f.name().as_str()) && !f.is_nullable() {
+                        Arc::new(f.as_ref().clone().with_nullable(true))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            ArrowSchema::new_with_metadata(fields, output_arrow.metadata().clone())
+        } else {
+            output_arrow
+        };
+        let output_arrow = Arc::new(output_arrow);
         let properties = Arc::new(
             input
                 .properties()
@@ -504,11 +621,12 @@ impl TakeExec {
         Ok(Some(Self {
             dataset,
             output_projection: original_projection,
-            schema_to_take: projection.into_schema_ref(),
+            schema_to_take,
             input,
             output_schema: output_arrow,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            nullable_extra_fields,
         }))
     }
 
@@ -609,7 +727,12 @@ impl ExecutionPlan for TakeExec {
 
         let projection = self.output_projection.clone();
 
-        let plan = Self::try_new(self.dataset.clone(), children[0].clone(), projection)?;
+        let plan = Self::try_new_impl(
+            self.dataset.clone(),
+            children[0].clone(),
+            projection,
+            self.nullable_extra_fields,
+        )?;
 
         if let Some(plan) = plan {
             Ok(Arc::new(plan))
@@ -1092,6 +1215,94 @@ mod tests {
         // Original order was [2, 0, 1, 0, 2] — duplicates should match
         assert_eq!(s_col.value(0), s_col.value(4)); // both row 2
         assert_eq!(s_col.value(1), s_col.value(3)); // both row 0
+    }
+
+    /// A null row address means "no row to fetch" (e.g. an insert row in an
+    /// outer-join take). The taken column must come back NULL for that row and
+    /// the row must be preserved (not dropped).
+    #[tokio::test]
+    async fn test_take_with_null_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let row_addrs = UInt64Array::from(vec![Some(0u64), None, Some(2), None, Some(1)]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+        let stream = futures::stream::iter(vec![Ok(batch)]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        let input = Arc::new(OneShotExec::new(stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let all = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(all.num_rows(), 5);
+
+        let s = all
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "str-0");
+        assert!(s.is_null(1));
+        assert_eq!(s.value(2), "str-2");
+        assert!(s.is_null(3));
+        assert_eq!(s.value(4), "str-1");
+    }
+
+    /// When *every* address is null (e.g. an all-insert take), all input rows
+    /// must be preserved with NULL taken columns.
+    #[tokio::test]
+    async fn test_take_all_null_row_addrs() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let row_addrs = UInt64Array::from(vec![None, None, None]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+        let stream = futures::stream::iter(vec![Ok(batch)]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        let input = Arc::new(OneShotExec::new(stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let all = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(all.num_rows(), 3);
+
+        let s = all.column_by_name("s").unwrap();
+        assert_eq!(s.null_count(), 3);
     }
 
     #[tokio::test]

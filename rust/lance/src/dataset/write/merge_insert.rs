@@ -1547,6 +1547,15 @@ impl MergeInsertJob {
             .create_physical_plan(&logical_plan, &session_state)
             .await?;
 
+        // Defer reading non-source columns: a partial-schema upsert reads the
+        // missing columns from the target side of the join only to rewrite full
+        // rows. This rule pushes those reads past the join so a selective match
+        // does not scan wide columns for every target row. It is applied only
+        // here (not in the session-wide optimizer) to bound its blast radius.
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        let physical_plan = crate::io::exec::LateMaterializeOverReducingJoin
+            .optimize(physical_plan, &datafusion::config::ConfigOptions::default())?;
+
         Ok(physical_plan)
     }
 
@@ -4521,20 +4530,379 @@ mod tests {
                 "expected HashJoinExec in plan, got: {}",
                 plan
             );
-            // Evidence that the partial-schema fix is active: the target
-            // side of the join reads the `other` column (which is missing
-            // from the source) and an explicit projection carries it
-            // through to the write exec alongside source columns.
+            // Late materialization is active: the `other` column (missing from
+            // the source) is *not* read by the target scan. Instead it is
+            // fetched by a `Take` inserted above the join, so a selective match
+            // does not scan `other` for every target row.
             assert!(
-                plan.contains("LanceRead") && plan.contains("projection=[other"),
-                "target-side scan should include the filled `other` column: {}",
+                plan.contains("LanceRead") && plan.contains("projection=[key]"),
+                "target-side scan should only read the join key, not `other`: {}",
                 plan
             );
             assert!(
-                plan.contains("other@0 as other"),
-                "expected post-join projection to carry `other` from the target side: {}",
+                !plan.contains("projection=[other"),
+                "deferred `other` column must not be in the target scan projection: {}",
                 plan
             );
+            assert!(
+                plan.contains("Take") && plan.contains("(other)"),
+                "expected a Take above the join fetching the deferred `other` column: {}",
+                plan
+            );
+        }
+
+        /// Extract the `output_rows` metric of the first plan node whose
+        /// (trimmed) display line starts with `node_prefix`, from an
+        /// `analyze_plan` string.
+        fn output_rows_for_node(analysis: &str, node_prefix: &str) -> Option<u64> {
+            let line = analysis
+                .lines()
+                .find(|l| l.trim_start().starts_with(node_prefix))?;
+            let start = line.find("output_rows=")? + "output_rows=".len();
+            let rest = &line[start..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse().ok()
+        }
+
+        /// The read-amplification payoff: on a selective partial-schema update,
+        /// the wide non-source column must be fetched only for the matched rows
+        /// (via the `Take`), not scanned for every target row.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_defers_wide_column_reads() {
+            // 100 rows across 4 fragments; `other` is a wide (string) column,
+            // `key`/`value` are narrow. Keys are 0..100 so matches are precise.
+            let batch = lance_datagen::gen_batch()
+                .with_seed(Seed::from(1))
+                .col("other", array::rand_utf8(64.into(), false))
+                .col("value", array::step::<UInt32Type>())
+                .col("key", array::step_custom::<UInt32Type>(0, 1))
+                .into_batch_rows(RowCount::from(100))
+                .unwrap();
+            let schema = batch.schema();
+            let ds = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema.clone()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 25,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+
+            // Partial-schema source (key, value) updating only 5 of 100 keys.
+            let update_schema = Arc::new(schema.project(&[2, 1]).unwrap());
+            let new_data = RecordBatch::try_new(
+                update_schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3, 4])),
+                    Arc::new(UInt32Array::from(vec![1000u32, 1001, 1002, 1003, 1004])),
+                ],
+            )
+            .unwrap();
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+            let source = reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            )));
+            let analysis = job.analyze_plan(source).await.unwrap();
+
+            // The target scan reads every row but only the narrow key column...
+            let lance_read = analysis
+                .lines()
+                .find(|l| l.trim_start().starts_with("LanceRead"))
+                .unwrap_or_else(|| panic!("no LanceRead node:\n{}", analysis));
+            assert!(
+                lance_read.contains("projection=[key]"),
+                "target scan must defer the wide `other` column: {}",
+                lance_read
+            );
+            assert_eq!(
+                output_rows_for_node(&analysis, "LanceRead"),
+                Some(100),
+                "target scan should still visit all rows:\n{}",
+                analysis
+            );
+
+            // ...and `other` is materialized only for the 5 matched rows.
+            assert_eq!(
+                output_rows_for_node(&analysis, "Take"),
+                Some(5),
+                "wide column should be taken for only the matched rows:\n{}",
+                analysis
+            );
+        }
+
+        /// A partial-schema `UpdateIf` whose condition references the deferred
+        /// (non-source) target column must still evaluate correctly: the column
+        /// is fetched once by the `Take` and read from there by the action
+        /// expression, not double-fetched or lost.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_update_if_on_deferred_column() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+                Field::new("other", DataType::Utf8, true),
+            ]));
+            // `other` gates the update; keys 0,2,4 are "keep", 1,3,5 are "skip".
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3, 4, 5])),
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3, 4, 5])),
+                    Arc::new(StringArray::from(vec![
+                        "keep", "skip", "keep", "skip", "keep", "skip",
+                    ])),
+                ],
+            )
+            .unwrap();
+            let ds = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema.clone()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 3, // two fragments
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let ds = Arc::new(ds);
+
+            // Partial-schema source (key, value) matching keys 0..=3.
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+            ]));
+            let new_data = RecordBatch::try_new(
+                source_schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3])),
+                    Arc::new(UInt32Array::from(vec![100u32, 100, 100, 100])),
+                ],
+            )
+            .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::update_if(&ds, "target.other = 'keep'").unwrap())
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+            let (updated, _stats) = job.execute_reader(reader).await.unwrap();
+
+            let batch = updated.scan().try_into_batch().await.unwrap();
+            let keys = batch["key"].as_any().downcast_ref::<UInt32Array>().unwrap();
+            let values = batch["value"]
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let others = batch["other"]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let by_key = (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.value(i),
+                        (values.value(i), others.value(i).to_string()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+
+            // Matched + condition true (other == "keep"): value updated to 100.
+            assert_eq!(by_key[&0], (100, "keep".to_string()));
+            assert_eq!(by_key[&2], (100, "keep".to_string()));
+            // Matched + condition false (other == "skip"): value unchanged.
+            assert_eq!(by_key[&1], (1, "skip".to_string()));
+            assert_eq!(by_key[&3], (3, "skip".to_string()));
+            // Unmatched rows untouched.
+            assert_eq!(by_key[&4], (4, "keep".to_string()));
+            assert_eq!(by_key[&5], (5, "skip".to_string()));
+        }
+
+        /// The width gate's negative branch: a *narrow* missing column must NOT
+        /// be deferred — a sequential scan of it is cheaper than a per-row take,
+        /// so it stays in the target scan and no `Take` is introduced.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_narrow_column_not_deferred() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+                Field::new("small", DataType::UInt32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3])),
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3])),
+                    Arc::new(UInt32Array::from(vec![10u32, 11, 12, 13])),
+                ],
+            )
+            .unwrap();
+            let ds = Arc::new(
+                Dataset::write(
+                    RecordBatchIterator::new([Ok(batch)], schema.clone()),
+                    "memory://",
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+
+            // Source omits the narrow `small` column.
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+            ]));
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+            let plan = job.explain_plan(Some(&source_schema), false).await.unwrap();
+
+            assert!(
+                !plan.contains("Take"),
+                "a narrow column must not be deferred via a Take: {}",
+                plan
+            );
+            let lance_read = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with("LanceRead"))
+                .unwrap_or_else(|| panic!("no LanceRead node: {}", plan));
+            assert!(
+                lance_read.contains("small"),
+                "narrow `small` should be read directly by the target scan: {}",
+                lance_read
+            );
+        }
+
+        /// Deferral must remain correct when more than one wide column is
+        /// dropped from the scan: this exercises the multi-column index remap of
+        /// the join output and the name-based re-index of the parent projection.
+        #[tokio::test]
+        async fn test_merge_insert_subcols_defers_multiple_wide_columns() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+                Field::new("wide_a", DataType::Utf8, true),
+                Field::new("wide_b", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3])),
+                    Arc::new(UInt32Array::from(vec![0u32, 1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a0", "a1", "a2", "a3"])),
+                    Arc::new(StringArray::from(vec!["b0", "b1", "b2", "b3"])),
+                ],
+            )
+            .unwrap();
+            let ds = Arc::new(
+                Dataset::write(
+                    RecordBatchIterator::new([Ok(batch)], schema.clone()),
+                    "memory://",
+                    Some(WriteParams {
+                        max_rows_per_file: 2, // two fragments
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+
+            // Source omits both wide columns; updates keys 0 and 1.
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("key", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, true),
+            ]));
+            let new_data = RecordBatch::try_new(
+                source_schema,
+                vec![
+                    Arc::new(UInt32Array::from(vec![0u32, 1])),
+                    Arc::new(UInt32Array::from(vec![100u32, 100])),
+                ],
+            )
+            .unwrap();
+
+            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap();
+
+            // Both wide columns are deferred to the take, not the scan.
+            let plan = job
+                .explain_plan(Some(&new_data.schema().as_ref().clone()), false)
+                .await
+                .unwrap();
+            let lance_read = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with("LanceRead"))
+                .unwrap_or_else(|| panic!("no LanceRead node: {}", plan));
+            assert!(
+                !lance_read.contains("wide_a") && !lance_read.contains("wide_b"),
+                "both wide columns must be deferred out of the scan: {}",
+                lance_read
+            );
+            assert!(
+                plan.contains("(wide_a)") && plan.contains("(wide_b)"),
+                "the take must fetch both deferred columns: {}",
+                plan
+            );
+
+            // And the result is correct: matched rows updated, wide columns preserved.
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(new_data.clone())],
+                new_data.schema(),
+            ));
+            let (updated, _stats) = job.execute_reader(reader).await.unwrap();
+            let batch = updated.scan().try_into_batch().await.unwrap();
+            let keys = batch["key"].as_any().downcast_ref::<UInt32Array>().unwrap();
+            let values = batch["value"]
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            let wide_a = batch["wide_a"]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let wide_b = batch["wide_b"]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let by_key = (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.value(i),
+                        (
+                            values.value(i),
+                            wide_a.value(i).to_string(),
+                            wide_b.value(i).to_string(),
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(by_key[&0], (100, "a0".to_string(), "b0".to_string()));
+            assert_eq!(by_key[&1], (100, "a1".to_string(), "b1".to_string()));
+            assert_eq!(by_key[&2], (2, "a2".to_string(), "b2".to_string()));
+            assert_eq!(by_key[&3], (3, "a3".to_string(), "b3".to_string()));
         }
 
         /// Partial-schema upserts with `insert_not_matched=InsertAll` must
