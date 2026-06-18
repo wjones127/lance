@@ -108,6 +108,9 @@ impl std::hash::Hash for LateTakeNode {
 }
 
 impl PartialOrd for LateTakeNode {
+    // Orders by the only fields that have a natural order (`deferred_columns`,
+    // then `input`); `dataset`/`qualifier`/`nullable_extra` are part of equality
+    // but not ordered here, matching the sibling `MergeInsertWriteNode` impl.
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match self.deferred_columns.partial_cmp(&other.deferred_columns) {
             Some(std::cmp::Ordering::Equal) => self.input.partial_cmp(&other.input),
@@ -117,6 +120,14 @@ impl PartialOrd for LateTakeNode {
 }
 
 impl LateTakeNode {
+    /// Build a node that re-fetches `deferred_columns` (dataset field names, in
+    /// dataset-schema order) from `dataset` by row address.
+    ///
+    /// `qualifier` is the relation the deferred columns came from; the appended
+    /// output fields carry it so downstream references still resolve. Set
+    /// `nullable_extra` when the take sits above an outer join on whose optional
+    /// side the scan lives, so unmatched rows (null row address) yield NULL
+    /// deferred values. Errors if a deferred name is absent from the dataset.
     pub fn try_new(
         input: LogicalPlan,
         dataset: Arc<Dataset>,
@@ -930,6 +941,45 @@ mod tests {
             "target.payload should be appended by the take"
         );
         assert_eq!(schema.fields().len(), input_field_count);
+    }
+
+    #[test]
+    fn test_is_wide_column() {
+        use lance_core::datatypes::Field as LanceField;
+        use std::collections::HashMap;
+
+        let lance_field = |arrow: Field| LanceField::try_from(arrow).unwrap();
+
+        // Variable-width: wide regardless of storage.
+        let utf8 = lance_field(Field::new("s", DataType::Utf8, true));
+        assert!(is_wide_column(&utf8, false));
+        assert!(is_wide_column(&utf8, true));
+
+        // Small fixed-width (4 bytes): narrow on both local and cloud.
+        let small = lance_field(Field::new("n", DataType::Int32, true));
+        assert!(!is_wide_column(&small, false));
+        assert!(!is_wide_column(&small, true));
+
+        // Mid fixed-width (64 bytes): above the 10-byte local threshold but
+        // below the 1KB cloud threshold — wide locally, narrow on cloud.
+        let mid = lance_field(Field::new("m", DataType::FixedSizeBinary(64), true));
+        assert!(is_wide_column(&mid, false));
+        assert!(!is_wide_column(&mid, true));
+
+        // Large fixed-width (2KB): wide on both.
+        let large = lance_field(Field::new("l", DataType::FixedSizeBinary(2048), true));
+        assert!(is_wide_column(&large, false));
+        assert!(is_wide_column(&large, true));
+
+        // Blob columns are never deferred even though LargeBinary is
+        // variable-width — they have their own access path.
+        let blob_meta =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let blob =
+            lance_field(Field::new("b", DataType::LargeBinary, true).with_metadata(blob_meta));
+        assert!(blob.is_blob());
+        assert!(!is_wide_column(&blob, false));
+        assert!(!is_wide_column(&blob, true));
     }
 
     #[tokio::test]
