@@ -4,13 +4,15 @@
 //! Late-materialization *logical* optimizer rule.
 //!
 //! Defers reading wide data columns that a row-reducing join only carries
-//! through, fetching them by `_rowaddr` *after* the row count has shrunk.
+//! through, fetching them by `_rowaddr` *after* the row count has shrunk. Used
+//! by `merge_insert` to avoid scanning wide non-source columns for every target
+//! row of a selective partial-schema upsert.
 //!
-//! Unlike the physical [`super::LateMaterializeOverReducingJoin`] rule (which
-//! re-indexes a `HashJoinExec` and its parent projection by position), this
-//! works at the logical level: a [`LateTakeNode`] is inserted above the join
-//! and advertises an output schema of "join columns minus deferred, plus the
-//! deferred columns appended". Its [`UserDefinedLogicalNodeCore::necessary_children_exprs`]
+//! Working at the logical level (rather than rewriting a physical
+//! `HashJoinExec` by position), a [`LateTakeNode`] is inserted above the join —
+//! fed by a projection that keeps only the columns carried past the join — and
+//! advertises an output schema of "carried columns plus the deferred columns
+//! appended". Its [`UserDefinedLogicalNodeCore::necessary_children_exprs`]
 //! reports that it does *not* need the deferred columns from its child, only
 //! `_rowaddr`. DataFusion's stock `OptimizeProjections` rule then prunes those
 //! columns from the scan automatically — no manual index remapping — and
@@ -27,24 +29,48 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
 use datafusion::{
     common::{
-        DFSchema, DFSchemaRef, Result as DFResult, TableReference,
+        Column, DFSchema, DFSchemaRef, Result as DFResult, TableReference,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     datasource::DefaultTableSource,
     execution::SessionState,
-    logical_expr::{Expr, Extension, Join, JoinType, LogicalPlan},
+    logical_expr::{Expr, Extension, Join, JoinType, LogicalPlan, Projection},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::ExecutionPlan,
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_expr::{UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::{ROW_ADDR, ROW_ID};
 
 use super::TakeExec;
-use super::late_materialization::is_wide_column;
 use crate::Dataset;
 use crate::datafusion::dataframe::LanceTableProvider;
+
+/// Width/storage gate mirroring the scanner's late-materialization heuristic
+/// ([`crate::dataset::scanner::MaterializationStyle::Heuristic`]): a column is
+/// worth deferring only if it is "wide" for the backing storage — a
+/// variable-width type (strings, lists, vectors) or a fixed-width type above the
+/// per-row byte threshold (1KB on cloud storage, 10 bytes on local). Narrow
+/// columns are cheaper to read in the sequential scan than to re-fetch by
+/// address.
+///
+/// Without a join-cardinality estimate (tracked in #4583) we cannot gate on
+/// match selectivity, so we fall back to width alone. This covers the
+/// inherently selective backfill case the feature targets; a follow-up can
+/// incorporate cardinality once it is available.
+fn is_wide_column(field: &lance_core::datatypes::Field, is_cloud: bool) -> bool {
+    if field.is_blob() {
+        return false;
+    }
+    let byte_width = field.data_type().byte_width_opt();
+    if is_cloud {
+        byte_width.is_none_or(|bw| bw >= 1000)
+    } else {
+        byte_width.is_none_or(|bw| bw >= 10)
+    }
+}
 
 /// Logical plan node that re-fetches `deferred_columns` from `dataset` by
 /// `_rowaddr` after a row-reducing operator.
@@ -316,6 +342,14 @@ impl LateMaterializeJoin {
     ) -> DFResult<HashSet<(Option<TableReference>, String)>> {
         let mut referenced = HashSet::new();
         plan.apply(|node| {
+            // A join's own on-clause / filter columns are consumed by the join
+            // itself, not by an operator above it, so they must not count as
+            // "used above the join". (Equi-keys are the common case: both sides'
+            // keys share a name, which would otherwise look like a duplicate
+            // column flowing into the take.) Children are still visited.
+            if matches!(node, LogicalPlan::Join(_)) {
+                return Ok(TreeNodeRecursion::Continue);
+            }
             for expr in node.expressions() {
                 expr.apply(|e| {
                     if let Expr::Column(col) = e {
@@ -339,19 +373,6 @@ impl LateMaterializeJoin {
             join.join_type,
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full
         ) || join.filter.is_some()
-        {
-            return Ok(None);
-        }
-
-        // The take re-fetches by `_rowaddr` and merges columns by name, so it
-        // cannot sit above a join whose output has duplicate field names (e.g.
-        // both sides' equi-keys share a name). Matches the physical rule.
-        let mut seen = HashSet::with_capacity(join.schema.fields().len());
-        if join
-            .schema
-            .fields()
-            .iter()
-            .any(|f| !seen.insert(f.name().as_str()))
         {
             return Ok(None);
         }
@@ -417,6 +438,57 @@ impl LateMaterializeJoin {
             let deferred_columns: Vec<String> =
                 deferred.into_iter().map(|(_, name)| name).collect();
 
+            // Insert a normalizing projection between the join and the take that
+            // keeps only the columns the take must carry: those referenced above
+            // the join plus the row locator, with the deferred columns dropped
+            // (they are re-fetched). This serves two purposes:
+            //   * It lets the physical planner give the join a tight output
+            //     projection. Without it, the opaque take node forces the
+            //     `HashJoinExec` to emit its full `left ++ right` output, which
+            //     for an equi-join includes both sides' key columns — duplicate
+            //     arrow names that `TakeExec` (which merges by name) cannot
+            //     handle once qualifiers are erased at the physical level.
+            //   * It is where scan narrowing happens: the deferred columns are
+            //     simply absent from the projection, so projection pushdown drops
+            //     them from the scan while keeping `_rowaddr`.
+            // `referenced` excludes the join's own on-clause columns, so a
+            // redundant equi-key (used only by the join) is pruned here rather
+            // than colliding with the surviving key. If two *referenced* columns
+            // still share a name, the take cannot disambiguate them; bail.
+            let deferred_set: HashSet<&str> = deferred_columns.iter().map(|s| s.as_str()).collect();
+            let mut kept_exprs: Vec<Expr> = Vec::new();
+            // Seed with the deferred names: they are appended to the take output,
+            // so a kept column sharing one of those names also conflicts.
+            let mut kept_names: HashSet<String> = deferred_columns.iter().cloned().collect();
+            let mut name_conflict = false;
+            for (col_qualifier, field) in join.schema.iter() {
+                let name = field.name();
+                // Drop the deferred columns: they are re-fetched and appended by
+                // the take, not carried through its input.
+                if col_qualifier == qualifier.as_ref() && deferred_set.contains(name.as_str()) {
+                    continue;
+                }
+                let kept = name == ROW_ADDR
+                    || name == ROW_ID
+                    || referenced.contains(&(col_qualifier.cloned(), name.clone()));
+                if !kept {
+                    continue;
+                }
+                if !kept_names.insert(name.clone()) {
+                    name_conflict = true;
+                    break;
+                }
+                kept_exprs.push(Expr::Column(Column::new(col_qualifier.cloned(), name)));
+            }
+            if name_conflict {
+                continue;
+            }
+
+            let take_input = LogicalPlan::Projection(Projection::try_new(
+                kept_exprs,
+                Arc::new(LogicalPlan::Join(join.clone())),
+            )?);
+
             // The scan side is null-extended when it is the optional side of an
             // outer join; its unmatched rows then have a null `_rowaddr` and
             // must yield NULL deferred values.
@@ -429,7 +501,7 @@ impl LateMaterializeJoin {
             );
 
             let node = LateTakeNode::try_new(
-                LogicalPlan::Join(join.clone()),
+                take_input,
                 dataset,
                 deferred_columns,
                 qualifier,
@@ -752,8 +824,9 @@ mod tests {
     async fn test_duplicate_join_output_names_not_deferred() {
         let (dataset, _tmp) = test_dataset().await;
         let ctx = SessionContext::new();
-        // Both sides expose `payload`; the join output has a duplicate name, so
-        // the take (which merges by name) cannot be inserted.
+        // Both sides expose `payload` and both are consumed above the join, so
+        // the take (which merges appended columns by name) would produce a
+        // duplicate `payload` and must not be inserted.
         let target = ctx
             .read_lance_unordered(dataset, false, true)
             .unwrap()
@@ -779,14 +852,20 @@ mod tests {
         let plan = target
             .join(source, JoinType::Inner, &["id"], &["sid"], None)
             .unwrap()
-            .select(vec![col("target.id"), col("target.payload")])
+            // Reference both sides' `payload` above the join: deferring
+            // `target.payload` would collide with the kept `source.payload`.
+            .select(vec![
+                col("target.id"),
+                col("target.payload"),
+                col("source.payload"),
+            ])
             .unwrap()
             .into_unoptimized_plan();
 
         let optimized = run_rule_and_pushdown(plan);
         assert!(
             !has_late_take(&optimized),
-            "duplicate join-output names must not be deferred"
+            "duplicate output names must not be deferred"
         );
     }
 

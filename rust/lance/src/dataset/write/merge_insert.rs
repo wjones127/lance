@@ -58,7 +58,7 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec, project,
+        AddRowAddrExec, LateMaterializeJoin, LateTakePlanner, Planner, TakeExec, project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -72,6 +72,7 @@ use arrow_select::take::take_record_batch;
 use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
+use datafusion::optimizer::{OptimizerContext, OptimizerRule};
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -88,7 +89,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
     },
-    physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
+    physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::DataFrame,
     scalar::ScalarValue,
 };
@@ -1538,23 +1539,33 @@ impl MergeInsertJob {
             node: Arc::new(write_node),
         });
 
+        // First pass: standard optimization. The non-source "fill" columns are
+        // still referenced (each copies `target.<col>`), so projection pushdown
+        // keeps them — and `target._rowaddr` — in the target scan.
         let logical_plan = session_state.optimize(&logical_plan)?;
-
-        let planner =
-            DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(MergeInsertPlanner {})]);
-        // This method already does the optimization for us.
-        let physical_plan = planner
-            .create_physical_plan(&logical_plan, &session_state)
-            .await?;
 
         // Defer reading non-source columns: a partial-schema upsert reads the
         // missing columns from the target side of the join only to rewrite full
-        // rows. This rule pushes those reads past the join so a selective match
-        // does not scan wide columns for every target row. It is applied only
-        // here (not in the session-wide optimizer) to bound its blast radius.
-        use datafusion::physical_optimizer::PhysicalOptimizerRule;
-        let physical_plan = crate::io::exec::LateMaterializeOverReducingJoin
-            .optimize(physical_plan, &datafusion::config::ConfigOptions::default())?;
+        // rows. This rule inserts a `LateTake` above the join so those wide
+        // columns are fetched by `_rowaddr` for the matched rows only, instead
+        // of being scanned for every target row. It is applied only here (not in
+        // the session-wide optimizer) to bound its blast radius.
+        let logical_plan = LateMaterializeJoin::new()
+            .rewrite(logical_plan, &OptimizerContext::default())?
+            .data;
+
+        // Second pass: the deferred columns are now absent from the `LateTake`'s
+        // input, so projection pushdown narrows the target scan to drop them
+        // while keeping `_rowaddr` (which the take forces in).
+        let logical_plan = session_state.optimize(&logical_plan)?;
+
+        let planner = DefaultPhysicalPlanner::with_extension_planners(vec![
+            Arc::new(MergeInsertPlanner {}) as Arc<dyn ExtensionPlanner + Send + Sync>,
+            Arc::new(LateTakePlanner) as Arc<dyn ExtensionPlanner + Send + Sync>,
+        ]);
+        let physical_plan = planner
+            .create_physical_plan(&logical_plan, &session_state)
+            .await?;
 
         Ok(physical_plan)
     }
