@@ -982,6 +982,95 @@ mod tests {
         assert!(!is_wide_column(&blob, true));
     }
 
+    /// Two *non-deferred* columns from different relations that share a name
+    /// (here `tag`, on both sides) collide in the take's input. This is the
+    /// kept-vs-kept conflict path — distinct from the duplicate-name test above,
+    /// which collides a kept column with a *deferred* name.
+    #[tokio::test]
+    async fn test_kept_column_name_conflict_not_deferred() {
+        let (dataset, _tmp) = test_dataset().await;
+        let ctx = SessionContext::new();
+        let target = ctx
+            .read_lance_unordered(dataset, false, true)
+            .unwrap()
+            .alias("target")
+            .unwrap();
+        // Source carries a narrow `tag` (never a defer candidate itself).
+        let source_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("sid", DataType::Int32, false),
+            Field::new("tag", DataType::Int32, true),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(Int32Array::from(vec![100, 300])),
+            ],
+        )
+        .unwrap();
+        let source = ctx
+            .read_batch(source_batch)
+            .unwrap()
+            .alias("source")
+            .unwrap();
+        // `payload` is wide (deferrable), but both `target.tag` and `source.tag`
+        // are carried past the join → their shared name would collide in the
+        // take's input, so the rule must bail.
+        let plan = target
+            .join(source, JoinType::Inner, &["id"], &["sid"], None)
+            .unwrap()
+            .select(vec![
+                col("target.id"),
+                col("target.payload"),
+                col("target.tag"),
+                col("source.tag"),
+            ])
+            .unwrap()
+            .into_unoptimized_plan();
+
+        let optimized = run_rule_and_pushdown(plan);
+        assert!(
+            !has_late_take(&optimized),
+            "a kept-column name collision must not be deferred"
+        );
+    }
+
+    /// `find_lance_dataset` must descend only single-input nodes, so a nested
+    /// join's scan is never mistaken for a scannable relation of an outer join.
+    #[tokio::test]
+    async fn test_find_lance_dataset_descends_single_input_only() {
+        let (dataset, _tmp) = test_dataset().await;
+        let ctx = SessionContext::new();
+
+        // A single-input chain (SubqueryAlias -> TableScan) resolves to the dataset.
+        let scan_plan = ctx
+            .read_lance_unordered(dataset.clone(), false, true)
+            .unwrap()
+            .alias("target")
+            .unwrap()
+            .into_unoptimized_plan();
+        assert!(LateMaterializeJoin::find_lance_dataset(&scan_plan).is_some());
+
+        // A join is multi-input: neither side's scan is surfaced, so the rule
+        // cannot pick up a nested join's relation by mistake.
+        let target = ctx
+            .read_lance_unordered(dataset, false, true)
+            .unwrap()
+            .alias("target")
+            .unwrap();
+        let join_plan = target
+            .join(
+                source_df(&ctx, vec![1, 3]),
+                JoinType::Inner,
+                &["id"],
+                &["sid"],
+                None,
+            )
+            .unwrap()
+            .into_unoptimized_plan();
+        assert!(LateMaterializeJoin::find_lance_dataset(&join_plan).is_none());
+    }
+
     #[tokio::test]
     async fn test_outer_join_marks_deferred_nullable() {
         let (dataset, _tmp) = test_dataset().await;
