@@ -413,56 +413,47 @@ impl LateMaterializeJoin {
             let dataset_arrow = ArrowSchema::from(dataset.schema());
 
             // Candidates = scan-side data columns that aren't join keys nor the
-            // system columns, that are consumed above the join, and are wide
-            // enough to be worth re-fetching by address.
-            let mut deferred: Vec<(usize, String)> = Vec::new();
-            for (col_qualifier, field) in side_schema.iter() {
-                let name = field.name();
-                if name == ROW_ADDR || name == ROW_ID || key_names.contains(name) {
-                    continue;
-                }
-                // Only defer columns actually used above the join; a column the
-                // scan produces but nobody references would just be pruned, so
-                // re-fetching it would be wasted work.
-                if !referenced.contains(&(col_qualifier.cloned(), name.clone())) {
-                    continue;
-                }
-                let Some(ds_field) = dataset.schema().field(name) else {
-                    continue;
-                };
-                if !is_wide_column(ds_field, is_cloud) {
-                    continue;
-                }
-                let Ok(ds_idx) = dataset_arrow.index_of(name) else {
-                    continue;
-                };
-                deferred.push((ds_idx, name.clone()));
-            }
-            if deferred.is_empty() {
+            // system columns, that are consumed above the join (a column nobody
+            // references would just be pruned, so re-fetching it is wasted work),
+            // and are wide enough to be worth re-fetching by address.
+            let candidates: HashSet<&str> = side_schema
+                .iter()
+                .filter(|(col_qualifier, field)| {
+                    let name = field.name();
+                    name != ROW_ADDR
+                        && name != ROW_ID
+                        && !key_names.contains(name)
+                        && referenced.contains(&(col_qualifier.cloned(), name.clone()))
+                        && dataset
+                            .schema()
+                            .field(name)
+                            .is_some_and(|f| is_wide_column(f, is_cloud))
+                })
+                .map(|(_, field)| field.name().as_str())
+                .collect();
+            if candidates.is_empty() {
                 continue;
             }
-            // Append in dataset-schema order to match TakeExec's output order.
-            deferred.sort_by_key(|(idx, _)| *idx);
-            let deferred_columns: Vec<String> =
-                deferred.into_iter().map(|(_, name)| name).collect();
+            // Order by the dataset schema to match TakeExec's append order.
+            let deferred_columns: Vec<String> = dataset_arrow
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .filter(|name| candidates.contains(name.as_str()))
+                .cloned()
+                .collect();
 
-            // Insert a normalizing projection between the join and the take that
-            // keeps only the columns the take must carry: those referenced above
-            // the join plus the row locator, with the deferred columns dropped
-            // (they are re-fetched). This serves two purposes:
-            //   * It lets the physical planner give the join a tight output
-            //     projection. Without it, the opaque take node forces the
-            //     `HashJoinExec` to emit its full `left ++ right` output, which
-            //     for an equi-join includes both sides' key columns — duplicate
-            //     arrow names that `TakeExec` (which merges by name) cannot
-            //     handle once qualifiers are erased at the physical level.
-            //   * It is where scan narrowing happens: the deferred columns are
-            //     simply absent from the projection, so projection pushdown drops
-            //     them from the scan while keeping `_rowaddr`.
-            // `referenced` excludes the join's own on-clause columns, so a
-            // redundant equi-key (used only by the join) is pruned here rather
-            // than colliding with the surviving key. If two *referenced* columns
-            // still share a name, the take cannot disambiguate them; bail.
+            // Insert a normalizing projection between the join and the take,
+            // keeping only the columns carried past the join (referenced above it
+            // plus the row locator) and dropping the deferred ones. This gives the
+            // join a tight output projection — without it the opaque take node
+            // forces `HashJoinExec` to emit its full `left ++ right`, whose
+            // equi-keys become duplicate arrow names the take (merging by name)
+            // can't handle once qualifiers are erased — and it is where scan
+            // narrowing happens, since the absent columns are pushed out of the
+            // scan. `referenced` excludes the join's own on-clause, so a redundant
+            // equi-key is pruned here; if two *referenced* columns still share a
+            // name the take can't disambiguate them, so bail.
             let deferred_set: HashSet<&str> = deferred_columns.iter().map(|s| s.as_str()).collect();
             let mut kept_exprs: Vec<Expr> = Vec::new();
             // Seed with the deferred names: they are appended to the take output,
