@@ -66,6 +66,9 @@ plugins:
   - mkdocs_protobuf:
       proto_dir: ../protos
 
+hooks:
+  - hooks/pmc_roster.py
+
 extra:
   generator: false
   social:
