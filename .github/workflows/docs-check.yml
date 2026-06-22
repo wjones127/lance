@@ -11,6 +11,7 @@ on:
       - release/**
     paths:
       - docs/**
+      - ci/sync_pmc_docs.py
       - .github/workflows/docs-check.yml
 
 permissions:
@@ -41,3 +42,7 @@ jobs:
         working-directory: docs
         run: |
           uv run mkdocs-linkcheck src
+      - name: Check PMC roster table is in sync with pmc.yaml
+        working-directory: docs
+        run: |
+          uv run python ../ci/sync_pmc_docs.py --check
