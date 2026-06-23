@@ -3562,6 +3562,7 @@ mod tests {
         let fragments = vec![Fragment {
             id: 0,
             files: vec![external_file, local_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),
