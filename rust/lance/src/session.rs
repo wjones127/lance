@@ -374,9 +374,8 @@ mod tests {
     #[tokio::test]
     async fn test_default_session_has_spill_store() {
         let session = Session::default();
-        // Should be able to create a spill file and write to it without error.
-        let spill = session.spill_store().create_spill_file().unwrap();
-        let mut writer = spill.writer().await.unwrap();
+        // Should be able to allocate a spill and write to it without error.
+        let (mut writer, _spill) = session.spill_store().new_spill().await.unwrap();
         writer.write_all(b"scratch").await.unwrap();
         lance_io::traits::Writer::shutdown(writer.as_mut())
             .await
@@ -388,8 +387,7 @@ mod tests {
         let capped = Arc::new(LocalSpillStore::with_cap(50).unwrap());
         let session = Session::default().with_spill_store(capped);
 
-        let spill = session.spill_store().create_spill_file().unwrap();
-        let mut writer = spill.writer().await.unwrap();
+        let (mut writer, _spill) = session.spill_store().new_spill().await.unwrap();
         // Writing 51 bytes exceeds the 50-byte cap; the typed error is wrapped
         // in an io::Error by the writer and recovered on conversion.
         let io_err = writer.write_all(&[0u8; 51]).await.unwrap_err();

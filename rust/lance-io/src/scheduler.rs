@@ -735,7 +735,7 @@ impl ScanScheduler {
     /// Unlike [`Self::open_file`], this skips the path lookup and size probe and
     /// schedules I/O against `reader` directly. This is useful when the reader
     /// was produced outside the scheduler's object store (e.g. a spill file
-    /// opened via [`crate::spill::SpillFile::reader`]), since a bare `Reader`
+    /// opened via [`crate::spill::Spill::reader`]), since a bare `Reader`
     /// cannot otherwise drive a v2 `FileReader` (which needs a scheduler).
     ///
     /// Uses a base priority of 0; chain [`FileScheduler::with_priority`] to set

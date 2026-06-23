@@ -3,36 +3,37 @@
 
 //! Reclaimable scratch storage.
 //!
-//! A [`SpillStore`] hands out [`SpillFile`] handles for temporary state that is
-//! too large to keep in memory and is read back later in the same process (for
+//! A [`SpillStore`] hands out scratch space for temporary state that is too
+//! large to keep in memory and is read back later in the same process (for
 //! example, posting lists or shuffle runs accumulated while building an index).
-//! The backing storage is reclaimed automatically when a handle is dropped.
+//! The backing storage is reclaimed automatically when the handle is dropped.
 //!
-//! Key properties:
-//! - **`writer()`/`reader()` interface.** A [`SpillFile`] vends a [`Writer`]
-//!   and a [`Reader`] rather than exposing an [`ObjectStore`] and a path. The
-//!   writer feeds `FileWriter::try_new` directly; the reader feeds a v2
-//!   `FileReader` via [`crate::scheduler::ScanScheduler::open_reader`].
-//! - **Per-file RAII.** One [`SpillFile`] is one file; dropping it deletes the
-//!   file and releases its bytes back to the store's disk budget, so a caller
-//!   can hold N files and reclaim them individually.
-//! - **Disk cap enforcement.** [`LocalSpillStore::with_cap`] enforces a byte
-//!   budget shared across all handles, returning a typed
-//!   [`lance_core::Error::DiskCapExceeded`] rather than silently filling the
-//!   disk.
+//! [`SpillStore::new_spill`] returns a [`Writer`] paired with a [`Spill`]
+//! handle: the writer is the byte sink (feed it to `FileWriter::try_new`, or
+//! write to it directly); the [`Spill`] reads the bytes back (via
+//! [`crate::scheduler::ScanScheduler::open_reader`] for a v2 `FileReader`) and
+//! owns the file's lifetime.
 //!
-//! # Usage contract
+//! # Lifecycle
 //!
-//! Hold the [`SpillFile`] alive for the file's lifetime: the [`Writer`] and
-//! [`Reader`] reference the backing file, which the handle deletes on drop. The
-//! store's temp directory is the backstop for anything leaked when it drops.
+//! - **Write-once.** The only way to obtain a writer is `new_spill`, and each
+//!   call allocates a fresh unit of storage, so a single spill cannot be
+//!   written twice — there is no second-writer path to guard against.
+//! - **Write-before-read.** [`Spill::reader`] fails until the writer has been
+//!   shut down, so partially written bytes are never read back.
+//! - **RAII.** Dropping the [`Spill`] deletes the file and releases its bytes
+//!   back to the store's disk budget. The store's temp directory is the
+//!   backstop for anything leaked if a handle is forgotten.
 //!
-//! Accounting is reserve-on-write + release-on-drop (by stat), which is exact
-//! for the write-once contract this enforces: [`SpillFile::writer`] may be
-//! called only once, so the bytes reserved while writing match the file size
-//! released on drop. Two minor inexactnesses are not engineered around: a write
-//! aborted at the cap leaks its reservation until the store is dropped, and a
-//! file whose size cannot be stat-ed on drop is not released.
+//! # Disk cap
+//!
+//! [`LocalSpillStore::with_cap`] enforces a byte budget shared across all live
+//! handles, returning a typed [`lance_core::Error::DiskCapExceeded`] rather than
+//! silently filling the disk. Accounting is reserve-on-write + release-on-drop
+//! (by stat), which is exact for the write-once contract. Two minor
+//! inexactnesses are not engineered around: a write aborted at the cap leaks its
+//! reservation until the store is dropped, and a file whose size cannot be
+//! stat-ed on drop is not released.
 
 use std::io;
 use std::path::PathBuf;
@@ -51,47 +52,39 @@ use crate::object_store::ObjectStore;
 use crate::object_writer::WriteResult;
 use crate::traits::{Reader, Writer};
 
-/// A handle to a single unit of reclaimable scratch storage.
-///
-/// Data is written through [`SpillFile::writer`] and read back through
-/// [`SpillFile::reader`]. The backing storage is released when the handle is
-/// dropped.
-///
-/// The trait is object-safe so it can be returned as `Box<dyn SpillFile>` from
-/// [`SpillStore::create_spill_file`], allowing implementations not backed by a
-/// local file (e.g. in-memory buffers, remote object stores).
-#[async_trait]
-pub trait SpillFile: Send + Sync {
-    /// Open a writer over this spill file.
-    ///
-    /// For a capped store, writes that would exceed the cap fail with
-    /// [`lance_core::Error::DiskCapExceeded`]. Spill files are write-once:
-    /// implementations may reject a second call (the [`LocalSpillStore`] impl
-    /// returns [`lance_core::Error::invalid_input`]).
-    async fn writer(&self) -> Result<Box<dyn Writer>>;
-
-    /// Open a reader over this spill file.
-    ///
-    /// The data must have been fully written (the writer shut down) first.
-    async fn reader(&self) -> Result<Box<dyn Reader>>;
-}
-
-/// A factory for [`SpillFile`] handles.
+/// A factory for scratch storage.
 ///
 /// The trait is object-safe and `Send + Sync` so it can be held behind an
-/// `Arc<dyn SpillStore>` (e.g. inside a `Session`).
+/// `Arc<dyn SpillStore>` (e.g. inside a `Session`). Implementations need not be
+/// backed by local files (e.g. in-memory buffers, remote object stores).
+#[async_trait]
 pub trait SpillStore: Send + Sync + 'static {
-    /// Allocate a new scratch handle.
+    /// Allocate a unit of scratch storage.
     ///
-    /// The backing storage is reclaimed when the returned [`SpillFile`] is
-    /// dropped.
-    fn create_spill_file(&self) -> Result<Box<dyn SpillFile>>;
+    /// Returns the byte sink to write it with and a [`Spill`] handle to read it
+    /// back. For a capped store, writes that would exceed the cap fail with
+    /// [`lance_core::Error::DiskCapExceeded`]. The storage is reclaimed when the
+    /// [`Spill`] is dropped.
+    async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)>;
+}
+
+/// The readable half of a spill, and the owner of its backing storage.
+///
+/// Dropping it reclaims the storage. The trait is object-safe so it can be
+/// returned as `Box<dyn Spill>` from [`SpillStore::new_spill`].
+#[async_trait]
+pub trait Spill: Send + Sync {
+    /// Open a reader over the spilled bytes.
+    ///
+    /// Fails until the paired writer has been shut down, since the bytes are not
+    /// complete before then.
+    async fn reader(&self) -> Result<Box<dyn Reader>>;
 }
 
 /// A shared, cloneable byte budget.
 ///
-/// Cloning produces another handle to the *same* underlying counter, so a
-/// quota shared across many writers enforces a single combined cap.
+/// Cloning produces another handle to the *same* underlying counter, so a quota
+/// shared across many writers enforces a single combined cap.
 #[derive(Debug, Clone)]
 struct DiskQuota {
     cap_bytes: u64,
@@ -128,32 +121,38 @@ impl DiskQuota {
     }
 }
 
-/// A [`Writer`] decorator that reserves a [`DiskQuota`] as bytes are written.
+/// The byte sink handed out by [`SpillStore::new_spill`].
 ///
-/// Wrapping the writer keeps cap enforcement inside the spill store rather than
-/// pushing it into [`ObjectStore`], and works for any backend the store opens.
-struct QuotaWriter {
+/// It optionally reserves a [`DiskQuota`] as bytes are written (keeping cap
+/// enforcement inside the spill store rather than in [`ObjectStore`], and
+/// working for any backend the store opens), and flips a shared `finished` flag
+/// on shutdown so the paired [`Spill`] knows the bytes are complete.
+struct SpillWriter {
     inner: Box<dyn Writer>,
-    quota: DiskQuota,
+    quota: Option<DiskQuota>,
+    finished: Arc<AtomicBool>,
 }
 
-impl AsyncWrite for QuotaWriter {
+impl AsyncWrite for SpillWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        let Some(quota) = &this.quota else {
+            return Pin::new(this.inner.as_mut()).poll_write(cx, buf);
+        };
         // Reserve up-front for the bytes we intend to write, then release the
         // remainder the inner writer did not accept so the reservation tracks
         // bytes actually buffered (and, for a write-once file, the file size).
-        if let Err(e) = this.quota.try_reserve(buf.len() as u64) {
+        if let Err(e) = quota.try_reserve(buf.len() as u64) {
             return Poll::Ready(Err(io::Error::other(e)));
         }
         let poll = Pin::new(this.inner.as_mut()).poll_write(cx, buf);
         match &poll {
-            Poll::Ready(Ok(n)) => this.quota.release((buf.len() - *n) as u64),
-            _ => this.quota.release(buf.len() as u64),
+            Poll::Ready(Ok(n)) => quota.release((buf.len() - *n) as u64),
+            _ => quota.release(buf.len() as u64),
         }
         poll
     }
@@ -163,18 +162,28 @@ impl AsyncWrite for QuotaWriter {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.get_mut().inner.as_mut()).poll_shutdown(cx)
+        let this = self.get_mut();
+        let poll = Pin::new(this.inner.as_mut()).poll_shutdown(cx);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            this.finished.store(true, Ordering::Relaxed);
+        }
+        poll
     }
 }
 
 #[async_trait]
-impl Writer for QuotaWriter {
+impl Writer for SpillWriter {
     async fn tell(&mut self) -> Result<usize> {
         self.inner.tell().await
     }
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
-        self.inner.shutdown().await
+        let result = self.inner.shutdown().await?;
+        // Signal the paired `Spill` that the bytes are now complete. `Relaxed`
+        // is sufficient: this only flags that shutdown happened; the file
+        // contents are synchronized through the filesystem, not this flag.
+        self.finished.store(true, Ordering::Relaxed);
+        Ok(result)
     }
 }
 
@@ -223,60 +232,56 @@ impl Default for LocalSpillStore {
     }
 }
 
+#[async_trait]
 impl SpillStore for LocalSpillStore {
-    fn create_spill_file(&self) -> Result<Box<dyn SpillFile>> {
+    async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
         let idx = self.file_counter.fetch_add(1, Ordering::Relaxed);
         let fs_path = self.temp_dir.path().join(format!("spill_{idx:06}.bin"));
         let os_path = Path::from_absolute_path(&fs_path)?;
-        Ok(Box::new(LocalSpillFile {
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let writer = Box::new(SpillWriter {
+            inner: self.store.create(&os_path).await?,
+            quota: self.quota.clone(),
+            finished: finished.clone(),
+        });
+        let spill = Box::new(LocalSpill {
             store: self.store.clone(),
             os_path,
             fs_path,
             quota: self.quota.clone(),
-            writer_taken: AtomicBool::new(false),
+            finished,
             _temp_dir: self.temp_dir.clone(),
-        }))
+        });
+        Ok((writer, spill))
     }
 }
 
-/// A [`SpillFile`] backed by a single file in the store's temp directory.
-struct LocalSpillFile {
+/// The readable half of a [`LocalSpillStore`] spill; reclaims the file on drop.
+struct LocalSpill {
     store: Arc<ObjectStore>,
     os_path: Path,
     fs_path: PathBuf,
     quota: Option<DiskQuota>,
-    /// Set once a writer has been vended, to reject the write-once violation of
-    /// reopening a writer (which would truncate the file and leak the first
-    /// write's reservation against the budget).
-    writer_taken: AtomicBool,
+    /// Set by the paired [`SpillWriter`] once it has been shut down.
+    finished: Arc<AtomicBool>,
     /// Keep the store's temp directory alive for at least this file's lifetime.
     _temp_dir: Arc<tempfile::TempDir>,
 }
 
 #[async_trait]
-impl SpillFile for LocalSpillFile {
-    async fn writer(&self) -> Result<Box<dyn Writer>> {
-        if self.writer_taken.swap(true, Ordering::Relaxed) {
+impl Spill for LocalSpill {
+    async fn reader(&self) -> Result<Box<dyn Reader>> {
+        if !self.finished.load(Ordering::Relaxed) {
             return Err(Error::invalid_input(
-                "spill files are write-once; this file already has a writer",
+                "spill reader requested before the writer was shut down",
             ));
         }
-        let writer = self.store.create(&self.os_path).await?;
-        match &self.quota {
-            Some(quota) => Ok(Box::new(QuotaWriter {
-                inner: writer,
-                quota: quota.clone(),
-            })),
-            None => Ok(writer),
-        }
-    }
-
-    async fn reader(&self) -> Result<Box<dyn Reader>> {
         self.store.open(&self.os_path).await
     }
 }
 
-impl Drop for LocalSpillFile {
+impl Drop for LocalSpill {
     fn drop(&mut self) {
         // Release the bytes this file occupied back to the budget. We stat the
         // persisted file rather than tracking writes, which is exact for the
@@ -296,8 +301,8 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    async fn write_spill(spill: &dyn SpillFile, data: &[u8]) -> Result<()> {
-        let mut writer = spill.writer().await?;
+    /// Write `data` to a fresh writer and shut it down.
+    async fn finish_writer(mut writer: Box<dyn Writer>, data: &[u8]) -> Result<()> {
         writer.write_all(data).await?;
         Writer::shutdown(writer.as_mut()).await?;
         Ok(())
@@ -315,10 +320,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_then_read() {
         let store = LocalSpillStore::new().unwrap();
-        let spill = store.create_spill_file().unwrap();
+        let (writer, spill) = store.new_spill().await.unwrap();
 
         let data = b"hello spill world";
-        write_spill(spill.as_ref(), data).await.unwrap();
+        finish_writer(writer, data).await.unwrap();
 
         let reader = spill.reader().await.unwrap();
         let read_back = reader.get_all().await.unwrap();
@@ -326,12 +331,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reader_requires_finished_writer() {
+        let store = LocalSpillStore::new().unwrap();
+        let (mut writer, spill) = store.new_spill().await.unwrap();
+        writer.write_all(b"partial").await.unwrap();
+
+        // Reading before the writer is shut down is rejected.
+        let Err(err) = spill.reader().await else {
+            panic!("reader before shutdown should be rejected");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // After shutdown the reader sees the bytes.
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), b"partial");
+    }
+
+    #[tokio::test]
     async fn test_raii_cleanup() {
         let store = LocalSpillStore::new().unwrap();
-        let spill = store.create_spill_file().unwrap();
-        write_spill(spill.as_ref(), b"some bytes").await.unwrap();
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, b"some bytes").await.unwrap();
 
-        // The first file gets a deterministic name under the store's temp dir.
+        // The first spill gets a deterministic name under the store's temp dir.
         let path = store.temp_dir.path().join("spill_000000.bin");
         assert!(path.exists());
         drop(spill);
@@ -341,8 +367,8 @@ mod tests {
     #[tokio::test]
     async fn test_cap_exceeded() {
         let store = LocalSpillStore::with_cap(100).unwrap();
-        let spill = store.create_spill_file().unwrap();
-        let err = write_spill(spill.as_ref(), &[0u8; 101]).await.unwrap_err();
+        let (writer, _spill) = store.new_spill().await.unwrap();
+        let err = finish_writer(writer, &[0u8; 101]).await.unwrap_err();
         assert!(
             matches!(err, Error::DiskCapExceeded { cap_bytes: 100, .. }),
             "expected DiskCapExceeded, got {err:?}"
@@ -352,12 +378,12 @@ mod tests {
     #[tokio::test]
     async fn test_cap_shared_across_files() {
         let store = LocalSpillStore::with_cap(100).unwrap();
-        let a = store.create_spill_file().unwrap();
-        let b = store.create_spill_file().unwrap();
+        let (writer_a, _spill_a) = store.new_spill().await.unwrap();
+        let (writer_b, _spill_b) = store.new_spill().await.unwrap();
 
-        write_spill(a.as_ref(), &[0u8; 60]).await.unwrap();
+        finish_writer(writer_a, &[0u8; 60]).await.unwrap();
         // 60 already reserved by `a`; writing 60 more would reach 120 > 100.
-        let err = write_spill(b.as_ref(), &[0u8; 60]).await.unwrap_err();
+        let err = finish_writer(writer_b, &[0u8; 60]).await.unwrap_err();
         assert!(
             matches!(err, Error::DiskCapExceeded { cap_bytes: 100, .. }),
             "expected DiskCapExceeded, got {err:?}"
@@ -369,62 +395,46 @@ mod tests {
         let store = LocalSpillStore::with_cap(100).unwrap();
 
         {
-            let a = store.create_spill_file().unwrap();
-            write_spill(a.as_ref(), &[0u8; 80]).await.unwrap();
-            // `a` drops here, releasing its 80 bytes.
+            let (writer, spill) = store.new_spill().await.unwrap();
+            finish_writer(writer, &[0u8; 80]).await.unwrap();
+            // `spill` drops at the end of this block, releasing its 80 bytes.
+            drop(spill);
         }
 
-        let b = store.create_spill_file().unwrap();
+        let (writer, _spill) = store.new_spill().await.unwrap();
         // Succeeds because the cap is no longer under pressure.
-        write_spill(b.as_ref(), &[0u8; 80]).await.unwrap();
+        finish_writer(writer, &[0u8; 80]).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_custom_implementation() {
         // A custom store can satisfy the traits without a local file.
         struct MemStore;
-        struct MemFile;
+        struct MemSpill;
 
         #[async_trait]
-        impl SpillFile for MemFile {
-            async fn writer(&self) -> Result<Box<dyn Writer>> {
-                ObjectStore::memory().create(&Path::from("/mem")).await
-            }
+        impl Spill for MemSpill {
             async fn reader(&self) -> Result<Box<dyn Reader>> {
                 ObjectStore::memory().open(&Path::from("/mem")).await
             }
         }
 
+        #[async_trait]
         impl SpillStore for MemStore {
-            fn create_spill_file(&self) -> Result<Box<dyn SpillFile>> {
-                Ok(Box::new(MemFile))
+            async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
+                let writer = ObjectStore::memory().create(&Path::from("/mem")).await?;
+                Ok((writer, Box::new(MemSpill)))
             }
         }
 
         let store = MemStore;
-        let spill = store.create_spill_file().unwrap();
-        // Exercise the factory + trait object; the in-memory store is a fresh
+        // Exercise the factory + trait objects; the in-memory store is a fresh
         // instance per call so we don't round-trip data here.
-        let _ = spill.writer().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_writer_is_write_once() {
-        let store = LocalSpillStore::new().unwrap();
-        let spill = store.create_spill_file().unwrap();
-
-        let _writer = spill.writer().await.unwrap();
-        let Err(err) = spill.writer().await else {
-            panic!("second writer() should be rejected");
-        };
-        assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "second writer() should be rejected with InvalidInput, got {err:?}"
-        );
+        let (_writer, _spill) = store.new_spill().await.unwrap();
     }
 
     /// A [`Writer`] whose `poll_write` accepts a fixed number of bytes per call,
-    /// or fails, so we can drive the [`QuotaWriter`] release arms that the local
+    /// or fails, so we can drive the [`SpillWriter`] release arms that the local
     /// backend (which accepts every write in full) never hits.
     struct ControlledWriter {
         outcome: Poll<io::Result<usize>>,
@@ -461,15 +471,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_quota_writer_releases_unaccepted_bytes() {
+    async fn test_spill_writer_releases_unaccepted_bytes() {
         // Short write: the inner writer accepts only 10 of the 40 reserved bytes,
         // so the 30-byte remainder must be returned to the budget.
         let quota = DiskQuota::new(100);
-        let mut writer = QuotaWriter {
+        let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Ok(10)),
             }),
-            quota: quota.clone(),
+            quota: Some(quota.clone()),
+            finished: Arc::new(AtomicBool::new(false)),
         };
         let n = writer.write(&[0u8; 40]).await.unwrap();
         assert_eq!(n, 10);
@@ -481,11 +492,12 @@ mod tests {
 
         // Failed write: the full reservation must be released.
         let quota = DiskQuota::new(100);
-        let mut writer = QuotaWriter {
+        let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Err(io::Error::other("boom"))),
             }),
-            quota: quota.clone(),
+            quota: Some(quota.clone()),
+            finished: Arc::new(AtomicBool::new(false)),
         };
         writer.write(&[0u8; 40]).await.unwrap_err();
         assert_eq!(
