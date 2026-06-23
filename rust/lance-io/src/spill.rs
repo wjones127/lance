@@ -165,6 +165,8 @@ impl AsyncWrite for SpillWriter {
         let this = self.get_mut();
         let poll = Pin::new(this.inner.as_mut()).poll_shutdown(cx);
         if matches!(poll, Poll::Ready(Ok(()))) {
+            // Mirrors `Writer::shutdown` so the flag is set whichever shutdown
+            // surface the consumer drives (`AsyncWrite` vs the `Writer` trait).
             this.finished.store(true, Ordering::Relaxed);
         }
         poll
@@ -272,6 +274,9 @@ struct LocalSpill {
 #[async_trait]
 impl Spill for LocalSpill {
     async fn reader(&self) -> Result<Box<dyn Reader>> {
+        // `Relaxed` is sufficient: the flag only gates "has the writer shut
+        // down"; the bytes themselves are synchronized through the filesystem,
+        // not this load.
         if !self.finished.load(Ordering::Relaxed) {
             return Err(Error::invalid_input(
                 "spill reader requested before the writer was shut down",
@@ -315,6 +320,9 @@ mod tests {
         assert!(quota.try_reserve(60).is_err());
         quota.release(60);
         quota.try_reserve(60).unwrap();
+        // Reserving exactly up to the cap succeeds; one byte past it fails.
+        quota.try_reserve(40).unwrap();
+        assert!(quota.try_reserve(1).is_err());
     }
 
     #[tokio::test]
@@ -349,6 +357,32 @@ mod tests {
         Writer::shutdown(writer.as_mut()).await.unwrap();
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"partial");
+    }
+
+    #[tokio::test]
+    async fn test_reader_ready_after_async_shutdown() {
+        // Shutting down through the `AsyncWrite` surface (not the `Writer`
+        // trait) must also mark the spill readable — covers poll_shutdown's
+        // flag set, the path the `Writer::shutdown` tests don't reach.
+        let store = LocalSpillStore::new().unwrap();
+        let (mut writer, spill) = store.new_spill().await.unwrap();
+        writer.write_all(b"async").await.unwrap();
+        AsyncWriteExt::shutdown(&mut writer).await.unwrap();
+
+        let reader = spill.reader().await.unwrap();
+        assert_eq!(reader.get_all().await.unwrap().as_ref(), b"async");
+    }
+
+    #[tokio::test]
+    async fn test_empty_spill() {
+        // A spill written with no bytes round-trips empty, and the capped path
+        // handles the zero-byte reserve/stat without error.
+        let store = LocalSpillStore::with_cap(100).unwrap();
+        let (writer, spill) = store.new_spill().await.unwrap();
+        finish_writer(writer, b"").await.unwrap();
+
+        let reader = spill.reader().await.unwrap();
+        assert!(reader.get_all().await.unwrap().is_empty());
     }
 
     #[tokio::test]
