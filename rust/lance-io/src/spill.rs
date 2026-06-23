@@ -37,8 +37,8 @@
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -95,51 +95,36 @@ pub trait SpillStore: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 struct DiskQuota {
     cap_bytes: u64,
-    used: Arc<AtomicU64>,
+    used: Arc<Mutex<u64>>,
 }
 
 impl DiskQuota {
     fn new(cap_bytes: u64) -> Self {
         Self {
             cap_bytes,
-            used: Arc::new(AtomicU64::new(0)),
+            used: Arc::new(Mutex::new(0)),
         }
     }
 
     /// Try to reserve `n` bytes, failing with [`Error::DiskCapExceeded`] if the
     /// reservation would push total usage past the cap.
     fn try_reserve(&self, n: u64) -> Result<()> {
-        // `Relaxed` is sufficient throughout: the counter guards no other
-        // memory, so we rely only on the atomicity of the read-modify-write,
-        // not on establishing a happens-before relationship with other data.
-        // Coherence guarantees the CAS loop always re-reads the latest value.
-        loop {
-            let current = self.used.load(Ordering::Relaxed);
-            let next = current.saturating_add(n);
-            if next > self.cap_bytes {
-                return Err(Error::disk_cap_exceeded(self.cap_bytes, current));
-            }
-            if self
-                .used
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
-            // Another thread won the CAS — retry.
+        // The lock is held only for a couple of arithmetic ops and never across
+        // an `.await`, so a std `Mutex` is the simplest correct choice.
+        let mut used = self.used.lock().unwrap();
+        let next = used.saturating_add(n);
+        if next > self.cap_bytes {
+            return Err(Error::disk_cap_exceeded(self.cap_bytes, *used));
         }
+        *used = next;
+        Ok(())
     }
 
     /// Release `n` previously reserved bytes back to the budget.
     fn release(&self, n: u64) {
-        // Saturating sub guards against any double-free bug becoming a panic.
-        // `Relaxed` for the same reason as `try_reserve`: no other state is
-        // published through this counter.
-        self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(n))
-            })
-            .ok();
+        // Saturating sub keeps a stray double-release from underflowing.
+        let mut used = self.used.lock().unwrap();
+        *used = used.saturating_sub(n);
     }
 }
 
@@ -489,7 +474,7 @@ mod tests {
         let n = writer.write(&[0u8; 40]).await.unwrap();
         assert_eq!(n, 10);
         assert_eq!(
-            quota.used.load(Ordering::Relaxed),
+            *quota.used.lock().unwrap(),
             10,
             "only the accepted bytes should remain reserved"
         );
@@ -504,7 +489,7 @@ mod tests {
         };
         writer.write(&[0u8; 40]).await.unwrap_err();
         assert_eq!(
-            quota.used.load(Ordering::Relaxed),
+            *quota.used.lock().unwrap(),
             0,
             "a failed write should release its entire reservation"
         );
