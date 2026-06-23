@@ -223,7 +223,7 @@ pub struct FileWriter {
     rows_written: u64,
     // The number of rows written for each top-level field (i.e. each entry in
     // `column_writers`). With `write_batch` every field advances together and
-    // these are all equal, but `write_columns` advances fields independently, so
+    // these are all equal, but `write_column` advances one field at a time, so
     // a single file may end up with columns of differing item counts.
     field_rows_written: Vec<u64>,
     global_buffers: Vec<(u64, u64)>,
@@ -521,9 +521,9 @@ impl FileWriter {
         self.encode_columns(&items, external_buffers)
     }
 
-    /// Encode a set of `(field index, array)` pairs, each advancing only its own
-    /// column. The returned tasks must be written before the per-field row
-    /// counters are advanced (see `advance_columns`).
+    // Encode a set of `(field index, array)` pairs, each advancing only its own
+    // column. The returned tasks must be written before the per-field row
+    // counters are advanced (see `advance_columns`).
     fn encode_columns(
         &mut self,
         items: &[(usize, ArrayRef)],
@@ -552,9 +552,9 @@ impl FileWriter {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Advance the per-field row counters after a set of columns has been
-    /// written, keeping `rows_written` (the file's logical length) in sync as the
-    /// maximum column length.
+    // Advance the per-field row counters after a set of columns has been
+    // written, keeping `rows_written` (the file's logical length) in sync as the
+    // maximum column length.
     fn advance_columns(&mut self, items: &[(usize, ArrayRef)]) {
         for (field_idx, array) in items {
             self.field_rows_written[*field_idx] += array.len() as u64;
@@ -614,21 +614,20 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Write a set of columns whose lengths may differ from one another.
+    /// Write a single column, advancing only that column's row counter.
     ///
     /// Unlike [`write_batch`](Self::write_batch), which advances every column
-    /// from a single shared row counter, this method advances each column
-    /// independently. The result is a single file whose columns may have
-    /// different item counts — the physical layout used by sparse data overlay
-    /// files, where each field covers a different set of rows.
+    /// from a single shared row counter, this method advances one column
+    /// independently. Used across calls it produces a single file whose columns
+    /// may have different item counts — the physical layout used by sparse data
+    /// overlay files, where each field covers a different set of rows.
     ///
-    /// `columns` is a list of `(field index, array)` pairs, where the field
-    /// index refers to a top-level field in the writer's schema (the same order
-    /// as the schema's fields). A field may be written across multiple calls;
-    /// its values are appended. A field that is never written ends up as a
-    /// zero-length column. The writer must have been created with an explicit
-    /// schema (via [`try_new`](Self::try_new)); a lazy schema cannot be inferred
-    /// here because individual calls need not cover every field.
+    /// `column_index` refers to a top-level field in the writer's schema (the
+    /// same order as the schema's fields). A column may be written across
+    /// multiple calls; its values are appended. A field that is never written
+    /// ends up as a zero-length column. The writer must have been created with
+    /// an explicit schema (via [`try_new`](Self::try_new)); a lazy schema cannot
+    /// be inferred here because individual calls need not cover every field.
     ///
     /// ```
     /// # use arrow_array::{ArrayRef, Int32Array};
@@ -636,47 +635,41 @@ impl FileWriter {
     /// # use lance_file::writer::FileWriter;
     /// # async fn example(writer: &mut FileWriter) -> lance_core::Result<()> {
     /// // Field 0 gets three values, field 1 gets one — a non-rectangular file.
-    /// let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    /// let b: ArrayRef = Arc::new(Int32Array::from(vec![10]));
-    /// writer.write_columns(vec![(0, a), (1, b)]).await?;
+    /// writer.write_column(0, Arc::new(Int32Array::from(vec![1, 2, 3]))).await?;
+    /// writer.write_column(1, Arc::new(Int32Array::from(vec![10]))).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn write_columns(&mut self, columns: Vec<(usize, ArrayRef)>) -> Result<()> {
+    pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         let schema = self.schema.as_ref().ok_or_else(|| {
             Error::invalid_input_source(
-                "write_columns requires the writer to be created with an explicit schema".into(),
+                "write_column requires the writer to be created with an explicit schema".into(),
             )
         })?;
-        // Validate field indices, lengths, and nullability up front.
-        for (field_idx, array) in &columns {
-            let field = schema.fields.get(*field_idx).ok_or_else(|| {
-                Error::invalid_input_source(
-                    format!(
-                        "write_columns: field index {} is out of bounds (schema has {} fields)",
-                        field_idx,
-                        schema.fields.len()
-                    )
-                    .into(),
+        let field = schema.fields.get(column_index).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "write_column: field index {} is out of bounds (schema has {} fields)",
+                    column_index,
+                    schema.fields.len()
                 )
-            })?;
-            if array.len() as u64 > u32::MAX as u64 {
-                return Err(Error::invalid_input_source(
-                    "cannot write Lance files with more than 2^32 rows".into(),
-                ));
-            }
-            Self::verify_field_nullability(&array.to_data(), field)?;
+                .into(),
+            )
+        })?;
+        if array.len() as u64 > u32::MAX as u64 {
+            return Err(Error::invalid_input_source(
+                "cannot write Lance files with more than 2^32 rows".into(),
+            ));
         }
-        // Skip empty arrays: a never-advanced field simply remains a zero-length
-        // column, which the encoders handle at `finish` time.
-        let columns = columns
-            .into_iter()
-            .filter(|(_, array)| !array.is_empty())
-            .collect::<Vec<_>>();
-        if columns.is_empty() {
+        Self::verify_field_nullability(&array.to_data(), field)?;
+
+        // A never-advanced field simply remains a zero-length column, which the
+        // encoders handle at `finish` time.
+        if array.is_empty() {
             return Ok(());
         }
 
+        let columns = [(column_index, array)];
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_columns(&columns, &mut external_buffers)?;
@@ -1165,10 +1158,10 @@ mod tests {
         file_writer.finish().await.unwrap();
     }
 
-    /// Read a single column back at an explicit range/index set, returning its
-    /// `Int32` values. Reading one column at a time is how unequal-length files
-    /// are consumed: a global full-scan would conflate columns of different
-    /// lengths into one (impossible) rectangular batch.
+    // Read a single column back at an explicit range/index set, returning its
+    // `Int32` values. Reading one column (or an equal-length group) at a time is
+    // how unequal-length files are consumed: a full scan across columns of
+    // differing lengths cannot form a single rectangular batch.
     async fn read_int32_column(
         reader: &FileReader,
         schema: &LanceSchema,
@@ -1233,14 +1226,13 @@ mod tests {
         // single value, and field "c" is never written (a zero-length column).
         let a1: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
         let b: ArrayRef = Arc::new(Int32Array::from(vec![10]));
-        writer.write_columns(vec![(0, a1), (1, b)]).await.unwrap();
+        writer.write_column(0, a1).await.unwrap();
+        writer.write_column(1, b).await.unwrap();
         let a2: ArrayRef = Arc::new(Int32Array::from(vec![4, 5]));
+        writer.write_column(0, a2).await.unwrap();
         // A zero-length array for an otherwise-unwritten field is a no-op.
         let c_empty: ArrayRef = Arc::new(Int32Array::from(Vec::<i32>::new()));
-        writer
-            .write_columns(vec![(0, a2), (2, c_empty)])
-            .await
-            .unwrap();
+        writer.write_column(2, c_empty).await.unwrap();
 
         let summary = writer.finish().await.unwrap();
         // The file's logical length is the longest column.
@@ -1305,6 +1297,137 @@ mod tests {
             )
             .await,
             vec![Some(1), Some(3), Some(5)],
+        );
+    }
+
+    /// Reading an unequal-length file:
+    /// - a projection whose columns are equal length full-scans normally;
+    /// - a full scan across columns of differing length is rejected up front,
+    ///   before any batch is produced (even though a prefix would be rectangular);
+    /// - a bounded read is valid as long as every projected column covers it;
+    /// - a single-column `RangeFull` resolves to that column's own length, not
+    ///   the file's (maximum) length.
+    #[rstest]
+    #[tokio::test]
+    async fn test_read_unequal_length_projection(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let fs = FsFixture::default();
+        let options = FileWriterOptions {
+            format_version: Some(version),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+        // "a" and "b" are equal length (5); "c" is shorter (1).
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])))
+            .await
+            .unwrap();
+        writer
+            .write_column(1, Arc::new(Int32Array::from(vec![6, 7, 8, 9, 10])))
+            .await
+            .unwrap();
+        writer
+            .write_column(2, Arc::new(Int32Array::from(vec![100])))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let read = |names: &'static [&'static str], params: ReadBatchParams| {
+            let projection =
+                ReaderProjection::from_column_names(version, &lance_schema, names).unwrap();
+            async {
+                match reader
+                    .read_stream_projected(
+                        params,
+                        1024,
+                        16,
+                        projection,
+                        FilterExpression::no_filter(),
+                    )
+                    .await
+                {
+                    Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await,
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let col_values = |batches: &[RecordBatch], idx: usize| -> Vec<Option<i32>> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    b.column(idx)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        // Equal-length projection [a, b] full-scans into rectangular batches.
+        let batches = read(&["a", "b"], ReadBatchParams::RangeFull).await.unwrap();
+        assert_eq!(
+            col_values(&batches, 0),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+        );
+        assert_eq!(
+            col_values(&batches, 1),
+            vec![Some(6), Some(7), Some(8), Some(9), Some(10)]
+        );
+
+        // A mismatched-length projection [a, c] (5 vs 1) is rejected before any
+        // batch is yielded, regardless of the read params — its columns cannot
+        // be combined into rectangular batches.
+        assert!(
+            read(&["a", "c"], ReadBatchParams::RangeFull).await.is_err(),
+            "full scan across unequal-length columns must error"
+        );
+        assert!(
+            read(&["a", "c"], ReadBatchParams::Range(0..1))
+                .await
+                .is_err(),
+            "even a common-prefix read of unequal-length columns must error"
+        );
+
+        // A single-column RangeFull resolves to that column's own length.
+        let batches = read(&["c"], ReadBatchParams::RangeFull).await.unwrap();
+        assert_eq!(col_values(&batches, 0), vec![Some(100)]);
+        let batches = read(&["a"], ReadBatchParams::RangeFull).await.unwrap();
+        assert_eq!(
+            col_values(&batches, 0),
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
         );
     }
 

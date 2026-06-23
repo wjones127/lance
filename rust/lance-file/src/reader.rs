@@ -495,7 +495,7 @@ impl FileReader {
     ///
     /// For ordinary (rectangular) files every column has the same length, equal
     /// to [`num_rows`](Self::num_rows). Files written with
-    /// [`FileWriter::write_columns`](crate::writer::FileWriter::write_columns)
+    /// [`FileWriter::write_column`](crate::writer::FileWriter::write_column)
     /// may have columns of differing lengths; this returns the length of one
     /// such column, derived by summing its pages' row counts. Returns `None` if
     /// `column_index` is out of bounds.
@@ -504,6 +504,72 @@ impl FileReader {
             .column_metadatas
             .get(column_index)
             .map(|col| col.pages.iter().map(|page| page.length).sum())
+    }
+
+    // Number of physical columns a field (and its descendants) contributes to a
+    // projection, mirroring `ReaderProjection::from_field_ids_helper`. Used to
+    // partition a projection's flat `column_indices` by top-level field.
+    fn count_projected_columns(field: &Field, is_structural: bool) -> usize {
+        let contributes = !is_structural
+            || field.children.is_empty()
+            || field.is_blob()
+            || field.is_packed_struct();
+        let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+        let mut count = contributes as usize;
+        if recurse {
+            for child in &field.children {
+                count += Self::count_projected_columns(child, is_structural);
+            }
+        }
+        count
+    }
+
+    // The top-level row count of each projected top-level field, in projection
+    // order. A field's length is the page-row sum of its root (first) physical
+    // column, which equals the field's top-level row count for primitive,
+    // struct, and list fields in both v2.0 and v2.1. Ordinary files have equal
+    // lengths across columns; files written with `write_column` may not.
+    fn projected_field_lengths(&self, projection: &ReaderProjection) -> Vec<u64> {
+        let is_structural = self.metadata.version() >= LanceFileVersion::V2_1;
+        let mut lengths = Vec::with_capacity(projection.schema.fields.len());
+        let mut cursor = 0usize;
+        for field in &projection.schema.fields {
+            let n = Self::count_projected_columns(field, is_structural);
+            if n == 0 {
+                continue;
+            }
+            let Some(&root_column) = projection.column_indices.get(cursor) else {
+                break;
+            };
+            lengths.push(self.column_num_rows(root_column as usize).unwrap_or(0));
+            cursor += n;
+        }
+        lengths
+    }
+
+    // The reader combines a projection's columns into rectangular batches, so
+    // they must all have the same length.  Returns that common length, or a
+    // descriptive error (naming the per-column lengths) when they differ.
+    // Ordinary files always pass; only files written with `write_column` whose
+    // columns ended up unequal can fail, and those must be read separately.
+    fn verify_uniform_lengths(projection: &ReaderProjection, field_lengths: &[u64]) -> Result<u64> {
+        let first = field_lengths.first().copied().unwrap_or(0);
+        if field_lengths.iter().all(|&len| len == first) {
+            return Ok(first);
+        }
+        let columns = projection
+            .schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .zip(field_lengths.iter().copied())
+            .map(|(name, len)| format!("{name}={len}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::invalid_input(format!(
+            "cannot read columns of differing lengths together ({columns}); \
+             read each column (or equal-length group) separately"
+        )))
     }
 
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
@@ -1236,11 +1302,18 @@ impl FileReader {
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
         Self::validate_projection(&projection, &self.metadata)?;
+        // All projected columns must share a length: the reader combines them
+        // into rectangular batches.  Ordinary files satisfy this (every column
+        // has `self.num_rows` rows); files written with `FileWriter::write_column`
+        // may not, and such columns must be read separately.  `read_len` is that
+        // common length, which `RangeFull`/`RangeFrom` resolve against (rather
+        // than `self.num_rows`, the file's longest column).
+        let field_lengths = self.projected_field_lengths(&projection);
+        let read_len = Self::verify_uniform_lengths(&projection, &field_lengths)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
-            if bound > self.num_rows || bound == self.num_rows && inclusive {
+            if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
-                    "cannot read {:?} from file with {} rows",
-                    params, self.num_rows
+                    "cannot read {params:?} from columns with {read_len} rows"
                 )))
             } else {
                 Ok(())
@@ -1282,13 +1355,8 @@ impl FileReader {
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
-                self.read_range(
-                    range.start as u64..self.num_rows,
-                    batch_size,
-                    projection,
-                    filter,
-                )
-                .await
+                self.read_range(range.start as u64..read_len, batch_size, projection, filter)
+                    .await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
@@ -1296,7 +1364,7 @@ impl FileReader {
                     .await
             }
             ReadBatchParams::RangeFull => {
-                self.read_range(0..self.num_rows, batch_size, projection, filter)
+                self.read_range(0..read_len, batch_size, projection, filter)
                     .await
             }
         }
@@ -1491,11 +1559,18 @@ impl FileReader {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
         Self::validate_projection(&projection, &self.metadata)?;
+        // All projected columns must share a length: the reader combines them
+        // into rectangular batches.  Ordinary files satisfy this (every column
+        // has `self.num_rows` rows); files written with `FileWriter::write_column`
+        // may not, and such columns must be read separately.  `read_len` is that
+        // common length, which `RangeFull`/`RangeFrom` resolve against (rather
+        // than `self.num_rows`, the file's longest column).
+        let field_lengths = self.projected_field_lengths(&projection);
+        let read_len = Self::verify_uniform_lengths(&projection, &field_lengths)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
-            if bound > self.num_rows || bound == self.num_rows && inclusive {
+            if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
-                    "cannot read {:?} from file with {} rows",
-                    params, self.num_rows
+                    "cannot read {params:?} from columns with {read_len} rows"
                 )))
             } else {
                 Ok(())
@@ -1536,7 +1611,7 @@ impl FileReader {
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
                 self.read_range_blocking(
-                    range.start as u64..self.num_rows,
+                    range.start as u64..read_len,
                     batch_size,
                     projection,
                     filter,
@@ -1547,7 +1622,7 @@ impl FileReader {
                 self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFull => {
-                self.read_range_blocking(0..self.num_rows, batch_size, projection, filter)
+                self.read_range_blocking(0..read_len, batch_size, projection, filter)
             }
         }
     }
