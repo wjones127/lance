@@ -31,8 +31,9 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta, pb,
+        BasePath, DataFile, DataOverlayFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata,
+        Manifest, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+        RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
@@ -258,6 +259,17 @@ pub struct Transaction {
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct DataReplacementGroup(pub u64, pub DataFile);
 
+/// Overlay files to append to a single fragment, in order (the last entry is
+/// newest). The overlays are appended to the fragment's existing `overlays`
+/// list rather than replacing it, so overlays written by concurrent commits are
+/// preserved. Each overlay's `committed_version` is stamped to the new dataset
+/// version at commit time (re-stamped on retry).
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
+pub struct DataOverlayGroup {
+    pub fragment_id: u64,
+    pub overlays: Vec<DataOverlayFile>,
+}
+
 /// An entry for a map update. If value is None, the key will be removed from the map.
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct UpdateMapEntry {
@@ -367,6 +379,11 @@ pub enum Operation {
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
     },
+    /// Attach overlay files to fragments, supplying new values for a subset of
+    /// `(row offset, field)` cells without rewriting the fragments' base data
+    /// files. See [`DataOverlayFile`] and the Data Overlay Files specification
+    /// for resolution, coverage, and versioning rules.
+    DataOverlay { groups: Vec<DataOverlayGroup> },
     /// Merge a new column in
     /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
@@ -499,6 +516,7 @@ impl std::fmt::Display for Operation {
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
             Self::DataReplacement { .. } => write!(f, "DataReplacement"),
+            Self::DataOverlay { .. } => write!(f, "DataOverlay"),
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
@@ -1345,6 +1363,16 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            // Data overlays are intentionally permissive, like DataReplacement.
+            // Two overlays stack (the higher committed_version wins each covered
+            // cell), and overlays are compatible with appends, deletes, column
+            // rewrites, and concurrent overlays. Only an operation that rewrites
+            // rows or otherwise invalidates physical offsets (Rewrite, which
+            // covers compaction and overlay->base folds) conflicts, since the
+            // overlay's physical offsets would no longer be valid.
+            (Self::DataOverlay { .. }, Self::Rewrite { .. })
+            | (Self::Rewrite { .. }, Self::DataOverlay { .. }) => true,
+            (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }
     }
 }
@@ -1521,6 +1549,7 @@ impl Operation {
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
             Self::DataReplacement { .. } => "DataReplacement",
+            Self::DataOverlay { .. } => "DataOverlay",
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
@@ -2300,6 +2329,42 @@ impl Transaction {
                     &replaced_fields,
                 );
             }
+            Operation::DataOverlay { groups } => {
+                // Stamp each overlay with the version this commit is producing.
+                // build_manifest re-runs on every retry with an updated
+                // current_manifest, so this is naturally re-stamped on retry.
+                let new_version = current_manifest.map_or(1, |m| m.version + 1);
+
+                let existing_fragments = maybe_existing_fragments?;
+                let overlays_by_fragment: HashMap<u64, &Vec<DataOverlayFile>> = groups
+                    .iter()
+                    .map(|g| (g.fragment_id, &g.overlays))
+                    .collect();
+
+                // Every group must target an existing fragment.
+                for fragment_id in overlays_by_fragment.keys() {
+                    if !existing_fragments.iter().any(|f| f.id == *fragment_id) {
+                        return Err(Error::invalid_input(format!(
+                            "DataOverlay targets fragment {fragment_id}, which does not exist"
+                        )));
+                    }
+                }
+
+                for fragment in existing_fragments {
+                    let mut fragment = fragment.clone();
+                    if let Some(new_overlays) = overlays_by_fragment.get(&fragment.id) {
+                        // Appended (not replaced) so concurrently-written overlays
+                        // survive; later entries are newer.
+                        fragment.overlays.extend(new_overlays.iter().cloned().map(
+                            |mut overlay| {
+                                overlay.committed_version = new_version;
+                                overlay
+                            },
+                        ));
+                    }
+                    final_fragments.push(fragment);
+                }
+            }
             Operation::UpdateMemWalState { merged_generations } => {
                 update_mem_wal_index_merged_generations(
                     &mut final_indices,
@@ -3007,6 +3072,34 @@ impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
     }
 }
 
+impl From<&DataOverlayGroup> for pb::transaction::DataOverlayGroup {
+    fn from(group: &DataOverlayGroup) -> Self {
+        Self {
+            fragment_id: group.fragment_id,
+            overlays: group
+                .overlays
+                .iter()
+                .map(pb::DataOverlayFile::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb::transaction::DataOverlayGroup> for DataOverlayGroup {
+    type Error = Error;
+
+    fn try_from(message: pb::transaction::DataOverlayGroup) -> Result<Self> {
+        Ok(Self {
+            fragment_id: message.fragment_id,
+            overlays: message
+                .overlays
+                .into_iter()
+                .map(DataOverlayFile::try_from)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
 impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
@@ -3289,16 +3382,14 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
-            Some(pb::transaction::Operation::DataOverlay(_)) => {
-                // Overlay files are not supported by this version of the library.
-                // A dataset that uses them sets reader feature flag 64, which is
-                // already rejected at the feature-flag layer; reject here too so a
-                // transaction referencing the operation can never be applied.
-                return Err(Error::not_supported(
-                    "data overlay files are not supported by this version of Lance \
-                     (reader feature flag 64)",
-                ));
-            }
+            Some(pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
+                groups,
+            })) => Operation::DataOverlay {
+                groups: groups
+                    .into_iter()
+                    .map(DataOverlayGroup::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+            },
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -3566,6 +3657,14 @@ impl From<&Transaction> for pb::Transaction {
                     replacements: replacements
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
+                        .collect(),
+                })
+            }
+            Operation::DataOverlay { groups } => {
+                pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
+                    groups: groups
+                        .iter()
+                        .map(pb::transaction::DataOverlayGroup::from)
                         .collect(),
                 })
             }
@@ -4158,6 +4257,7 @@ mod tests {
             physical_rows: Some(100),
             row_id_meta: None,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4190,6 +4290,7 @@ mod tests {
             physical_rows: Some(50),
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4222,6 +4323,7 @@ mod tests {
             physical_rows: Some(50), // More physical rows than existing row IDs
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4257,6 +4359,7 @@ mod tests {
             physical_rows: Some(50), // Less physical rows than existing row IDs
             row_id_meta: Some(RowIdMeta::Inline(serialized)),
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4285,6 +4388,7 @@ mod tests {
                 physical_rows: Some(30), // No existing row IDs
                 row_id_meta: None,
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
@@ -4294,6 +4398,7 @@ mod tests {
                 physical_rows: Some(25), // Partial existing row IDs
                 row_id_meta: Some(RowIdMeta::Inline(serialized)),
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
@@ -4338,6 +4443,7 @@ mod tests {
             physical_rows: None,
             row_id_meta: None,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
@@ -4845,6 +4951,7 @@ mod tests {
         let fragment = Fragment {
             id: 1,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
@@ -5114,6 +5221,7 @@ mod tests {
                 None,
             )],
             physical_rows: Some(10),
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             last_updated_at_version_meta: None,
@@ -5205,6 +5313,7 @@ mod tests {
         let prev_fragment = Fragment {
             id: 0,
             files: vec![mk_file("before.lance")],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
@@ -5277,6 +5386,7 @@ mod tests {
         let prev_fragment = Fragment {
             id: 0,
             files: vec![data_file.clone()],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: row_id_meta.clone(),
             physical_rows: Some(5),
@@ -5296,6 +5406,7 @@ mod tests {
         let merged_fragment = Fragment {
             id: 0,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta,
             physical_rows: Some(5),
@@ -5345,6 +5456,7 @@ mod tests {
         let prev_fragment = Fragment {
             id: 0,
             files: vec![mk_file("before.lance")],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(5),
@@ -5409,6 +5521,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 0,
             files: vec![mk_file("existing.lance")],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
             physical_rows: Some(3),
@@ -5431,6 +5544,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 1,
             files: vec![mk_file("new.lance")],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
             physical_rows: Some(4),
@@ -5493,6 +5607,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(3),
@@ -5506,6 +5621,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -5548,6 +5664,7 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_a_seq))),
                 physical_rows: Some(2),
@@ -5559,6 +5676,7 @@ mod tests {
             Fragment {
                 id: 2,
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&frag_b_seq))),
                 physical_rows: Some(3),
@@ -5574,6 +5692,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -5615,6 +5734,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
@@ -5629,6 +5749,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -5673,6 +5794,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
@@ -5686,6 +5808,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 20,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(4),
@@ -5719,6 +5842,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
@@ -5730,6 +5854,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(1),
@@ -5758,6 +5883,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
@@ -5768,6 +5894,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(3),
@@ -5798,6 +5925,7 @@ mod tests {
         let existing_fragment = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&existing_seq))),
             physical_rows: Some(2),
@@ -5811,6 +5939,7 @@ mod tests {
         let new_fragment = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(1),
@@ -5852,6 +5981,7 @@ mod tests {
         let in_range_frag = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&in_range_seq))),
             physical_rows: Some(2),
@@ -5872,6 +6002,7 @@ mod tests {
         let out_of_range_frag = Fragment {
             id: 2,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&out_of_range_seq))),
             physical_rows: Some(2),
@@ -5886,6 +6017,7 @@ mod tests {
         let new_frag = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -5924,6 +6056,7 @@ mod tests {
         let existing = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq))),
             physical_rows: Some(3),
@@ -5936,6 +6069,7 @@ mod tests {
         let new_frag = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -5984,6 +6118,7 @@ mod tests {
         let src_frag = Fragment {
             id: 1,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&src_seq))),
             physical_rows: Some(100),
@@ -5998,6 +6133,7 @@ mod tests {
         let new_frag = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(100),
@@ -6045,6 +6181,7 @@ mod tests {
             Fragment {
                 id: 1,
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_a))),
                 physical_rows: Some(3),
@@ -6056,6 +6193,7 @@ mod tests {
             Fragment {
                 id: 2,
                 files: vec![],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&seq_b))),
                 physical_rows: Some(3),
@@ -6071,6 +6209,7 @@ mod tests {
         let new_frag = Fragment {
             id: 10,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&new_seq))),
             physical_rows: Some(2),
@@ -6139,20 +6278,45 @@ mod tests {
     }
 
     #[test]
-    fn test_data_overlay_operation_rejected() {
-        // Overlay files are not supported by this version of the library. A
-        // transaction carrying the DataOverlay operation must be rejected rather
-        // than silently ignored, mirroring the feature-flag-64 rejection.
+    fn test_data_overlay_operation_roundtrips() {
+        // A DataOverlay operation survives the protobuf round-trip, preserving
+        // the target fragment, the overlay's coverage, and its committed_version.
+        use lance_table::format::{DataOverlayFile, OverlayCoverage};
+
+        let mut bitmap = roaring::RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(4);
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay-0.lance", vec![3], None),
+            coverage: OverlayCoverage::dense(&bitmap),
+            committed_version: 6,
+        };
+        let pb_overlay = pb::DataOverlayFile::from(&overlay);
+
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::DataOverlay(
-                pb::transaction::DataOverlay { groups: vec![] },
+                pb::transaction::DataOverlay {
+                    groups: vec![pb::transaction::DataOverlayGroup {
+                        fragment_id: 7,
+                        overlays: vec![pb_overlay],
+                    }],
+                },
             )),
             ..Default::default()
         };
 
-        let result = Transaction::try_from(message);
-        assert!(matches!(result, Err(Error::NotSupported { .. })));
+        let txn = Transaction::try_from(message).unwrap();
+        match txn.operation {
+            Operation::DataOverlay { groups } => {
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].fragment_id, 7);
+                assert_eq!(groups[0].overlays.len(), 1);
+                assert_eq!(groups[0].overlays[0].committed_version, 6);
+                assert_eq!(groups[0].overlays[0].coverage_for_field(0).unwrap(), bitmap);
+            }
+            other => panic!("expected DataOverlay, got {other:?}"),
+        }
     }
 }
