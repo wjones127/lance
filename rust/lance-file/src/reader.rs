@@ -491,6 +491,21 @@ impl FileReader {
         self.num_rows
     }
 
+    /// The number of rows stored in a single physical column.
+    ///
+    /// For ordinary (rectangular) files every column has the same length, equal
+    /// to [`num_rows`](Self::num_rows). Files written with
+    /// [`FileWriter::write_columns`](crate::writer::FileWriter::write_columns)
+    /// may have columns of differing lengths; this returns the length of one
+    /// such column, derived by summing its pages' row counts. Returns `None` if
+    /// `column_index` is out of bounds.
+    pub fn column_num_rows(&self, column_index: usize) -> Option<u64> {
+        self.metadata
+            .column_metadatas
+            .get(column_index)
+            .map(|col| col.pages.iter().map(|page| page.length).sum())
+    }
+
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
         &self.metadata
     }
