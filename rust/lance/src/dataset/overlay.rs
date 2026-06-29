@@ -19,24 +19,14 @@
 //! for a deleted offset is computed and then dropped with the row — making it
 //! inert, exactly as the specification requires, with no special handling here.
 
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use std::collections::{BTreeSet, HashMap};
+
+use arrow_array::{Array, ArrayRef};
 use arrow_select::interleave::interleave;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
 use lance_table::format::DataOverlayFile;
-
-/// One field's contribution from a single overlay: which physical offsets it
-/// covers, and the value column holding those offsets' values (indexed by rank).
-#[derive(Debug, Clone)]
-pub struct ResolvedFieldOverlay {
-    /// Physical offsets this overlay covers for the field.
-    pub coverage: RoaringBitmap,
-    /// The overlay's value column for the field. Its length must equal
-    /// `coverage.len()`; the value for a covered offset `o` is at `coverage`'s
-    /// rank of `o`.
-    pub values: ArrayRef,
-}
 
 /// Order a fragment's overlays from newest to oldest for read resolution.
 ///
@@ -54,108 +44,138 @@ pub fn overlay_indices_newest_first(overlays: &[DataOverlayFile]) -> Vec<usize> 
     indices
 }
 
-/// Resolve a single field's values for the rows whose physical offsets are given
-/// by `offsets` (one per base row, in the same order as `base`), merging the
-/// overlays that cover the field (which must be supplied newest-first).
+/// How a batch of physical row offsets routes onto a field's overlays.
 ///
-/// The result has the same length and data type as `base`. A covered offset
-/// whose overlay value is NULL resolves **to** NULL (distinct from an offset no
-/// overlay covers, which keeps its base value).
-pub fn resolve_overlay_column(
-    base: &ArrayRef,
-    offsets: &[u32],
-    overlays_newest_first: &[ResolvedFieldOverlay],
-) -> Result<ArrayRef> {
-    if offsets.len() != base.len() {
-        return Err(Error::invalid_input(format!(
-            "overlay resolution got {} offsets for a base column of {} rows",
-            offsets.len(),
-            base.len()
-        )));
+/// Produced by [`route_overlays`] from the coverage bitmaps alone — before any
+/// value column is read — so the caller can fetch only the ranks it actually
+/// needs (see [`OverlayRouting::needed_ranks`]) instead of the whole column, and
+/// then assemble the merged column with [`assemble_overlay_column`].
+pub struct OverlayRouting {
+    /// `interleave` source/position pairs, one per output row. Source `0` is the
+    /// base column (position = the row's index); source `k + 1` is overlay `k`'s
+    /// fetched values (position = the row's index within `needed_ranks[k]`).
+    indices: Vec<(usize, usize)>,
+    /// `needed_ranks[k]` is the sorted, deduplicated set of coverage ranks that
+    /// overlay `k` must supply for this batch — the indices to fetch from its
+    /// value column.
+    needed_ranks: Vec<Vec<u32>>,
+    /// Whether any row routes to an overlay at all (false ⇒ pure fall-through).
+    any_overlay: bool,
+}
+
+impl OverlayRouting {
+    /// The ranks each overlay (newest-first) must fetch from its value column.
+    pub fn needed_ranks(&self) -> &[Vec<u32>] {
+        &self.needed_ranks
     }
-    if overlays_newest_first.is_empty() {
+
+    /// True when no row is covered by any overlay, so the base column is the
+    /// answer unchanged and no value-column reads are needed.
+    pub fn all_fall_through(&self) -> bool {
+        !self.any_overlay
+    }
+}
+
+/// Decide, for each physical offset in `offsets`, which source supplies its
+/// value: the newest overlay whose coverage contains it (taken at the offset's
+/// 0-based rank in that coverage), or the base column if none covers it.
+///
+/// Reads only the coverage bitmaps (newest-first), so it can run before the
+/// value columns are fetched and tells the caller exactly which ranks to fetch.
+pub fn route_overlays(
+    offsets: &[u32],
+    coverages_newest_first: &[&RoaringBitmap],
+) -> OverlayRouting {
+    let mut rank_sets: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); coverages_newest_first.len()];
+    let mut raw: Vec<Option<(usize, u32)>> = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        let mut routed = None;
+        for (k, coverage) in coverages_newest_first.iter().enumerate() {
+            if coverage.contains(offset) {
+                // 0-based rank: number of set bits strictly below `offset`.
+                let rank = coverage.rank(offset) as u32 - 1;
+                rank_sets[k].insert(rank);
+                routed = Some((k, rank));
+                break;
+            }
+        }
+        raw.push(routed);
+    }
+
+    let needed_ranks: Vec<Vec<u32>> = rank_sets
+        .iter()
+        .map(|ranks| ranks.iter().copied().collect())
+        .collect();
+    let rank_positions: Vec<HashMap<u32, usize>> = needed_ranks
+        .iter()
+        .map(|ranks| ranks.iter().enumerate().map(|(pos, &r)| (r, pos)).collect())
+        .collect();
+
+    let mut any_overlay = false;
+    let indices = raw
+        .into_iter()
+        .enumerate()
+        .map(|(i, routed)| match routed {
+            None => (0, i),
+            Some((k, rank)) => {
+                any_overlay = true;
+                (k + 1, rank_positions[k][&rank])
+            }
+        })
+        .collect();
+
+    OverlayRouting {
+        indices,
+        needed_ranks,
+        any_overlay,
+    }
+}
+
+/// Assemble the merged column from `base` and the per-overlay values fetched for
+/// the ranks [`route_overlays`] asked for.
+///
+/// `fetched_newest_first[k]` holds overlay `k`'s values for `routing`'s
+/// `needed_ranks[k]`, in that order. The result has the same length and data
+/// type as `base`; a covered offset whose overlay value is NULL resolves **to**
+/// NULL (distinct from a fall-through, which keeps its base value).
+pub fn assemble_overlay_column(
+    base: &ArrayRef,
+    routing: &OverlayRouting,
+    fetched_newest_first: &[ArrayRef],
+) -> Result<ArrayRef> {
+    if routing.all_fall_through() {
         return Ok(base.clone());
     }
-    for (i, overlay) in overlays_newest_first.iter().enumerate() {
-        if overlay.values.len() as u64 != overlay.coverage.len() {
+    if fetched_newest_first.len() != routing.needed_ranks.len() {
+        return Err(Error::invalid_input(format!(
+            "overlay assembly got {} value columns but routing expects {}",
+            fetched_newest_first.len(),
+            routing.needed_ranks.len()
+        )));
+    }
+    for (k, values) in fetched_newest_first.iter().enumerate() {
+        if values.len() != routing.needed_ranks[k].len() {
             return Err(Error::invalid_input(format!(
-                "overlay value column {} has {} values but its coverage has {} offsets",
-                i,
-                overlay.values.len(),
-                overlay.coverage.len()
+                "overlay value column {} has {} values but {} ranks were requested",
+                k,
+                values.len(),
+                routing.needed_ranks[k].len()
             )));
         }
     }
 
-    // Source 0 is the base; source k+1 is overlays_newest_first[k].values.
-    let mut sources: Vec<&dyn Array> = Vec::with_capacity(overlays_newest_first.len() + 1);
+    let mut sources: Vec<&dyn Array> = Vec::with_capacity(fetched_newest_first.len() + 1);
     sources.push(base.as_ref());
-    for overlay in overlays_newest_first {
-        sources.push(overlay.values.as_ref());
+    for values in fetched_newest_first {
+        sources.push(values.as_ref());
     }
-
-    let indices: Vec<(usize, usize)> = offsets
-        .iter()
-        .enumerate()
-        .map(|(i, &offset)| {
-            for (k, overlay) in overlays_newest_first.iter().enumerate() {
-                if overlay.coverage.contains(offset) {
-                    // 0-based rank: number of set bits strictly below `offset`.
-                    let rank = overlay.coverage.rank(offset) as usize - 1;
-                    return (k + 1, rank);
-                }
-            }
-            (0, i)
-        })
-        .collect();
-
-    interleave(&sources, &indices).map_err(Error::from)
-}
-
-/// The overlays that apply to a single projected field, resolved (value columns
-/// loaded) and ordered newest-first. `field_name` is the top-level read-batch
-/// column name the plan applies to.
-#[derive(Debug, Clone)]
-pub struct FieldOverlayPlan {
-    pub field_name: String,
-    pub overlays_newest_first: Vec<ResolvedFieldOverlay>,
-}
-
-/// Merge overlay values into a read batch of base values.
-///
-/// `offsets[i]` is the physical row offset of `batch` row `i` (as produced by
-/// [`lance_io::ReadBatchParams::to_offsets_total`]). Each plan replaces the
-/// batch column whose name equals `plan.field_name`; columns with no plan, and
-/// the row-id/row-address system columns, pass through unchanged.
-///
-/// This runs on physical rows *before* deletion filtering, so an overlay value
-/// computed for a deleted row is dropped with the row downstream — giving
-/// deletions precedence with no special handling here.
-pub fn apply_overlays_to_batch(
-    batch: RecordBatch,
-    offsets: &[u32],
-    plans: &[FieldOverlayPlan],
-) -> Result<RecordBatch> {
-    if plans.is_empty() {
-        return Ok(batch);
-    }
-    let schema = batch.schema();
-    let mut columns = batch.columns().to_vec();
-    for plan in plans {
-        let Some(idx) = schema.index_of(&plan.field_name).ok() else {
-            // The plan's field is not in this batch's projection; skip it.
-            continue;
-        };
-        columns[idx] = resolve_overlay_column(&columns[idx], offsets, &plan.overlays_newest_first)?;
-    }
-    Ok(RecordBatch::try_new(schema, columns)?)
+    interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, StringArray, UInt32Array};
     use std::sync::Arc;
 
     fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
@@ -171,6 +191,29 @@ mod tests {
         (start..start + len as u32).collect()
     }
 
+    /// Drive the production flow purely in memory: route against the coverage
+    /// bitmaps, then fetch just the requested ranks from each overlay's *full*
+    /// value column (exactly what the rank-pushdown `take` does on disk), then
+    /// assemble. `overlays_newest_first` holds each overlay's `(coverage, full
+    /// value column indexed by rank)`.
+    fn resolve(
+        base: &ArrayRef,
+        offsets: &[u32],
+        overlays_newest_first: &[(RoaringBitmap, ArrayRef)],
+    ) -> ArrayRef {
+        let coverages: Vec<&RoaringBitmap> = overlays_newest_first.iter().map(|(c, _)| c).collect();
+        let routing = route_overlays(offsets, &coverages);
+        let fetched: Vec<ArrayRef> = overlays_newest_first
+            .iter()
+            .zip(routing.needed_ranks())
+            .map(|((_, full), ranks)| {
+                let indices = UInt32Array::from(ranks.clone());
+                arrow_select::take::take(full.as_ref(), &indices, None).unwrap()
+            })
+            .collect();
+        assemble_overlay_column(base, &routing, &fetched).unwrap()
+    }
+
     fn assert_i32_eq(actual: &ArrayRef, expected: impl IntoIterator<Item = Option<i32>>) {
         let actual = actual.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(actual, &Int32Array::from_iter(expected));
@@ -179,7 +222,7 @@ mod tests {
     #[test]
     fn test_no_overlays_returns_base() {
         let base = i32_array([Some(1), Some(2), Some(3)]);
-        let resolved = resolve_overlay_column(&base, &offsets(0, 3), &[]).unwrap();
+        let resolved = resolve(&base, &offsets(0, 3), &[]);
         assert_i32_eq(&resolved, [Some(1), Some(2), Some(3)]);
     }
 
@@ -187,11 +230,8 @@ mod tests {
     fn test_single_overlay_rank_addressing() {
         // Base ages [30, 25, 40, 22]; overlay sets offset 1 -> 26 (rank 0).
         let base = i32_array([Some(30), Some(25), Some(40), Some(22)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([1]),
-            values: i32_array([Some(26)]),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(0, 4), &[overlay]).unwrap();
+        let overlay = (bitmap([1]), i32_array([Some(26)]));
+        let resolved = resolve(&base, &offsets(0, 4), &[overlay]);
         assert_i32_eq(&resolved, [Some(30), Some(26), Some(40), Some(22)]);
     }
 
@@ -199,11 +239,11 @@ mod tests {
     fn test_rank_addressing_multiple_offsets() {
         // Coverage {0, 2, 3} -> values at ranks 0,1,2.
         let base = i32_array([Some(10), Some(11), Some(12), Some(13)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([0, 2, 3]),
-            values: i32_array([Some(100), Some(120), Some(130)]),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(0, 4), &[overlay]).unwrap();
+        let overlay = (
+            bitmap([0, 2, 3]),
+            i32_array([Some(100), Some(120), Some(130)]),
+        );
+        let resolved = resolve(&base, &offsets(0, 4), &[overlay]);
         assert_i32_eq(&resolved, [Some(100), Some(11), Some(120), Some(130)]);
     }
 
@@ -211,15 +251,9 @@ mod tests {
     fn test_newest_overlay_wins() {
         // Two overlays both cover offset 1; the newest (first in the slice) wins.
         let base = i32_array([Some(0), Some(1), Some(2)]);
-        let newest = ResolvedFieldOverlay {
-            coverage: bitmap([1]),
-            values: i32_array([Some(999)]),
-        };
-        let older = ResolvedFieldOverlay {
-            coverage: bitmap([1, 2]),
-            values: i32_array([Some(111), Some(222)]),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(0, 3), &[newest, older]).unwrap();
+        let newest = (bitmap([1]), i32_array([Some(999)]));
+        let older = (bitmap([1, 2]), i32_array([Some(111), Some(222)]));
+        let resolved = resolve(&base, &offsets(0, 3), &[newest, older]);
         // offset 1 -> newest (999); offset 2 -> only older covers it (222).
         assert_i32_eq(&resolved, [Some(0), Some(999), Some(222)]);
     }
@@ -229,11 +263,8 @@ mod tests {
         // A covered offset with a NULL value overrides the cell to NULL; an
         // absent offset falls through to the base.
         let base = i32_array([Some(1), Some(2), Some(3)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([0]),
-            values: i32_array([None]),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(0, 3), &[overlay]).unwrap();
+        let overlay = (bitmap([0]), i32_array([None]));
+        let resolved = resolve(&base, &offsets(0, 3), &[overlay]);
         assert_i32_eq(&resolved, [None, Some(2), Some(3)]);
     }
 
@@ -241,22 +272,19 @@ mod tests {
     fn test_physical_start_offset() {
         // The batch covers physical rows [10, 13); the overlay covers offset 11.
         let base = i32_array([Some(0), Some(0), Some(0)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([11]),
-            values: i32_array([Some(7)]),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(10, 3), &[overlay]).unwrap();
+        let overlay = (bitmap([11]), i32_array([Some(7)]));
+        let resolved = resolve(&base, &offsets(10, 3), &[overlay]);
         assert_i32_eq(&resolved, [Some(0), Some(7), Some(0)]);
     }
 
     #[test]
     fn test_string_column_merge() {
         let base: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([0, 2]),
-            values: Arc::new(StringArray::from(vec!["A", "C"])),
-        };
-        let resolved = resolve_overlay_column(&base, &offsets(0, 3), &[overlay]).unwrap();
+        let overlay = (
+            bitmap([0, 2]),
+            Arc::new(StringArray::from(vec!["A", "C"])) as ArrayRef,
+        );
+        let resolved = resolve(&base, &offsets(0, 3), &[overlay]);
         let expected: ArrayRef = Arc::new(StringArray::from(vec!["A", "b", "C"]));
         assert_eq!(&resolved, &expected);
     }
@@ -267,77 +295,42 @@ mod tests {
         // rows correspond to offsets 5, 1, 8 (in that order); the overlay covers
         // offsets {1, 8} with values at ranks 0, 1.
         let base = i32_array([Some(50), Some(10), Some(80)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([1, 8]),
-            values: i32_array([Some(11), Some(88)]),
-        };
-        let resolved = resolve_overlay_column(&base, &[5, 1, 8], &[overlay]).unwrap();
+        let overlay = (bitmap([1, 8]), i32_array([Some(11), Some(88)]));
+        let resolved = resolve(&base, &[5, 1, 8], &[overlay]);
         // offset 5 uncovered -> base 50; offset 1 -> rank 0 (11); offset 8 -> rank 1 (88).
         assert_i32_eq(&resolved, [Some(50), Some(11), Some(88)]);
     }
 
     #[test]
-    fn test_offset_count_mismatch_errors() {
-        let base = i32_array([Some(1), Some(2), Some(3)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([0]),
-            values: i32_array([Some(9)]),
-        };
-        // Two offsets for a three-row base column is a caller bug.
-        assert!(resolve_overlay_column(&base, &[0, 1], &[overlay]).is_err());
+    fn test_routing_dedups_repeated_ranks() {
+        // A `take` may request the same offset twice; both rows must route to the
+        // same rank, and that rank is fetched only once.
+        let coverage = bitmap([2, 5]);
+        let routing = route_overlays(&[5, 2, 5], &[&coverage]);
+        // Offset 5 is rank 1, offset 2 is rank 0: distinct ranks {0, 1}, sorted.
+        assert_eq!(routing.needed_ranks(), &[vec![0, 1]]);
+        let full = i32_array([Some(20), Some(50)]); // values at ranks 0, 1
+        let fetched = vec![
+            arrow_select::take::take(
+                full.as_ref(),
+                &UInt32Array::from(routing.needed_ranks()[0].clone()),
+                None,
+            )
+            .unwrap(),
+        ];
+        let base = i32_array([Some(0), Some(0), Some(0)]);
+        let resolved = assemble_overlay_column(&base, &routing, &fetched).unwrap();
+        assert_i32_eq(&resolved, [Some(50), Some(20), Some(50)]);
     }
 
     #[test]
-    fn test_value_count_mismatch_errors() {
+    fn test_assemble_value_count_mismatch_errors() {
+        let coverage = bitmap([0, 1]);
+        let routing = route_overlays(&[0, 1], &[&coverage]);
         let base = i32_array([Some(1), Some(2)]);
-        let overlay = ResolvedFieldOverlay {
-            coverage: bitmap([0, 1]),
-            values: i32_array([Some(9)]), // only one value for two covered offsets
-        };
-        assert!(resolve_overlay_column(&base, &offsets(0, 2), &[overlay]).is_err());
-    }
-
-    #[test]
-    fn test_apply_overlays_to_batch_per_field() {
-        // Two columns; only "age" has an overlay. "name" passes through.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("age", DataType::Int32, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                i32_array([Some(30), Some(25), Some(40)]),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-        let plans = vec![FieldOverlayPlan {
-            field_name: "age".to_string(),
-            overlays_newest_first: vec![ResolvedFieldOverlay {
-                coverage: bitmap([2, 5]),
-                values: i32_array([Some(26), Some(99)]),
-            }],
-        }];
-        // Batch rows map to physical offsets 4, 5, 6; only offset 5 is covered,
-        // and offset 5 is at rank 1 in coverage {2, 5}, so its value is 99.
-        let merged = apply_overlays_to_batch(batch, &[4, 5, 6], &plans).unwrap();
-        let ages = merged.column(0);
-        assert_i32_eq(ages, [Some(30), Some(99), Some(40)]);
-        let names = merged
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(names, &StringArray::from(vec!["a", "b", "c"]));
-    }
-
-    #[test]
-    fn test_apply_overlays_to_batch_empty_plans_is_noop() {
-        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int32, true)]));
-        let batch = RecordBatch::try_new(schema, vec![i32_array([Some(1), Some(2)])]).unwrap();
-        let merged = apply_overlays_to_batch(batch.clone(), &[0, 1], &[]).unwrap();
-        assert_eq!(merged, batch);
+        // One value supplied for two requested ranks is a caller bug.
+        let fetched = vec![i32_array([Some(9)])];
+        assert!(assemble_overlay_column(&base, &routing, &fetched).is_err());
     }
 
     #[test]

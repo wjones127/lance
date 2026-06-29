@@ -44,11 +44,11 @@ use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DataOverlayFile, DeletionFile, Fragment};
+use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
-    ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
+    ReadBatchFut, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
     wrap_with_row_id_and_delete,
 };
 use roaring::RoaringBitmap;
@@ -64,7 +64,7 @@ use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
-    FieldOverlayPlan, ResolvedFieldOverlay, apply_overlays_to_batch, overlay_indices_newest_first,
+    assemble_overlay_column, overlay_indices_newest_first, route_overlays,
 };
 use crate::io::deletion::read_dataset_deletion_file;
 
@@ -915,11 +915,24 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
+        // Open overlay value-column readers concurrently with the base files
+        // (no value bytes are read yet — that happens per batch on read).
+        let overlay_plan_load = if self.metadata.overlays.is_empty() {
+            futures::future::Either::Left(futures::future::ready(Ok(Vec::new())))
+        } else {
+            futures::future::Either::Right(self.load_overlay_plan(projection, &read_config))
+        };
+
+        let (opened_files, deletion_vec, row_id_sequence, overlay_plans) = join!(
+            open_files,
+            deletion_vec_load,
+            row_id_load,
+            overlay_plan_load
+        );
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
+        let overlay_plans = overlay_plans?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -942,9 +955,8 @@ impl FileFragment {
             Arc::new(self.metadata.clone()),
         )?;
 
-        if !self.metadata.overlays.is_empty() {
-            reader.overlay_plans =
-                Arc::new(self.load_overlay_plans(projection, &read_config).await?);
+        if !overlay_plans.is_empty() {
+            reader.overlay_plans = Arc::new(overlay_plans);
         }
 
         if read_config.with_row_id {
@@ -1122,24 +1134,60 @@ impl FileFragment {
         Ok(opened_files)
     }
 
-    /// Load the overlay value columns for the projected fields, ordered
+    /// Open the overlay value-column readers for the projected fields, ordered
     /// newest-first, ready to be merged into base batches on read.
+    ///
+    /// Each contributing overlay *file* is opened once (its metadata loaded),
+    /// projected to the fields it covers that the read also projects. The value
+    /// columns themselves are **not** read here — the per-batch merge fetches
+    /// only the coverage ranks it needs (see [`FragmentReader::merge_overlays`]),
+    /// so a `take` of a few rows no longer reads a whole overlay column.
     ///
     /// For each projected (top-level) field, the fragment's overlays are walked
     /// newest-first; an overlay contributes if its `data_file.fields` includes
-    /// the field, in which case the field's coverage bitmap and full value
-    /// column are loaded. Overlays on nested (non-top-level) fields are not yet
-    /// supported and are simply not matched here.
-    async fn load_overlay_plans(
+    /// the field. Overlays on nested (non-top-level) fields are not yet supported
+    /// and are simply not matched here.
+    async fn load_overlay_plan(
         &self,
         projection: &Schema,
         read_config: &FragReadConfig,
     ) -> Result<Vec<FieldOverlayPlan>> {
         let order = overlay_indices_newest_first(&self.metadata.overlays);
+
+        // Open each contributing overlay file once, concurrently. The reader is
+        // shared (via `Arc`) by every field that file covers.
+        //
+        // TODO(overlay perf): these reads use the default reader priority. Once
+        // we benchmark take/scan over overlays, decide whether overlay value
+        // reads should inherit `read_config.reader_priority` (or get a dedicated
+        // priority) so they schedule alongside the base reads.
+        let opened: Vec<Option<Arc<dyn GenericFileReader>>> =
+            futures::future::try_join_all(order.iter().map(|&overlay_idx| async move {
+                let overlay = &self.metadata.overlays[overlay_idx];
+                let covered: Vec<lance_core::datatypes::Field> = projection
+                    .fields
+                    .iter()
+                    .filter(|f| overlay.data_file.fields.contains(&f.id))
+                    .cloned()
+                    .collect();
+                if covered.is_empty() {
+                    return Ok::<_, Error>(None);
+                }
+                let schema = Schema {
+                    fields: covered,
+                    metadata: Default::default(),
+                };
+                Ok(self
+                    .open_reader(&overlay.data_file, Some(&schema), read_config)
+                    .await?
+                    .map(Arc::from))
+            }))
+            .await?;
+
         let mut plans = Vec::new();
         for field in &projection.fields {
-            let mut resolved = Vec::new();
-            for &overlay_idx in &order {
+            let mut overlays_newest_first = Vec::new();
+            for (slot, &overlay_idx) in order.iter().enumerate() {
                 let overlay = &self.metadata.overlays[overlay_idx];
                 let Some(field_pos) = overlay
                     .data_file
@@ -1149,63 +1197,26 @@ impl FileFragment {
                 else {
                     continue;
                 };
-                let coverage = overlay.coverage_for_field(field_pos)?;
-                let values = self
-                    .read_overlay_value_column(overlay, field, coverage.len(), read_config)
-                    .await?;
-                resolved.push(ResolvedFieldOverlay { coverage, values });
+                let Some(reader) = &opened[slot] else {
+                    continue;
+                };
+                overlays_newest_first.push(LoadedFieldOverlay {
+                    coverage: Arc::new(overlay.coverage_for_field(field_pos)?),
+                    reader: reader.clone(),
+                    field_projection: Arc::new(Schema {
+                        fields: vec![field.clone()],
+                        metadata: Default::default(),
+                    }),
+                });
             }
-            if !resolved.is_empty() {
+            if !overlays_newest_first.is_empty() {
                 plans.push(FieldOverlayPlan {
                     field_name: field.name.clone(),
-                    overlays_newest_first: resolved,
+                    overlays_newest_first,
                 });
             }
         }
         Ok(plans)
-    }
-
-    /// Read a single field's value column fully from an overlay data file.
-    ///
-    /// The value column has `num_values` rows (the popcount of the field's
-    /// coverage); position `r` holds the value for the offset whose rank is `r`.
-    async fn read_overlay_value_column(
-        &self,
-        overlay: &DataOverlayFile,
-        field: &lance_core::datatypes::Field,
-        num_values: u64,
-        read_config: &FragReadConfig,
-    ) -> Result<ArrayRef> {
-        if num_values == 0 {
-            return Ok(arrow_array::new_empty_array(&field.data_type()));
-        }
-        let single_field = Schema {
-            fields: vec![field.clone()],
-            metadata: Default::default(),
-        };
-        let reader = self
-            .open_reader(&overlay.data_file, Some(&single_field), read_config)
-            .await?
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "overlay data file {} does not contain field {} (id {})",
-                    overlay.data_file.path, field.name, field.id
-                ))
-            })?;
-        let mut tasks = reader
-            .read_range_tasks(
-                0..num_values,
-                num_values as u32,
-                reader.projection().clone(),
-            )
-            .await?;
-        let mut chunks: Vec<ArrayRef> = Vec::new();
-        while let Some(task) = tasks.next().await {
-            let batch = task.task.await?;
-            chunks.push(batch.column(0).clone());
-        }
-        let chunk_refs: Vec<&dyn arrow_array::Array> = chunks.iter().map(|a| a.as_ref()).collect();
-        Ok(arrow_select::concat::concat(&chunk_refs)?)
     }
 
     /// Count the rows in this fragment.
@@ -2084,6 +2095,106 @@ impl From<FileFragment> for Fragment {
     }
 }
 
+/// One overlay's contribution to one projected field: which physical offsets it
+/// covers, and an opened (but unread) reader over the overlay file from which the
+/// field's value column is fetched by coverage rank at merge time.
+#[derive(Debug, Clone)]
+struct LoadedFieldOverlay {
+    /// Physical offsets this overlay covers for the field.
+    coverage: Arc<RoaringBitmap>,
+    /// Reader over the overlay data file, projected to this field; shared across
+    /// the fields that the same file covers.
+    reader: Arc<dyn GenericFileReader>,
+    /// Single-field projection used when fetching the value column.
+    field_projection: Arc<Schema>,
+}
+
+/// The overlays that apply to a single projected field, ordered newest-first.
+/// `field_name` is the top-level read-batch column name the plan applies to.
+#[derive(Debug, Clone)]
+struct FieldOverlayPlan {
+    field_name: String,
+    overlays_newest_first: Vec<LoadedFieldOverlay>,
+}
+
+/// Resolve overlays for one base batch: route each projected field against the
+/// batch's physical `offsets`, fetch only the coverage ranks the batch touches
+/// (concurrently with the base read), and assemble the merged columns. Fields
+/// with no plan, and the row-id/row-address system columns, pass through.
+async fn merge_overlay_batch(
+    base: ReadBatchFut,
+    offsets: &[u32],
+    plans: &[FieldOverlayPlan],
+) -> Result<RecordBatch> {
+    let field_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
+        let coverages: Vec<&RoaringBitmap> = plan
+            .overlays_newest_first
+            .iter()
+            .map(|overlay| overlay.coverage.as_ref())
+            .collect();
+        let routing = route_overlays(offsets, &coverages);
+        if routing.all_fall_through() {
+            return Ok::<_, Error>((plan.field_name.as_str(), None));
+        }
+        let fetched = futures::future::try_join_all(
+            plan.overlays_newest_first
+                .iter()
+                .zip(routing.needed_ranks())
+                .map(|(overlay, ranks)| {
+                    fetch_overlay_ranks(
+                        overlay.reader.as_ref(),
+                        overlay.field_projection.clone(),
+                        ranks,
+                    )
+                }),
+        )
+        .await?;
+        Ok((plan.field_name.as_str(), Some((routing, fetched))))
+    }));
+
+    // The base read and every overlay value read proceed concurrently.
+    let (batch, resolved) = futures::future::try_join(base, field_work).await?;
+
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    for (field_name, work) in resolved {
+        let Some((routing, fetched)) = work else {
+            continue;
+        };
+        let Some(idx) = schema.index_of(field_name).ok() else {
+            // The plan's field is not in this batch's projection; skip it.
+            continue;
+        };
+        columns[idx] = assemble_overlay_column(&columns[idx], &routing, &fetched)?;
+    }
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Fetch one overlay's value column at the given coverage `ranks` (sorted and
+/// unique). Returns a column of `ranks.len()` values aligned with `ranks`; an
+/// empty `ranks` reads nothing and yields an empty column.
+async fn fetch_overlay_ranks(
+    reader: &dyn GenericFileReader,
+    projection: Arc<Schema>,
+    ranks: &[u32],
+) -> Result<ArrayRef> {
+    if ranks.is_empty() {
+        return Ok(arrow_array::new_empty_array(
+            &projection.fields[0].data_type(),
+        ));
+    }
+    let mut tasks = reader
+        .take_all_tasks(ranks, ranks.len() as u32, projection, None)
+        .await?;
+    let mut chunks: Vec<ArrayRef> = Vec::new();
+    while let Some(task) = tasks.next().await {
+        let batch = task.task.await?;
+        chunks.push(batch.column(0).clone());
+    }
+    let chunk_refs: Vec<&dyn arrow_array::Array> = chunks.iter().map(|a| a.as_ref()).collect();
+    Ok(arrow_select::concat::concat(&chunk_refs)?)
+}
+
 /// [`FragmentReader`] is an abstract reader for a [`FileFragment`].
 ///
 /// It opens the data files that contains the columns of the projection schema, and
@@ -2502,6 +2613,11 @@ impl FragmentReader {
     /// row can be addressed by its physical offset (from `params`) and deletions
     /// take precedence naturally (an overlay value for a deleted row is dropped
     /// with the row downstream). A no-op when the fragment has no overlays.
+    ///
+    /// Each batch's physical offsets are known from `params` and the task's
+    /// `num_rows` without reading any data, so the overlay value reads (only the
+    /// coverage ranks the batch actually touches) are issued concurrently with
+    /// the base read rather than after it.
     fn merge_overlays(
         &self,
         merged: ReadBatchTaskStream,
@@ -2526,9 +2642,8 @@ impl FragmentReader {
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let batch = inner.await?;
-                        let slice = &offsets[start..start + batch.num_rows()];
-                        apply_overlays_to_batch(batch, slice, &plans)
+                        let slice = &offsets[start..start + num_rows as usize];
+                        merge_overlay_batch(inner, slice, &plans).await
                     }
                     .boxed(),
                 }
@@ -3327,6 +3442,86 @@ mod tests {
                 })
                 .collect();
             assert_eq!(col(&batch, "val").values(), &expected);
+        }
+
+        /// A `take` of a few rows must read only the overlay value-column ranks
+        /// those rows touch — not the whole column. Uses v2.1 (which slices pages
+        /// on read) and an incompressible, all-covering overlay, so reading the
+        /// full column would be far more bytes than reading a couple of ranks.
+        /// This is the regression guard for the lazy, rank-pushdown overlay read.
+        #[tokio::test]
+        async fn test_take_reads_only_needed_overlay_ranks() {
+            let version = LanceFileVersion::V2_1;
+            const N: usize = 100_000;
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let base = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..N as i32)),
+                    Arc::new(Int32Array::from_iter_values((0..N as i32).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: N,
+                max_rows_per_group: N,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(base)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `val` over ALL N offsets with incompressible values, so the
+            // value column is ~N*4 bytes on disk.
+            let values: Vec<i32> = (0..N as u64)
+                .map(|i| {
+                    let mut x = i;
+                    x ^= x >> 33;
+                    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                    x ^= x >> 33;
+                    x as i32
+                })
+                .collect();
+            let dataset = commit_overlay(
+                dataset,
+                "big",
+                0,
+                &[1],
+                OverlayCoverage::dense(&bitmap(0..N as u32)),
+                vec![Arc::new(Int32Array::from(values.clone())) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // Measure only the reads that resolve the take.
+            dataset.object_store.io_stats_incremental();
+            let batch = frag.take(&[0, 1], &val_only).await.unwrap();
+            let io = dataset.object_store.io_stats_incremental();
+
+            // The overlay's `val` column alone is N*4 bytes; resolving two adjacent
+            // offsets must read only a small fraction of it.
+            let full_column_bytes = (N * std::mem::size_of::<i32>()) as u64;
+            assert!(
+                io.read_bytes > 0 && io.read_bytes < full_column_bytes / 4,
+                "take read {} bytes; expected far less than the {}-byte overlay \
+                 column (a take must not read the whole value column)",
+                io.read_bytes,
+                full_column_bytes,
+            );
+
+            // ...and it still resolves correctly.
+            let val = col(&batch, "val");
+            assert_eq!(val.value(0), values[0]);
+            assert_eq!(val.value(1), values[1]);
         }
     }
 
