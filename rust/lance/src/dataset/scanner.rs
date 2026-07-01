@@ -4121,7 +4121,9 @@ impl Scanner {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         // Fragments with a newer overlay on an indexed field hold values the index has not
         // seen, so their index entries may be stale. Treat them as not covered: they fall to
-        // the flat path and are re-evaluated against their current (overlay-merged) values.
+        // the flat path via `missing_frags` and are re-evaluated against their current
+        // (overlay-merged) values. Unlike the vector path, stale_frags need not be threaded
+        // further — the flat-path re-evaluation already handles them via `missing_frags`.
         let stale_frags = self
             .overlay_stale_index_frags(index_expr, &fragments)
             .await?;
@@ -4162,7 +4164,8 @@ impl Scanner {
         let frag_by_id: std::collections::HashMap<u32, &Fragment> =
             fragments.iter().map(|f| (f.id as u32, f)).collect();
 
-        // Collect the leaf index searches referenced by the (boolean) index query.
+        // Walk the (boolean) index expression tree to collect leaf searches. `ScalarIndexExpr`
+        // doesn't expose a visitor, so we traverse it manually.
         let mut searches = Vec::new();
         let mut stack = vec![index_expr];
         while let Some(expr) = stack.pop() {
@@ -4176,6 +4179,9 @@ impl Scanner {
             }
         }
 
+        // `load_named_scalar_segments` returns cached index metadata — no disk I/O on the hot
+        // path. Even without the cache, this code is only reached when at least one fragment has
+        // overlays (rare), so the per-leaf cost is acceptable.
         let mut stale = RoaringBitmap::new();
         for search in searches {
             let segments = load_named_scalar_segments(
