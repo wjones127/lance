@@ -28,7 +28,6 @@ from typing import (
     Literal,
     Optional,
     Sequence,
-    Set,
     Tuple,
     TypedDict,
     Union,
@@ -55,6 +54,7 @@ from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
+    Bitmap,
     CleanupExplanation,
     CleanupStats,
     Compaction,
@@ -5966,7 +5966,9 @@ class Index:
     name: str
     fields: List[int]
     dataset_version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
+    """The fragments covered by this index. A ``Set[int]``/``List[int]`` is
+    also accepted when constructing an ``Index``."""
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
@@ -5984,7 +5986,7 @@ class IndexInformation(TypedDict):
     uuid: str
     fields: List[str]
     version: int
-    fragment_ids: Set[int]
+    fragment_ids: Bitmap
     base_id: Optional[int]
 
 
@@ -6408,9 +6410,10 @@ class LanceOperation:
         layered over the base data without rewriting the base files.
 
         The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
-        every field in ``data_file``) or a ``List[List[int]]`` for a sparse
-        overlay (one offset list per field, in the order of the file's fields).
+        pass a single :class:`~lance.bitmap.Bitmap` (or flat ``List[int]``) for
+        a dense overlay (one offset set shared by every field in
+        ``data_file``), or a list of ``Bitmap``/``List[int]`` for a sparse
+        overlay (one offset set per field, in the order of the file's fields).
         Offsets are **physical** row offsets (positions in the base files,
         counting deleted rows), like deletion vectors.
 
@@ -6421,12 +6424,15 @@ class LanceOperation:
             value column per covered field. The value at each covered offset is
             stored at the rank (0-based count of covered offsets below it) of
             that offset in the field's coverage.
-        offsets : Union[List[int], List[List[int]]]
-            The covered physical row offsets. A flat list is dense coverage
-            (shared by every field); a list of per-field lists is sparse
-            coverage (in field order). Each list must be strictly ascending
-            with no duplicates, since the Nth offset maps to the Nth value row
-            in ``data_file``; a non-ascending list raises ``ValueError``.
+        offsets : Union[Bitmap, List[Bitmap], List[int], List[List[int]]]
+            The covered physical row offsets. A single ``Bitmap``/flat
+            ``List[int]`` is dense coverage (shared by every field); a list of
+            ``Bitmap``/per-field lists is sparse coverage (in field order).
+            When passing a raw ``List[int]``/``List[List[int]]``, each list
+            must be strictly ascending with no duplicates, since the Nth
+            offset maps to the Nth value row in ``data_file``; a non-ascending
+            list raises ``ValueError``. A ``Bitmap`` has no such restriction —
+            it is always canonically sorted and deduplicated.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.
@@ -6435,7 +6441,7 @@ class LanceOperation:
         """
 
         data_file: DataFile
-        offsets: Union[List[int], List[List[int]]]
+        offsets: Union[Bitmap, List[Bitmap], List[int], List[List[int]]]
         committed_version: Optional[int] = None
 
     @dataclass
