@@ -308,6 +308,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
