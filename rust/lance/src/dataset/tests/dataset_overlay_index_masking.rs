@@ -1104,3 +1104,232 @@ async fn bench_index_query_overlay_overhead() {
         println!("{num_vec_overlays:>12}  {ann_ms:>10.1}");
     }
 }
+
+async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("age", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids.clone())),
+            Arc::new(Int32Array::from_iter_values(ids.map(|v| v * 10))),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+// `OptimizeIndices` merges an index's delta segments without re-reading data overlays, but used
+// to stamp the merged segment with the current `dataset_version`. That flipped the overlay mask's
+// version gate (`overlay.committed_version > segment.dataset_version`) off, un-masking the stale
+// pre-overlay entries the merge had carried over. The merge now drops overlay-stale fragments from
+// the new segment's coverage (and, for scalar types, filters their old entries out via
+// `OldIndexDataFilter`) so those fragments fall to the flat path against current values. The
+// following tests reproduce the un-masking for each index type and assert it stays masked.
+
+/// Scalar (BTree, Bitmap): a range query over the indexed column after an overlay + optimize must
+/// still drop the stale value and surface the overlaid one.
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::BuiltinIndexType;
+
+    let params = match index_type {
+        IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+        _ => ScalarIndexParams::default(),
+    };
+    let mut dataset = create_base_dataset().await;
+    dataset
+        .create_index(&["age"], index_type, None, &params, true)
+        .await
+        .unwrap();
+
+    // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
+    let mut dataset = commit_overlay(
+        dataset,
+        "age_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Masking works before optimize.
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Append an unindexed fragment so the merge does real work, then merge all deltas.
+    append_age_fragment(&mut dataset, 12..18).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: the stale age=10 entry stays dropped and the overlaid age=999 value stays
+    // visible (fragment 0 is dropped from index coverage and re-evaluated on the flat path).
+    assert_eq!(
+        ids_matching(&dataset, "age = 10").await,
+        Vec::<i32>::new(),
+        "stale index entry age=10 for id=1 resurfaced after optimize"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![1],
+        "overlaid value age=999 dropped after optimize"
+    );
+    // A row untouched by the overlay is unaffected.
+    assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+/// FTS: after an overlay replaces a row's text and the index is optimized, searching for the old
+/// terms must not return the stale row, and the new terms must find it.
+#[tokio::test]
+async fn test_optimize_preserves_fts_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    let mut dataset = create_text_dataset().await;
+    build_text_fts_index(&mut dataset).await;
+
+    // fragment 0, offset 1 (id=1): "apple banana" -> "cherry mango".
+    let mut dataset = commit_overlay(
+        dataset,
+        "text_opt",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // Masking works before optimize: id=1 no longer matches "banana"/"apple".
+    assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3]);
+    assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0]);
+
+    // Append an unindexed fragment of new text, then merge all deltas.
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(12..18)),
+            Arc::new(StringArray::from(vec![
+                "kiwi", "melon", "date", "guava", "papaya", "lychee",
+            ])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=1's stale "apple"/"banana" postings stay dropped.
+    assert_eq!(
+        fts_ids_matching(&dataset, "banana").await,
+        vec![3],
+        "stale FTS posting for id=1 (banana) resurfaced after optimize"
+    );
+    assert_eq!(
+        fts_ids_matching(&dataset, "apple").await,
+        vec![0],
+        "stale FTS posting for id=1 (apple) resurfaced after optimize"
+    );
+    // The overlaid terms are found via the flat path.
+    assert!(fts_ids_matching(&dataset, "cherry").await.contains(&1));
+    assert!(fts_ids_matching(&dataset, "mango").await.contains(&1));
+}
+
+/// Vector (IVF): after an overlay moves a row's vector and the index is optimized, the ANN must
+/// not resurface the stale vector, and the moved-onto-query row is found by flat re-scoring.
+#[tokio::test]
+async fn test_optimize_preserves_vector_overlay_masking() {
+    use crate::index::DatasetIndexExt;
+    use lance_index::optimize::OptimizeOptions;
+
+    // Overlay on fragment 1 moves id=35 away from the query and id=40 onto it.
+    let mut dataset = create_vector_overlay_dataset(false).await;
+
+    // Masking works before optimize.
+    let before = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !before.contains(&35),
+        "pre-optimize id=35 should be dropped: {before:?}"
+    );
+    assert!(
+        before.contains(&40),
+        "pre-optimize id=40 should be found: {before:?}"
+    );
+
+    // Append an unindexed fragment of far vectors, then merge all deltas.
+    let far_vecs: Vec<Vec<f32>> = (0..32)
+        .map(|i| {
+            let mut v = vec![0.0_f32; VEC_DIM as usize];
+            v[1] = (i + 200) as f32;
+            v
+        })
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                VEC_DIM,
+            ),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(64..96)),
+            fsl(far_vecs, VEC_DIM),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+
+    // Still masked: id=35's stale vector stays dropped and id=40 is still found via re-scoring.
+    let after = vector_query_ids(&dataset, 3, false).await;
+    assert!(
+        !after.contains(&35),
+        "stale index vector for id=35 resurfaced after optimize: {after:?}"
+    );
+    assert!(
+        after.contains(&40),
+        "overlaid vector for id=40 dropped after optimize: {after:?}"
+    );
+}

@@ -26,11 +26,14 @@ use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use super::DatasetIndexInternalExt;
 use super::vector::LogicalVectorIndex;
 use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_rebalance};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::overlay::{collect_overlay_stale_frags, overlaid_fragments};
 use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::index::vector_index_details_default;
@@ -133,24 +136,55 @@ pub async fn build_old_data_filter(
     }
 }
 
-/// Split the stored fragment coverage of `segments` into fragments still live in
-/// `dataset` (`effective`) and fragments that compaction or deletion has already
-/// retired (`deleted`).
+/// One segment's live coverage split into fragments the merge keeps on the indexed path
+/// (`effective`) and fragments whose old index entries must be dropped (`retired`).
+///
+/// `retired` unions two causes: fragments no longer in the dataset (compaction/deletion), and
+/// fragments carrying a data overlay this merge will *not* incorporate -- one committed after the
+/// segment was built (`committed_version > segment.dataset_version`) that touches a field the
+/// segment indexes. A merge carries a segment's stored entries without re-reading overlaid values,
+/// so such a fragment's indexed values are stale; dropping it from coverage and filtering its old
+/// entries out routes the whole fragment to the flat path, which reads current (overlay-merged)
+/// values. Mirrors `prune_overlay_stale_fields_from_indices`, which does the same for overlays a
+/// compaction has baked into rewritten fragments.
+fn segment_coverage_split(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+    overlaid_frags: &HashMap<u32, &Fragment>,
+) -> Result<(RoaringBitmap, RoaringBitmap)> {
+    let mut effective = segment
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap_or_default();
+    let mut retired = segment
+        .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+        .unwrap_or_default();
+    let mut stale = RoaringBitmap::new();
+    collect_overlay_stale_frags(segment, overlaid_frags, &mut stale)?;
+    // Only still-live fragments matter for coverage; a stale fragment already retired above is a
+    // no-op in both directions.
+    stale &= &effective;
+    effective -= &stale;
+    retired |= stale;
+    Ok((effective, retired))
+}
+
+/// Split the fragment coverage of `segments` into fragments the merge keeps on the indexed path
+/// (`effective`) and fragments whose entries must be dropped (`retired`): those retired by
+/// compaction/deletion, plus those carrying an overlay the merge won't incorporate. See
+/// [`segment_coverage_split`].
 pub fn split_segment_coverage<'a>(
     dataset: &Dataset,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
-) -> (RoaringBitmap, RoaringBitmap) {
+) -> Result<(RoaringBitmap, RoaringBitmap)> {
+    let overlaid = overlaid_fragments(&dataset.manifest.fragments);
     let mut effective = RoaringBitmap::new();
-    let mut deleted = RoaringBitmap::new();
+    let mut retired = RoaringBitmap::new();
     for segment in segments {
-        if let Some(eff) = segment.effective_fragment_bitmap(&dataset.fragment_bitmap) {
-            effective |= eff;
-        }
-        if let Some(del) = segment.deleted_fragment_bitmap(&dataset.fragment_bitmap) {
-            deleted |= del;
-        }
+        let (eff, ret) = segment_coverage_split(dataset, segment, &overlaid)?;
+        effective |= eff;
+        retired |= ret;
     }
-    (effective, deleted)
+    Ok((effective, retired))
 }
 
 /// Build one [`OldIndexDataFilter`] per segment, each derived from that segment's
@@ -160,6 +194,7 @@ pub async fn build_per_segment_filters(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
 ) -> Result<(RoaringBitmap, Vec<Option<OldIndexDataFilter>>)> {
+    let overlaid = overlaid_fragments(&dataset.manifest.fragments);
     let mut effective_union = RoaringBitmap::new();
     let mut filters = Vec::with_capacity(segments.len());
     for segment in segments {
@@ -169,14 +204,9 @@ pub async fn build_per_segment_filters(
                 segment.uuid
             )));
         }
-        let effective = segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-            .unwrap_or_default();
-        let deleted = segment
-            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
-            .unwrap_or_default();
+        let (effective, retired) = segment_coverage_split(dataset, segment, &overlaid)?;
         effective_union |= &effective;
-        filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
+        filters.push(build_old_data_filter(dataset, &effective, &retired).await?);
     }
     Ok((effective_union, filters))
 }
@@ -406,9 +436,10 @@ async fn merge_scalar_indices<'a>(
         .await?;
     let update_criteria = reference_index.update_criteria();
 
-    // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
-    let (effective_old_frags, deleted_old_frags) =
-        split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied());
+    // Effective = fragments the merge keeps indexed; retired = fragments whose old entries must
+    // be dropped (retired by compaction/deletion, or stale under an unincorporated overlay).
+    let (effective_old_frags, retired_old_frags) =
+        split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied())?;
 
     let mut frag_bitmap = base_unindexed_bitmap.clone();
     frag_bitmap |= &effective_old_frags;
@@ -498,7 +529,7 @@ async fn merge_scalar_indices<'a>(
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
-                        &deleted_old_frags,
+                        &retired_old_frags,
                     )
                     .await?;
                     reference_index
@@ -866,15 +897,19 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 )
                 .await?;
 
+                let overlaid = overlaid_fragments(&dataset.manifest.fragments);
                 let mut frag_bitmap = base_unindexed_bitmap;
                 let mut effective_old_frags = RoaringBitmap::new();
+                let mut retired_old_frags = RoaringBitmap::new();
                 let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
                 for idx in &selected_old_indices {
-                    if let Some(effective) = idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
-                    {
-                        frag_bitmap |= &effective;
-                        effective_old_frags |= &effective;
-                    }
+                    // Drop fragments carrying an unincorporated overlay from coverage (see
+                    // `segment_coverage_split`); they fall to the flat FTS path with current values.
+                    let (effective, retired) =
+                        segment_coverage_split(dataset.as_ref(), idx, &overlaid)?;
+                    frag_bitmap |= &effective;
+                    effective_old_frags |= &effective;
+                    retired_old_frags |= retired;
                     let scalar_index = dataset
                         .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                         .await?;
@@ -900,7 +935,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 } else {
                     Some(OldIndexDataFilter::Fragments {
                         to_keep: effective_old_frags,
-                        to_remove: RoaringBitmap::new(),
+                        to_remove: retired_old_frags,
                     })
                 };
 
@@ -960,6 +995,28 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             ))),
         }
     }?;
+
+    // A vector merge carries the old segments' quantized codes without re-reading overlaid values,
+    // and vector indices have no `OldIndexDataFilter` to drop stale postings. Instead, drop
+    // overlay-stale fragments from the new segment's coverage: the ANN prefilter is an allow-list
+    // restricted to coverage (see `DatasetPreFilter::new`), so their stale codes are blocked, and
+    // `knn_combined` re-scores those fragments on the flat path against current (overlay-merged)
+    // values. The scalar path already excludes these fragments (and filters their entries) inside
+    // `merge_scalar_indices`.
+    let new_fragment_bitmap = if first_is_vector_index {
+        let overlaid = overlaid_fragments(&dataset.manifest.fragments);
+        if overlaid.is_empty() {
+            new_fragment_bitmap
+        } else {
+            let mut stale = RoaringBitmap::new();
+            for &segment in &removed_indices {
+                collect_overlay_stale_frags(segment, &overlaid, &mut stale)?;
+            }
+            &new_fragment_bitmap - &stale
+        }
+    } else {
+        new_fragment_bitmap
+    };
 
     Ok(Some(IndexMergeResults {
         new_uuid,
