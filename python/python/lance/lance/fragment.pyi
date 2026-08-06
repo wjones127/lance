@@ -134,6 +134,14 @@ class RowIdSequence:
         sequence = RowIdSequence([7, 12])
         fragment = FragmentMetadata(..., row_id_meta=sequence.to_inline_metadata())
 
+    The sequence may be shorter than the fragment's ``physical_rows``. The ids
+    bind to the leading rows and the commit mints ids for the remaining ones,
+    which is how a fragment holding both rewritten and newly inserted rows is
+    expressed: write the rewritten rows first and supply only their ids. Passing
+    more ids than the fragment has rows is rejected. Do not mint ids for new rows
+    yourself -- they come from a counter in the manifest that a concurrent commit
+    can advance, so only the commit knows which values are free.
+
     Parameters
     ----------
     row_ids : range | pa.Array | pa.ChunkedArray | Iterable[int]
