@@ -201,6 +201,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+const OFFSETS_SHAPE_ERR: &str = "DataOverlayFile.offsets must be an iterable of ints (dense coverage shared by every \
+     field) or an iterable of per-field int iterables (sparse coverage)";
+
 // Accept either a `Bitmap` (cheap `Arc` clone) or any other iterable of ints
 // (a `set`, `list`, etc.), collected in whatever order the iterable yields —
 // `RoaringBitmap` itself defines the canonical (ascending, deduplicated)
@@ -223,13 +226,46 @@ fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
         .collect::<PyResult<RoaringBitmap>>()
 }
 
-// Extract `offsets` as a sparse (per-field) coverage: an iterable of
-// `Bitmap`s/int iterables, one per field.
-fn extract_sparse_bitmaps(offsets: &Bound<'_, PyAny>) -> PyResult<Vec<RoaringBitmap>> {
-    offsets
-        .try_iter()?
-        .map(|item| extract_bitmap(&item?))
-        .collect()
+// Resolve `offsets` into a dense (one coverage shared by every field) or
+// sparse (one per field) `OverlayCoverage`, deciding by shape: a `Bitmap` or
+// an iterable of ints is dense, an iterable of `Bitmap`s/int iterables is
+// sparse.
+//
+// The items are drained into a `Vec` before the shape is decided, because
+// `offsets` may be a one-shot iterable (a generator). Probing the dense shape
+// by iterating and then re-iterating for the sparse shape would silently drop
+// whatever the first pass consumed — committing truncated or empty coverage
+// that only fails much later, at read time.
+fn extract_coverage(offsets: &Bound<'_, PyAny>) -> PyResult<OverlayCoverage> {
+    if let Ok(bitmap) = offsets.extract::<PyBitmap>() {
+        return Ok(OverlayCoverage::dense((*bitmap.0).clone()));
+    }
+    let items = offsets
+        .try_iter()
+        .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?
+        .collect::<PyResult<Vec<_>>>()?;
+    let Some(first) = items.first() else {
+        // An empty iterable can't distinguish the two shapes; an empty dense
+        // coverage and an empty sparse one describe the same (no) rows.
+        return Ok(OverlayCoverage::dense(RoaringBitmap::new()));
+    };
+    // The first item picks the shape, and every remaining item must match it —
+    // a mixed iterable like `[0, [1]]` is a caller mistake, not a shape.
+    if first.extract::<u32>().is_ok() {
+        let bitmap = items
+            .iter()
+            .map(|item| item.extract::<u32>())
+            .collect::<PyResult<RoaringBitmap>>()
+            .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?;
+        Ok(OverlayCoverage::dense(bitmap))
+    } else {
+        let per_field = items
+            .iter()
+            .map(extract_bitmap)
+            .collect::<PyResult<Vec<_>>>()
+            .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?;
+        Ok(OverlayCoverage::sparse(per_field))
+    }
 }
 
 impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
@@ -238,21 +274,7 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
         let data_file = ob.getattr("data_file")?.extract::<PyLance<DataFile>>()?.0;
         let offsets = ob.getattr("offsets")?;
 
-        // A `Bitmap`/flat iterable of ints is a dense overlay (one coverage
-        // shared by every field); an iterable of `Bitmap`/int iterables is a
-        // sparse overlay (one per field). Differentiate by shape, trying the
-        // dense form first: it fails to extract if `offsets`' elements aren't
-        // ints (e.g. they're themselves iterables), falling through to sparse.
-        let coverage = if let Ok(bitmap) = extract_bitmap(&offsets) {
-            OverlayCoverage::dense(bitmap)
-        } else if let Ok(per_field) = extract_sparse_bitmaps(&offsets) {
-            OverlayCoverage::sparse(per_field)
-        } else {
-            return Err(PyValueError::new_err(
-                "DataOverlayFile.offsets must be an iterable of ints (dense coverage shared \
-                 by every field) or an iterable of per-field int iterables (sparse coverage)",
-            ));
-        };
+        let coverage = extract_coverage(&offsets)?;
 
         // Present (and preserved) when round-tripping an existing fragment's
         // overlays; None/0 when creating an overlay to commit, since the

@@ -5899,6 +5899,79 @@ def test_data_overlay_round_trips_through_fragment_metadata(
     assert result.column("id").to_pylist() == list(range(10))
 
 
+def test_data_overlay_offsets_accept_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # `offsets` is documented as an Iterable, so a generator must work. The
+    # dense/sparse shape probe must not consume it before the sparse form is
+    # resolved, or the first field's coverage would be silently dropped.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([0, 1, 2], pa.int32()),
+                "val": pa.array([0, 10, 20], pa.int32()),
+            }
+        ),
+        base_dir,
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([999], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(
+        data_file, offsets=(item for item in ([1], [2]))
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table()
+    assert result.column("id").to_pylist() == [0, 777, 2]
+    assert result.column("val").to_pylist() == [0, 10, 999]
+
+
+def test_data_overlay_rejects_invalid_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # A one-shot iterable whose contents are invalid must be rejected at
+    # commit time, not committed as empty coverage that only fails at read.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 10, 20], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "invalid.lance",
+        pa.table({"val": pa.array([999], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=iter([1, "bad"]))
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
 def test_data_overlay_rejects_invalid_offsets(
     tmp_path: Path, enable_unstable_data_overlay_files
 ):

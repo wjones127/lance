@@ -61,6 +61,18 @@ def test_construct_from_chunked_array():
     assert set(b) == {1, 2, 3, 4, 5}
 
 
+def test_construct_from_unaligned_pyarrow_buffer():
+    # A buffer arriving over the Arrow C data interface may not meet the
+    # type's native alignment (here, an int32 array over a byte-offset slice).
+    # That must be handled by copying, not by panicking inside `make_array`.
+    raw = bytearray([0xFF, 1, 0, 0, 0])
+    buffer = pa.py_buffer(raw).slice(1, 4)
+    arr = pa.Array.from_buffers(pa.int32(), 1, [None, buffer])
+
+    assert arr.to_pylist() == [1]
+    assert set(bitmap(arr)) == {1}
+
+
 def test_construct_from_pyarrow_rejects_nulls():
     arr = pa.array([1, 2, None], type=pa.int32())
     with pytest.raises(ValueError):

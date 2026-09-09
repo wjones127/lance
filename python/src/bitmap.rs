@@ -65,12 +65,18 @@ fn u64_to_u32(value: u64) -> PyResult<u32> {
 /// going through per-value Python objects or an intermediate `Vec` — each
 /// arm collects straight from the array's native buffer into the bitmap.
 fn bitmap_from_pyarrow(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
-    let data = ArrayData::from_pyarrow_bound(ob)?;
+    let mut data = ArrayData::from_pyarrow_bound(ob)?;
     if data.null_count() > 0 {
         return Err(PyValueError::new_err(
             "Bitmap cannot be constructed from an array containing nulls",
         ));
     }
+    // Buffers that arrive over the Arrow C data interface carry whatever
+    // alignment the producer gave them (e.g. a sliced `pa.py_buffer`), while
+    // `make_array` requires the type's native alignment and panics otherwise.
+    // A panic can't cross the FFI boundary as a Python exception, so copy any
+    // under-aligned buffer into an aligned allocation first.
+    data.align_buffers();
     let array = make_array(data);
     match array.data_type() {
         DataType::UInt8 => Ok(array
