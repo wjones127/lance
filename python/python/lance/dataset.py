@@ -40,6 +40,9 @@ from pyarrow import RecordBatch, Schema
 
 from lance.log import LOGGER
 
+# Imported at runtime, not only for the annotations below: importing it here
+# is what registers `Bitmap` as a `collections.abc.MutableSet`.
+from .bitmap import Bitmap  # noqa: TC001
 from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
@@ -54,7 +57,6 @@ from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
-    Bitmap,
     CleanupExplanation,
     CleanupStats,
     Compaction,
@@ -6431,13 +6433,8 @@ class LanceOperation:
             ascending order — the smallest covered offset maps to row 0 of
             ``data_file``, the next-smallest to row 1, and so on — regardless
             of the order values are given in, so a plain ``List[int]`` need
-            not be pre-sorted.
-
-            This is a low-level API with no built-in protection against a
-            duplicate offset: since the coverage is stored as a set, a
-            repeated offset silently collapses to one entry, shifting every
-            later offset onto the wrong row of ``data_file`` with no error.
-            Callers are responsible for passing distinct offsets.
+            not be pre-sorted. A repeated offset raises ``ValueError``: it
+            would shift every later offset onto the wrong row.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.

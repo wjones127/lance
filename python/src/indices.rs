@@ -90,11 +90,10 @@ impl PyIndexSegment {
     }
 
     fn __repr__(&self) -> String {
-        let fragment_ids: Vec<u32> = self.inner.fragment_bitmap().iter().collect();
         format!(
-            "IndexSegment(uuid={}, fragment_ids={:?}, index_version={})",
+            "IndexSegment(uuid={}, fragment_ids={}, index_version={})",
             self.uuid(),
-            fragment_ids,
+            self.fragment_ids().__repr__(),
             self.index_version()
         )
     }
@@ -649,12 +648,11 @@ impl PyIndexSegmentDescription {
     }
 
     pub fn __repr__(&self) -> String {
-        let fragment_ids: Vec<u32> = self.fragment_ids.0.iter().collect();
         format!(
-            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={:?}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
+            "IndexSegmentDescription(uuid={}, dataset_version_at_last_update={}, fragment_ids={}, index_version={}, created_at={:?}, size_bytes={:?}, base_id={:?}, covering_fields={:?})",
             self.uuid,
             self.dataset_version_at_last_update,
-            fragment_ids,
+            self.fragment_ids.__repr__(),
             self.index_version,
             self.created_at,
             self.size_bytes,

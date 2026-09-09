@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::bitmap::PyBitmap;
+use crate::bitmap::{PyBitmap, bitmap_from_iterable, is_int, value_from_py};
 use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
@@ -71,7 +71,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
         let fragment_ids = ob.getattr("fragment_ids")?;
         let created_at = ob.getattr("created_at")?.extract()?;
 
-        let fragment_bitmap = Some(extract_bitmap(&fragment_ids)?);
+        let fragment_bitmap = Some(extract_fragment_bitmap(&fragment_ids)?);
         let base_id: Option<u32> = ob
             .getattr("base_id")?
             .extract::<Option<i64>>()?
@@ -204,26 +204,51 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
 const OFFSETS_SHAPE_ERR: &str = "DataOverlayFile.offsets must be an iterable of ints (dense coverage shared by every \
      field) or an iterable of per-field int iterables (sparse coverage)";
 
-// Accept either a `Bitmap` (cheap `Arc` clone) or any other iterable of ints
-// (a `set`, `list`, etc.), collected in whatever order the iterable yields —
-// `RoaringBitmap` itself defines the canonical (ascending, deduplicated)
-// order, so there's no separate ordering contract to validate here.
-//
-// Deliberate footgun, not an oversight: a `RoaringBitmap` is a set, so a
-// duplicate value in the input silently collapses to one entry. That's
-// harmless for `IndexMetadata.fragment_bitmap` (just a set of fragment
-// ids), but for `DataOverlayFile.offsets` (see its docstring in
-// dataset.py) it would silently shift every later offset onto the wrong
-// row of the value file. This is intentionally left unvalidated — it's a
-// low-level API and callers are expected to pass distinct offsets — but
-// don't remove this comment without also updating that docstring.
-fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
+// Fragment ids are just a set: accept a `Bitmap` or any other iterable of ints
+// (a `set`, `list`, ...) in whatever order it yields, since `RoaringBitmap`
+// defines the canonical ascending, deduplicated order. Unlike
+// `DataOverlayFile.offsets` below, a repeated fragment id means nothing here,
+// so it collapses rather than being rejected.
+fn extract_fragment_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     if let Ok(bitmap) = ob.extract::<PyBitmap>() {
         return Ok((*bitmap.0).clone());
     }
-    ob.try_iter()?
-        .map(|item| item?.extract::<u32>())
-        .collect::<PyResult<RoaringBitmap>>()
+    bitmap_from_iterable(ob)
+}
+
+// Add one covered offset, rejecting a repeat.
+//
+// Offsets map positionally to rows of the value file — the smallest covered
+// offset to row 0, the next to row 1, and so on — so a repeated offset would
+// shift every later offset onto the wrong row, producing wrong values with no
+// error at read time. A `RoaringBitmap` is a set and would swallow the repeat,
+// so it has to be caught on the way in.
+fn insert_offset(offsets: &mut RoaringBitmap, item: &Bound<'_, PyAny>) -> PyResult<()> {
+    let offset = value_from_py(item)?;
+    if !offsets.insert(offset) {
+        return Err(PyValueError::new_err(format!(
+            "DataOverlayFile.offsets must not repeat an offset, but {offset} appears more than \
+             once; each offset maps positionally to a row of the overlay's value file"
+        )));
+    }
+    Ok(())
+}
+
+// Collect one field's covered offsets: a `Bitmap` (shared, not copied) or any
+// iterable of ints.
+fn extract_offsets(ob: &Bound<'_, PyAny>) -> PyResult<Arc<RoaringBitmap>> {
+    if let Ok(bitmap) = ob.extract::<PyBitmap>() {
+        // Already a set, so it cannot carry a repeat.
+        return Ok(bitmap.0);
+    }
+    let mut offsets = RoaringBitmap::new();
+    for item in ob
+        .try_iter()
+        .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?
+    {
+        insert_offset(&mut offsets, &item?)?;
+    }
+    Ok(Arc::new(offsets))
 }
 
 // Resolve `offsets` into a dense (one coverage shared by every field) or
@@ -238,7 +263,7 @@ fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
 // that only fails much later, at read time.
 fn extract_coverage(offsets: &Bound<'_, PyAny>) -> PyResult<OverlayCoverage> {
     if let Ok(bitmap) = offsets.extract::<PyBitmap>() {
-        return Ok(OverlayCoverage::dense((*bitmap.0).clone()));
+        return Ok(OverlayCoverage::Shared(bitmap.0));
     }
     let items = offsets
         .try_iter()
@@ -247,24 +272,32 @@ fn extract_coverage(offsets: &Bound<'_, PyAny>) -> PyResult<OverlayCoverage> {
     let Some(first) = items.first() else {
         // An empty iterable can't distinguish the two shapes; an empty dense
         // coverage and an empty sparse one describe the same (no) rows.
-        return Ok(OverlayCoverage::dense(RoaringBitmap::new()));
+        return Ok(OverlayCoverage::Shared(Arc::new(RoaringBitmap::new())));
     };
     // The first item picks the shape, and every remaining item must match it —
-    // a mixed iterable like `[0, [1]]` is a caller mistake, not a shape.
-    if first.extract::<u32>().is_ok() {
-        let bitmap = items
-            .iter()
-            .map(|item| item.extract::<u32>())
-            .collect::<PyResult<RoaringBitmap>>()
-            .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?;
-        Ok(OverlayCoverage::dense(bitmap))
+    // a mixed iterable like `[0, [1]]` is a caller mistake, not a shape. Only
+    // that mismatch is reported as a shape error; a bad offset within the
+    // chosen shape keeps the error that names it.
+    if is_int(first)? {
+        let mut dense = RoaringBitmap::new();
+        for item in &items {
+            if !is_int(item)? {
+                return Err(PyValueError::new_err(OFFSETS_SHAPE_ERR));
+            }
+            insert_offset(&mut dense, item)?;
+        }
+        Ok(OverlayCoverage::Shared(Arc::new(dense)))
     } else {
         let per_field = items
             .iter()
-            .map(extract_bitmap)
-            .collect::<PyResult<Vec<_>>>()
-            .map_err(|_| PyValueError::new_err(OFFSETS_SHAPE_ERR))?;
-        Ok(OverlayCoverage::sparse(per_field))
+            .map(|item| {
+                if is_int(item)? {
+                    return Err(PyValueError::new_err(OFFSETS_SHAPE_ERR));
+                }
+                extract_offsets(item)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(OverlayCoverage::PerField(per_field))
     }
 }
 
