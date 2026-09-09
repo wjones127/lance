@@ -191,7 +191,7 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
     Index dataclasses. This characterization test guards the dict keys and
     values so the deprecated method stays backwards compatible.
     """
-    from lance.bitmap import bitmap as Bitmap
+    from lance.bitmap import Bitmap
 
     with pytest.warns(DeprecationWarning):
         indices = indexed_dataset.list_indices()

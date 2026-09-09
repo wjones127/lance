@@ -5846,7 +5846,7 @@ def test_data_overlay_round_trips_through_fragment_metadata(
 ):
     import json
 
-    from lance.bitmap import bitmap as Bitmap
+    from lance.bitmap import Bitmap
 
     base_dir = tmp_path / "test"
     table = pa.table(

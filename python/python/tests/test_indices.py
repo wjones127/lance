@@ -377,7 +377,7 @@ def test_ivf_centroids_multivector_fragment_ids(tmpdir):
         ivf_centroids=centroids,
     )
 
-    from lance.bitmap import bitmap as Bitmap
+    from lance.bitmap import Bitmap
 
     assert index.uuid == "00000000-0000-4000-8000-000000000001"
     assert isinstance(index.fragment_ids, Bitmap)
