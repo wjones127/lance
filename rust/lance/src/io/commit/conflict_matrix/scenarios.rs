@@ -69,7 +69,7 @@ impl Staged {
 /// The operations this suite stages, one variant per column and row of the
 /// matrix. `Update` appears twice because its two modes take different arms of
 /// `check_update_txn` and build different manifests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Scenario {
     Append,
     Delete,
@@ -100,6 +100,24 @@ impl Scenario {
         Self::Overwrite,
         Self::Restore,
     ];
+
+    /// Two-letter column heading for the matrix grid in `cases`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Append => "ap",
+            Self::Delete => "dl",
+            Self::UpdateRewriteRows => "ur",
+            Self::UpdateRewriteColumns => "uc",
+            Self::DataOverlay => "ov",
+            Self::DataReplacement => "dr",
+            Self::Project => "pj",
+            Self::Merge => "mg",
+            Self::CreateIndex => "ci",
+            Self::Rewrite => "rw",
+            Self::Overwrite => "ow",
+            Self::Restore => "rs",
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -386,9 +404,20 @@ async fn stage_rewrite(dataset: &Arc<Dataset>) -> Result<Staged> {
         .with_params(&params)
         .execute_uncommitted(vec![rows])
         .await?;
-    let Operation::Append { fragments } = written.operation else {
+    let Operation::Append { mut fragments } = written.operation else {
         unreachable!("an append in uncommitted form always carries Append");
     };
+    if dataset.manifest.uses_stable_row_ids() {
+        // A rewrite carries the old rows' identities onto the new fragment.
+        // Reuse compaction's own transfer rather than reimplementing it, or the
+        // new fragment arrives with no row ids and the commit is rejected.
+        crate::dataset::optimize::rechunk_stable_row_ids(
+            dataset.as_ref(),
+            &mut fragments,
+            std::slice::from_ref(&old),
+        )
+        .await?;
+    }
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::Rewrite {
@@ -419,7 +448,10 @@ async fn write_value_file(
     values: &[i32],
 ) -> Result<DataFile> {
     let schema = dataset.schema().project(fields)?;
-    let filename = format!("{name}.lance");
+    // A fresh uuid per call, the way real writers name data files. `name` is
+    // only a human-readable hint: two stagings of the same scenario must not
+    // collide, or the second silently overwrites the first's contents.
+    let filename = format!("{name}-{}.lance", uuid::Uuid::new_v4());
     let path = dataset.base.clone().join("data").join(filename.as_str());
     let writer = dataset.object_store.create(&path).await?;
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
@@ -477,6 +509,10 @@ pub(super) async fn fixture() -> Arc<Dataset> {
     .unwrap();
     let params = WriteParams {
         max_rows_per_file: 3,
+        // On, so `Dataset::validate` exercises the stable row id invariants —
+        // notably that no row id is live in two fragments at once. They are a
+        // no-op on a dataset that does not use them.
+        enable_stable_row_ids: true,
         ..Default::default()
     };
     let mut dataset = InsertBuilder::new("memory://")

@@ -4,413 +4,132 @@
 //! The ordered-pair matrix, the runner that executes one cell, and the cells
 //! deliberately left out of it.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use rstest::rstest;
 
-use super::Outcome;
 use super::invariants;
+use super::oracle;
 use super::scenarios::{OVERLAY_VALUE, Scenario, Staged, fixture};
+use super::{Isolation, Outcome};
 use crate::Dataset;
 
-/// What each ordered pair does today, observed rather than derived.
+/// What each ordered pair does today, observed rather than derived, stated
+/// under [`Isolation::Legacy`].
+///
+/// Rows are `ours` — the transaction that has to rebase. Columns are `theirs`,
+/// the one that landed underneath it, keyed by [`Scenario::code`]. Cells are
+/// `L` lands, `R` retryable, `X` incompatible, and `!` excluded because what
+/// the code does today is wrong (see [`KNOWN_BUGS`]).
+///
+/// This grid is the expectation table, not a rendering of one: it is parsed at
+/// run time, so there is a single place to read and a single place to change.
+/// A row landing here also opts that pair into the invariant battery, so a cell
+/// is a claim about the resulting manifest as much as about the verdict.
 ///
 /// Regenerate with the `discover` test below after a deliberate behaviour
-/// change; do not hand-edit a cell to make a failing test pass. A row landing
-/// here also opts that pair into the invariant battery, so a cell is a claim
-/// about the resulting manifest as much as about the verdict.
-///
-/// Four pairs are deliberately absent — see [`KNOWN_BUGS`].
-const EXPECTATIONS: &[(Scenario, Scenario, Outcome)] = &[
-    (Scenario::Append, Scenario::Append, Outcome::Lands),
-    (Scenario::Append, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::Append,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::Append,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::Append, Scenario::DataOverlay, Outcome::Lands),
-    (Scenario::Append, Scenario::DataReplacement, Outcome::Lands),
-    (Scenario::Append, Scenario::Project, Outcome::Lands),
-    (Scenario::Append, Scenario::Merge, Outcome::Lands),
-    (Scenario::Append, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Append, Scenario::Rewrite, Outcome::Lands),
-    (Scenario::Append, Scenario::Overwrite, Outcome::Incompatible),
-    (Scenario::Append, Scenario::Restore, Outcome::Incompatible),
-    (Scenario::Delete, Scenario::Append, Outcome::Lands),
-    (Scenario::Delete, Scenario::Delete, Outcome::Retryable),
-    (
-        Scenario::Delete,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::Delete,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::Delete,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (Scenario::Delete, Scenario::Merge, Outcome::Retryable),
-    (Scenario::Delete, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Delete, Scenario::Rewrite, Outcome::Retryable),
-    (Scenario::Delete, Scenario::Overwrite, Outcome::Incompatible),
-    (Scenario::Delete, Scenario::Restore, Outcome::Incompatible),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Append,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Delete,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::DataOverlay,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Merge,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::CreateIndex,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Rewrite,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Restore,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Append,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Delete,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::DataOverlay,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Merge,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::CreateIndex,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Rewrite,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Restore,
-        Outcome::Incompatible,
-    ),
-    (Scenario::DataOverlay, Scenario::Append, Outcome::Lands),
-    (Scenario::DataOverlay, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::DataOverlay,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::DataOverlay,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::DataOverlay, Scenario::DataOverlay, Outcome::Lands),
-    (
-        Scenario::DataOverlay,
-        Scenario::DataReplacement,
-        Outcome::Lands,
-    ),
-    (Scenario::DataOverlay, Scenario::Project, Outcome::Lands),
-    (Scenario::DataOverlay, Scenario::Merge, Outcome::Retryable),
-    (Scenario::DataOverlay, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::DataOverlay, Scenario::Rewrite, Outcome::Retryable),
-    (
-        Scenario::DataOverlay,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::DataOverlay,
-        Scenario::Restore,
-        Outcome::Incompatible,
-    ),
-    (Scenario::DataReplacement, Scenario::Append, Outcome::Lands),
-    (Scenario::DataReplacement, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::DataReplacement,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::DataOverlay,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (Scenario::DataReplacement, Scenario::Project, Outcome::Lands),
-    (
-        Scenario::DataReplacement,
-        Scenario::Merge,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::CreateIndex,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::Rewrite,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::DataReplacement,
-        Scenario::Restore,
-        Outcome::Incompatible,
-    ),
-    (Scenario::Project, Scenario::Append, Outcome::Lands),
-    (Scenario::Project, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::Project,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::Project,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::Project, Scenario::DataOverlay, Outcome::Lands),
-    (Scenario::Project, Scenario::DataReplacement, Outcome::Lands),
-    (Scenario::Project, Scenario::Project, Outcome::Retryable),
-    (Scenario::Project, Scenario::Merge, Outcome::Retryable),
-    (Scenario::Project, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Project, Scenario::Rewrite, Outcome::Lands),
-    (
-        Scenario::Project,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (Scenario::Project, Scenario::Restore, Outcome::Incompatible),
-    (Scenario::Merge, Scenario::Append, Outcome::Retryable),
-    (Scenario::Merge, Scenario::Delete, Outcome::Retryable),
-    (
-        Scenario::Merge,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::Merge,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Retryable,
-    ),
-    (Scenario::Merge, Scenario::DataOverlay, Outcome::Retryable),
-    (
-        Scenario::Merge,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (Scenario::Merge, Scenario::Project, Outcome::Incompatible),
-    (Scenario::Merge, Scenario::Merge, Outcome::Retryable),
-    (Scenario::Merge, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Merge, Scenario::Rewrite, Outcome::Retryable),
-    (Scenario::Merge, Scenario::Overwrite, Outcome::Incompatible),
-    (Scenario::Merge, Scenario::Restore, Outcome::Incompatible),
-    (Scenario::CreateIndex, Scenario::Append, Outcome::Lands),
-    (Scenario::CreateIndex, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::CreateIndex,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::CreateIndex,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::CreateIndex, Scenario::DataOverlay, Outcome::Lands),
-    (
-        Scenario::CreateIndex,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (Scenario::CreateIndex, Scenario::Project, Outcome::Lands),
-    (Scenario::CreateIndex, Scenario::Merge, Outcome::Lands),
-    (
-        Scenario::CreateIndex,
-        Scenario::CreateIndex,
-        Outcome::Retryable,
-    ),
-    (Scenario::CreateIndex, Scenario::Rewrite, Outcome::Retryable),
-    (
-        Scenario::CreateIndex,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (
-        Scenario::CreateIndex,
-        Scenario::Restore,
-        Outcome::Incompatible,
-    ),
-    (Scenario::Rewrite, Scenario::Append, Outcome::Lands),
-    (Scenario::Rewrite, Scenario::Delete, Outcome::Retryable),
-    (
-        Scenario::Rewrite,
-        Scenario::UpdateRewriteRows,
-        Outcome::Retryable,
-    ),
-    (
-        Scenario::Rewrite,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Retryable,
-    ),
-    (Scenario::Rewrite, Scenario::DataOverlay, Outcome::Retryable),
-    (
-        Scenario::Rewrite,
-        Scenario::DataReplacement,
-        Outcome::Retryable,
-    ),
-    (Scenario::Rewrite, Scenario::Project, Outcome::Lands),
-    (Scenario::Rewrite, Scenario::Merge, Outcome::Retryable),
-    (Scenario::Rewrite, Scenario::CreateIndex, Outcome::Retryable),
-    (Scenario::Rewrite, Scenario::Rewrite, Outcome::Retryable),
-    (
-        Scenario::Rewrite,
-        Scenario::Overwrite,
-        Outcome::Incompatible,
-    ),
-    (Scenario::Rewrite, Scenario::Restore, Outcome::Incompatible),
-    (Scenario::Overwrite, Scenario::Append, Outcome::Lands),
-    (Scenario::Overwrite, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::Overwrite,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::Overwrite,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::Overwrite, Scenario::DataOverlay, Outcome::Lands),
-    (
-        Scenario::Overwrite,
-        Scenario::DataReplacement,
-        Outcome::Lands,
-    ),
-    (Scenario::Overwrite, Scenario::Project, Outcome::Lands),
-    (Scenario::Overwrite, Scenario::Merge, Outcome::Lands),
-    (Scenario::Overwrite, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Overwrite, Scenario::Rewrite, Outcome::Lands),
-    (Scenario::Overwrite, Scenario::Overwrite, Outcome::Retryable),
-    (Scenario::Overwrite, Scenario::Restore, Outcome::Lands),
-    (Scenario::Restore, Scenario::Append, Outcome::Lands),
-    (Scenario::Restore, Scenario::Delete, Outcome::Lands),
-    (
-        Scenario::Restore,
-        Scenario::UpdateRewriteRows,
-        Outcome::Lands,
-    ),
-    (
-        Scenario::Restore,
-        Scenario::UpdateRewriteColumns,
-        Outcome::Lands,
-    ),
-    (Scenario::Restore, Scenario::DataOverlay, Outcome::Lands),
-    (Scenario::Restore, Scenario::DataReplacement, Outcome::Lands),
-    (Scenario::Restore, Scenario::Project, Outcome::Lands),
-    (Scenario::Restore, Scenario::Merge, Outcome::Lands),
-    (Scenario::Restore, Scenario::CreateIndex, Outcome::Lands),
-    (Scenario::Restore, Scenario::Rewrite, Outcome::Lands),
-    (Scenario::Restore, Scenario::Overwrite, Outcome::Lands),
-    (Scenario::Restore, Scenario::Restore, Outcome::Lands),
-];
+/// change; do not hand-edit a cell to make a failing test pass. When isolation
+/// levels become configurable this grows a grid per level.
+const MATRIX: &str = "\
+                       | ap dl ur uc ov dr pj mg ci rw ow rs
+append                 | L  L  L  L  L  L  L  L  L  L  X  X
+delete                 | L  R  L  R  !  R  !  R  L  R  X  X
+update_rewrite_rows    | L  L  R  R  R  R  !  R  L  R  X  X
+update_rewrite_columns | L  R  R  R  L  R  !  R  L  R  X  X
+data_overlay           | L  L  R  L  L  L  L  R  L  R  X  X
+data_replacement       | L  L  R  L  L  R  L  R  R  R  X  X
+project                | L  L  L  L  L  L  R  R  L  L  X  X
+merge                  | R  R  R  R  R  R  X  R  L  R  X  X
+create_index           | L  L  L  L  L  R  L  L  R  R  X  X
+rewrite                | L  R  R  R  R  R  L  R  R  R  X  X
+overwrite              | L  L  L  L  L  L  L  L  L  L  R  L
+restore                | L  L  L  L  L  L  L  L  L  L  L  L
+";
+
+/// The level [`MATRIX`] was observed under.
+const MATRIX_ISOLATION: Isolation = Isolation::Legacy;
+
+/// Parsed form of [`MATRIX`]. `None` marks a cell excluded as a known bug.
+static MATRIX_CELLS: LazyLock<HashMap<(Scenario, Scenario), Option<Outcome>>> =
+    LazyLock::new(parse_matrix);
+
+fn parse_matrix() -> HashMap<(Scenario, Scenario), Option<Outcome>> {
+    let scenario_by = |field: fn(Scenario) -> &'static str, value: &str| {
+        Scenario::ALL
+            .into_iter()
+            .find(|s| field(*s) == value)
+            .unwrap_or_else(|| panic!("matrix names an unknown scenario {value:?}"))
+    };
+
+    let mut lines = MATRIX.lines().filter(|line| !line.trim().is_empty());
+    let header = lines.next().expect("the matrix has a header row");
+    let columns: Vec<Scenario> = header
+        .split_once('|')
+        .expect("the header row is delimited by `|`")
+        .1
+        .split_whitespace()
+        .map(|code| scenario_by(Scenario::code, code))
+        .collect();
+    assert_eq!(
+        columns.len(),
+        Scenario::ALL.len(),
+        "the matrix header has {} columns but there are {} scenarios",
+        columns.len(),
+        Scenario::ALL.len(),
+    );
+
+    let mut cells = HashMap::new();
+    for line in lines {
+        let (label, rest) = line
+            .split_once('|')
+            .expect("a matrix row is delimited by `|`");
+        let ours = scenario_by(Scenario::name, label.trim());
+        let symbols: Vec<&str> = rest.split_whitespace().collect();
+        assert_eq!(
+            symbols.len(),
+            columns.len(),
+            "matrix row {} has {} cells but there are {} columns",
+            ours.name(),
+            symbols.len(),
+            columns.len(),
+        );
+        for (theirs, symbol) in columns.iter().zip(symbols) {
+            let cell = (symbol != "!").then(|| Outcome::from_symbol(symbol));
+            assert!(
+                cells.insert((ours, *theirs), cell).is_none(),
+                "the matrix has two rows for {}",
+                ours.name(),
+            );
+        }
+    }
+    cells
+}
+
+/// Render a grid in [`MATRIX`]'s format, for the `discover` tool.
+fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
+    let width = Scenario::ALL
+        .into_iter()
+        .map(|s| s.name().len())
+        .max()
+        .expect("there is at least one scenario")
+        + 1;
+    let mut out = format!("{:width$}| ", "");
+    for theirs in Scenario::ALL {
+        out.push_str(theirs.code());
+        out.push(' ');
+    }
+    for ours in Scenario::ALL {
+        out = out.trim_end().to_string();
+        out.push('\n');
+        out.push_str(&format!("{:width$}| ", ours.name()));
+        for theirs in Scenario::ALL {
+            out.push(symbol(ours, theirs));
+            out.push_str("  ");
+        }
+    }
+    out.trim_end().to_string()
+}
 
 /// Ordered pairs this suite deliberately leaves out of [`EXPECTATIONS`],
 /// because what the code does with them today is wrong.
@@ -457,10 +176,7 @@ fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
 }
 
 fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
-    EXPECTATIONS
-        .iter()
-        .find(|(o, t, _)| *o == ours && *t == theirs)
-        .map(|(_, _, outcome)| *outcome)
+    MATRIX_CELLS.get(&(ours, theirs)).copied().flatten()
 }
 
 /// Run one ordered pair: stage `ours` against the fixture, land `theirs`
@@ -533,6 +249,16 @@ async fn matrix_row(#[case] ours: Scenario) {
         );
         if let Some((before, after)) = landed {
             invariants::check_all(&before, &after, ours, &context).await;
+            // Boxed: the oracle runs a whole second commit sequence, so its
+            // future is large enough to trip `clippy::large_futures` inline.
+            Box::pin(oracle::check(
+                MATRIX_ISOLATION,
+                ours,
+                theirs,
+                &after,
+                &context,
+            ))
+            .await;
         }
     }
 }
@@ -570,20 +296,41 @@ async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     invariants::check_all(&base, &committed, scenario, &context).await;
 }
 
-/// The matrix must cover the whole grid: every ordered pair is either an
-/// expectation or a recorded bug, and no pair is both.
+/// The matrix must cover the whole grid, and its exclusions must be exactly the
+/// pairs [`KNOWN_BUGS`] documents.
+///
+/// The grid and the bug list are separate on purpose — the grid says which cells
+/// are excluded, the list says why and against which issue — so they have to be
+/// held to agreeing.
 #[test]
 fn matrix_is_total() {
+    assert_eq!(
+        MATRIX_CELLS.len(),
+        Scenario::ALL.len() * Scenario::ALL.len(),
+        "the matrix does not cover every ordered pair",
+    );
     for ours in Scenario::ALL {
         for theirs in Scenario::ALL {
-            let expected = expectation(ours, theirs).is_some();
-            let bug = known_bug(ours, theirs).is_some();
-            assert!(
-                expected ^ bug,
-                "({}, {}) is {} — every pair must be exactly one of the two",
+            let cell = MATRIX_CELLS.get(&(ours, theirs)).unwrap_or_else(|| {
+                panic!(
+                    "({}, {}) is missing from the matrix; re-run `discover`",
+                    ours.name(),
+                    theirs.name()
+                )
+            });
+            let bug = known_bug(ours, theirs);
+            assert_eq!(
+                cell.is_none(),
+                bug.is_some(),
+                "({}, {}) is marked {} in the matrix but {} in KNOWN_BUGS",
                 ours.name(),
                 theirs.name(),
-                if expected { "both" } else { "neither" },
+                if cell.is_none() {
+                    "excluded"
+                } else {
+                    "expected"
+                },
+                if bug.is_some() { "listed" } else { "absent" },
             );
         }
     }
@@ -714,25 +461,36 @@ fn int_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<i32> {
         .collect()
 }
 
-/// Print the observed outcome for every ordered pair.
+/// Print the observed outcome for every ordered pair, as a grid.
 ///
-/// Not an assertion — this is the tool that regenerates [`EXPECTATIONS`]. Run
-/// it with:
+/// Not an assertion — this is the tool that regenerates [`MATRIX`]. Run it with:
 ///
 /// ```text
 /// cargo test -p lance --lib conflict_matrix::cases::discover -- --ignored --nocapture
 /// ```
+///
+/// Cells that are excluded in the current matrix are re-emitted as `!` rather
+/// than as whatever they do, so regenerating never silently turns a known bug
+/// back into an expectation.
 #[tokio::test]
-#[ignore = "discovery tool, not an assertion; regenerates the EXPECTATIONS table"]
-// Stdout is the output format here: this test's job is to emit Rust source to
-// paste back into `EXPECTATIONS`, so a logging framework would be the wrong
-// sink.
+#[ignore = "discovery tool, not an assertion; regenerates the MATRIX grid"]
+// Stdout is the output format here: this test's job is to emit a grid to paste
+// back into `MATRIX`, so a logging framework would be the wrong sink.
 #[allow(clippy::print_stdout)]
 async fn discover() {
+    let mut observed = HashMap::new();
     for ours in Scenario::ALL {
         for theirs in Scenario::ALL {
-            let (outcome, _) = run(ours, theirs).await;
-            println!("    (Scenario::{ours:?}, Scenario::{theirs:?}, Outcome::{outcome:?}),");
+            let symbol = if known_bug(ours, theirs).is_some() {
+                '!'
+            } else {
+                run(ours, theirs).await.0.symbol()
+            };
+            observed.insert((ours, theirs), symbol);
         }
     }
+    println!(
+        "{}",
+        render_matrix(|ours, theirs| observed[&(ours, theirs)])
+    );
 }

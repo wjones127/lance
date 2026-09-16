@@ -54,10 +54,32 @@ mod cases;
 #[cfg(test)]
 mod invariants;
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
 mod scenarios;
 
 #[cfg(test)]
 use crate::Error;
+
+/// The isolation level a matrix of expectations is stated under.
+///
+/// Legacy conflict resolution is not uniformly any textbook level: it is a set
+/// of per-operation rules that approximate snapshot isolation. `Legacy` names
+/// what the code does today, so that the grid in [`cases`] and the oracle in
+/// [`oracle`] each say which contract they are asserting rather than leaving it
+/// implicit.
+///
+/// Lance intends to make the level configurable — snapshot by default, with
+/// serializable available. When that lands this gains variants, `cases::MATRIX`
+/// gains a dimension, and `oracle`'s exemption list becomes a per-level rule.
+/// The invariants in [`invariants`] are level-independent and are unaffected: a
+/// dataset may not corrupt itself at any level.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Isolation {
+    /// Whatever the pre-Transaction-V2 rules do. Measured, not specified.
+    Legacy,
+}
 
 /// What committing `ours` over a concurrent `theirs` does today.
 #[cfg(test)]
@@ -73,6 +95,24 @@ pub(crate) enum Outcome {
 
 #[cfg(test)]
 impl Outcome {
+    /// Single-character form used by the matrix grid in [`cases`].
+    fn symbol(self) -> char {
+        match self {
+            Self::Retryable => 'R',
+            Self::Incompatible => 'X',
+            Self::Lands => 'L',
+        }
+    }
+
+    fn from_symbol(symbol: &str) -> Self {
+        match symbol {
+            "R" => Self::Retryable,
+            "X" => Self::Incompatible,
+            "L" => Self::Lands,
+            other => panic!("unknown matrix symbol {other:?}"),
+        }
+    }
+
     fn of(result: &crate::Result<crate::Dataset>) -> Self {
         match result {
             Ok(_) => Self::Lands,

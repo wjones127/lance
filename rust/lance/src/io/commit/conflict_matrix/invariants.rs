@@ -15,8 +15,12 @@
 //! Each one earns its place by being able to fail. `Manifest::max_field_id` is
 //! deliberately *not* asserted against the schema: it is defined as the maximum
 //! over the schema and the fragments, so "every schema field id is within the
-//! watermark" holds by construction. The observable half of that property — a
-//! data file the schema can no longer reach — is [`no_orphaned_data_file`].
+//! watermark" holds by construction.
+//!
+//! These are all *level-independent*: "the dataset does not corrupt itself"
+//! holds whatever isolation level the commit ran under. The level-relative half
+//! of the suite — which pairs conflict, and what content a rebase must produce —
+//! lives in `cases` and `oracle`.
 
 use std::collections::HashSet;
 
@@ -32,7 +36,7 @@ use crate::Dataset;
 /// produced. `ours` names the operation that just landed, which decides whether
 /// the incremental invariants apply at all.
 pub(super) async fn check_all(before: &Dataset, after: &Dataset, ours: Scenario, context: &str) {
-    no_orphaned_data_file(after, context);
+    dataset_is_internally_consistent(after, context).await;
     overlays_reference_live_fragments(after, context);
     tombstones_stay_tombstoned(before, after, context);
     if !ours.replaces_state() {
@@ -43,34 +47,23 @@ pub(super) async fn check_all(before: &Dataset, after: &Dataset, ours: Scenario,
     dataset_scans(after, context).await;
 }
 
-/// Every data file must contribute at least one field the schema still has.
+/// Delegate to [`Dataset::validate`], the production integrity check.
 ///
-/// A file none of whose fields are in the schema is unreachable by any reader
-/// and, worse, is evidence that a post-image built before a concurrent schema
-/// change was installed over it — the file was pruned and then reinstated.
+/// It subsumes what this module used to assert by hand as `no_orphaned_data_file`
+/// — `FileFragment::validate` opens every base data file and fails with "did not
+/// have any fields in common with the dataset schema" when a pruned file was
+/// reinstated (`dataset/fragment.rs`), which is the observable form of #9217.
+/// Delegating gets that check against real IO rather than against the manifest
+/// alone, and adds several this suite never had: fragment ids unique and sorted,
+/// every data file in a fragment agreeing on length and matching `physical_rows`,
+/// and deletion-vector cardinality matching `num_deleted_rows`.
 ///
-/// Note the weaker form: a file may legitimately carry a field the schema has
-/// dropped, because a projection only prunes a file when *all* of its fields go
-/// away. Asserting the stronger "every field id appears in the schema" would
-/// fire on an ordinary single-fragment projection with no conflict at all.
-fn no_orphaned_data_file(after: &Dataset, context: &str) {
-    let live: HashSet<i32> = after
-        .manifest
-        .schema
-        .fields_pre_order()
-        .map(|field| field.id)
-        .collect();
-    for fragment in after.fragments().iter() {
-        for file in fragment.files.iter() {
-            assert!(
-                file.fields.iter().any(|id| live.contains(id)),
-                "{context}: fragment {} carries data file {:?} whose fields {:?} are all absent \
-                 from the schema {live:?} — a pruned file was reinstated",
-                fragment.id,
-                file.path,
-                file.fields,
-            );
-        }
+/// It also carries the stable row id invariants, including no duplicate live row
+/// id. Those are a no-op unless the fixture enables stable row ids, since
+/// `validate_stable_row_ids` early-returns on datasets that do not use them.
+async fn dataset_is_internally_consistent(after: &Dataset, context: &str) {
+    if let Err(e) = after.validate().await {
+        panic!("{context}: the committed dataset is not internally consistent: {e}");
     }
 }
 
