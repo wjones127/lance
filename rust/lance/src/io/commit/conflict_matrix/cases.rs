@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use futures::future::BoxFuture;
 use rstest::rstest;
 
 use super::invariants;
@@ -37,14 +38,14 @@ append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L
 delete                    | L  R  R  L  R  !  R  !  !  R  R  L  R  X  X  L
 delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
 update_rewrite_rows       | L  L  R  R  R  R  R  !  R  R  R  L  R  X  X  L
-update_rewrite_columns    | L  R  R  R  R  L  R  !  R  R  R  L  R  X  X  L
-data_overlay              | L  L  R  R  L  L  L  L  R  R  R  L  R  X  X  L
-data_replacement          | L  L  X  R  L  L  R  L  R  R  R  R  R  X  X  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L
+update_rewrite_columns    | L  R  R  R  R  R  R  !  R  R  R  L  R  X  X  L
+data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L
+project                   | L  L  L  L  L  !  L  R  R  R  R  L  L  X  X  L
 project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
-create_index              | L  L  L  L  L  L  R  L  L  L  L  R  R  X  X  L
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L
 rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
 restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L
@@ -135,7 +136,7 @@ fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
     out.trim_end().to_string()
 }
 
-/// Ordered pairs this suite deliberately leaves out of [`EXPECTATIONS`],
+/// Ordered pairs this suite deliberately leaves out of [`MATRIX`],
 /// because what the code does with them today is wrong.
 ///
 /// Each is written up below as a `#[ignore]`d test asserting the *correct*
@@ -177,6 +178,19 @@ const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[
         "update reinstates a data file a concurrent project pruned: \
          https://github.com/lance-format/lance/issues/9217",
     ),
+    (
+        Scenario::DataOverlay,
+        Scenario::Project,
+        "a project leaves behind the overlays of the columns it drops: \
+         https://github.com/lance-format/lance/issues/9313",
+    ),
+    (
+        Scenario::Project,
+        Scenario::DataOverlay,
+        "a project leaves behind the overlays of the columns it drops, in the other \
+         order and through the same apply arm: \
+         https://github.com/lance-format/lance/issues/9313",
+    ),
 ];
 
 pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
@@ -190,6 +204,10 @@ fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
     MATRIX_CELLS.get(&(ours, theirs)).copied().flatten()
 }
 
+/// What one cell produces: the verdict, and — when `ours` landed — the dataset
+/// `theirs` committed alongside the one `ours` committed.
+type Landing = (Outcome, Option<(Arc<Dataset>, Dataset)>);
+
 /// Run one ordered pair: stage `ours` against the fixture, land `theirs`
 /// underneath it, then commit `ours` so it has to rebase over `theirs`.
 ///
@@ -198,33 +216,40 @@ fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
 ///
 /// Returns the observed outcome and, when it landed, the dataset `theirs`
 /// produced alongside the one `ours` produced.
-pub(super) async fn run(
+///
+/// Boxed rather than a plain `async fn`: three commit sequences over a
+/// four-column fixture make the future large enough to trip
+/// `clippy::large_futures` at every caller, and boxing once here is one comment
+/// instead of four.
+pub(super) fn run(
     ours: Scenario,
     theirs: Scenario,
     footprint: Footprint,
-) -> (Outcome, Option<(Arc<Dataset>, Dataset)>) {
-    let base = fixture().await;
+) -> BoxFuture<'static, Landing> {
+    Box::pin(async move {
+        let base = fixture().await;
 
-    let staged: Staged = ours
-        .stage(&base)
-        .await
-        .unwrap_or_else(|e| panic!("staging {} failed: {e}", ours.name()));
-
-    let concurrent = theirs
-        .stage_with(&base, footprint)
-        .await
-        .unwrap_or_else(|e| panic!("staging {} failed: {e}", theirs.name()));
-    let after_theirs = Arc::new(
-        concurrent
-            .commit(&base)
+        let staged: Staged = ours
+            .stage(&base)
             .await
-            .unwrap_or_else(|e| panic!("{} could not land uncontended: {e}", theirs.name())),
-    );
+            .unwrap_or_else(|e| panic!("staging {} failed: {e}", ours.name()));
 
-    let result = staged.commit(&base).await;
-    let outcome = Outcome::of(&result);
-    let landed = result.ok().map(|dataset| (after_theirs, dataset));
-    (outcome, landed)
+        let concurrent = theirs
+            .stage_with(&base, footprint)
+            .await
+            .unwrap_or_else(|e| panic!("staging {} failed: {e}", theirs.name()));
+        let after_theirs = Arc::new(
+            concurrent
+                .commit(&base)
+                .await
+                .unwrap_or_else(|e| panic!("{} could not land uncontended: {e}", theirs.name())),
+        );
+
+        let result = staged.commit(&base).await;
+        let outcome = Outcome::of(&result);
+        let landed = result.ok().map(|dataset| (after_theirs, dataset));
+        (outcome, landed)
+    })
 }
 
 /// Every ordered pair in one row of the matrix, plus the invariant battery on
@@ -383,17 +408,17 @@ async fn delete_must_not_drop_a_concurrent_overlay() {
     let after_overlay = overlay.commit(&base).await.unwrap();
     let overlaid = after_overlay.scan().try_into_batch().await.unwrap();
     assert!(
-        int_column(&overlaid, "b").contains(&OVERLAY_VALUE),
+        int_column(&overlaid, "c").contains(&OVERLAY_VALUE),
         "precondition: the overlay is visible before the delete",
     );
 
     let committed = staged.commit(&base).await.unwrap();
     let after = committed.scan().try_into_batch().await.unwrap();
     assert!(
-        int_column(&after, "b").contains(&OVERLAY_VALUE),
-        "the delete dropped the concurrently committed overlay: `b` reads back as {:?}, \
+        int_column(&after, "c").contains(&OVERLAY_VALUE),
+        "the delete dropped the concurrently committed overlay: `c` reads back as {:?}, \
          with the overlaid value {OVERLAY_VALUE} gone",
-        int_column(&after, "b"),
+        int_column(&after, "c"),
     );
 }
 
@@ -415,8 +440,8 @@ async fn delete_must_not_reinstate_a_pruned_data_file() {
     let after_project = project.commit(&base).await.unwrap();
     assert_eq!(
         after_project.fragments()[0].files.len(),
-        1,
-        "precondition: the projection pruned `c`'s data file",
+        2,
+        "precondition: the projection pruned `c`'s data file, leaving `a`/`b`'s and `d`'s",
     );
     let watermark = after_project.manifest.max_field_id();
 
@@ -454,8 +479,8 @@ async fn update_must_not_reinstate_a_pruned_data_file() {
     let after_project = project.commit(&base).await.unwrap();
     assert_eq!(
         after_project.fragments()[0].files.len(),
-        1,
-        "precondition: the projection pruned `c`'s data file",
+        2,
+        "precondition: the projection pruned `c`'s data file, leaving `a`/`b`'s and `d`'s",
     );
 
     let committed = staged.commit(&base).await.unwrap();
@@ -473,6 +498,62 @@ async fn update_must_not_reinstate_a_pruned_data_file() {
                  fields {:?}, none of which are in the schema {live:?}",
                 fragment.id,
                 file.fields,
+            );
+        }
+    }
+}
+
+/// A `Project` must drop the overlays of the columns it drops.
+///
+/// `Operation::Project`'s apply computes the surviving field ids and prunes the
+/// data files none of whose fields survive, but applies the same rule to
+/// `fragment.overlays` nowhere. An overlay supplying only dropped fields is left
+/// on the fragment, where nothing will read it and `cleanup` has no reason to
+/// believe it is dead.
+///
+/// Not a conflict-resolution defect — it reproduces with no concurrency, as
+/// written here — but it is what makes the two `data_overlay`/`project` cells
+/// unassertable, so it is recorded with the rest.
+#[tokio::test]
+#[ignore = "bug: https://github.com/lance-format/lance/issues/9313"]
+async fn project_must_drop_the_overlays_of_dropped_columns() {
+    let base = fixture().await;
+    let after_overlay = Arc::new(
+        Scenario::DataOverlay
+            .stage(&base)
+            .await
+            .unwrap()
+            .commit(&base)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !after_overlay.fragments()[0].overlays.is_empty(),
+        "precondition: the overlay landed on fragment 0",
+    );
+
+    let committed = Scenario::Project
+        .stage(&after_overlay)
+        .await
+        .unwrap()
+        .commit(&after_overlay)
+        .await
+        .unwrap();
+    let live: Vec<i32> = committed
+        .manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect();
+    for fragment in committed.fragments().iter() {
+        for overlay in fragment.overlays.iter() {
+            assert!(
+                overlay.data_file.fields.iter().any(|id| live.contains(id)),
+                "the projection left behind an overlay for a column it dropped: fragment {} \
+                 carries an overlay supplying fields {:?}, none of which are in the schema \
+                 {live:?}",
+                fragment.id,
+                overlay.data_file.fields,
             );
         }
     }

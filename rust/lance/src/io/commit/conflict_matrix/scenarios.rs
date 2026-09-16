@@ -98,37 +98,58 @@ pub(super) enum Scenario {
     UpdateConfig,
 }
 
-/// Which fragment a staged operation touches, relative to the fragment every
-/// `ours` in the matrix works on.
+/// What a staged `theirs` touches, relative to what every `ours` in the matrix
+/// touches.
 ///
-/// `ours` always targets fragment 0, so staging `theirs` at
-/// [`Footprint::Disjoint`] is the only way to ask "do these two conflict
-/// *because* of what they touch, or merely because of what they are?". Without
-/// the axis the matrix scores a conflict detector that rejects everything just
-/// as well as one that reasons about footprints.
+/// `ours` always works on fragment 0, field `c`. Staging `theirs` somewhere else
+/// is the only way to ask "do these two conflict *because* of what they touch,
+/// or merely because of what they are?". Without the axis the matrix scores a
+/// conflict detector that rejects everything just as well as one that reasons
+/// about footprints.
+///
+/// Two operations can be disjoint in two different ways, and legacy need not
+/// treat them alike: a different fragment is visible in the fragment ids a
+/// transaction carries, while a different column of the *same* fragment is only
+/// visible to something that reasons about fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Footprint {
-    /// Fragment 0 — the same fragment `ours` works on.
+    /// Fragment 0, field `c` — exactly what `ours` touches.
     Same,
+    /// Fragment 0, field `d`. Same fragment, no column in common.
+    ///
+    /// Only meaningful for a field-scoped `theirs`; see
+    /// [`Scenario::is_field_scoped`].
+    OtherField,
     /// Fragment 1, which no `ours` touches.
-    Disjoint,
+    OtherFragment,
 }
 
 impl Footprint {
-    pub const ALL: [Self; 2] = [Self::Same, Self::Disjoint];
+    pub const ALL: [Self; 3] = [Self::Same, Self::OtherField, Self::OtherFragment];
 
     /// The fixture fragment this footprint names.
     fn fragment(self) -> usize {
         match self {
-            Self::Same => 0,
-            Self::Disjoint => 1,
+            Self::Same | Self::OtherField => 0,
+            Self::OtherFragment => 1,
+        }
+    }
+
+    /// The field this footprint names. Both `c` and `d` hold a data file to
+    /// themselves, which is what lets a scenario swap one without orphaning
+    /// another field.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Same | Self::OtherFragment => "c",
+            Self::OtherField => "d",
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Same => "same",
-            Self::Disjoint => "disjoint",
+            Self::OtherField => "other_field",
+            Self::OtherFragment => "other_fragment",
         }
     }
 }
@@ -226,6 +247,19 @@ impl Scenario {
         )
     }
 
+    /// Whether this operation's conflict behaviour can depend on *which field*
+    /// it touches, as opposed to only which fragment.
+    ///
+    /// A delete, a rewrite and a row-level update act on whole rows, and an
+    /// index here covers `a` whatever else is going on, so pointing any of them
+    /// at a different column produces the same transaction.
+    pub fn is_field_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::UpdateRewriteColumns | Self::DataOverlay | Self::DataReplacement
+        )
+    }
+
     /// Stage against the fragment every `ours` in the matrix uses.
     pub async fn stage(self, dataset: &Arc<Dataset>) -> Result<Staged> {
         self.stage_with(dataset, Footprint::Same).await
@@ -238,15 +272,24 @@ impl Scenario {
             self.name(),
             footprint.name(),
         );
+        debug_assert!(
+            footprint != Footprint::OtherField || self.is_field_scoped(),
+            "{} is not field-scoped; staging it at {} would produce the same transaction",
+            self.name(),
+            footprint.name(),
+        );
         let fragment = footprint.fragment();
+        let field = footprint.field();
         match self {
             Self::Append => stage_append(dataset).await,
             Self::Delete => stage_delete(dataset, fragment).await,
             Self::DeleteWholeFragment => stage_delete_whole_fragment(dataset, fragment).await,
             Self::UpdateRewriteRows => stage_update_rewrite_rows(dataset, fragment).await,
-            Self::UpdateRewriteColumns => stage_update_rewrite_columns(dataset, fragment).await,
-            Self::DataOverlay => stage_data_overlay(dataset, fragment).await,
-            Self::DataReplacement => stage_data_replacement(dataset, fragment).await,
+            Self::UpdateRewriteColumns => {
+                stage_update_rewrite_columns(dataset, fragment, field).await
+            }
+            Self::DataOverlay => stage_data_overlay(dataset, fragment, field).await,
+            Self::DataReplacement => stage_data_replacement(dataset, fragment, field).await,
             Self::Project => stage_project(dataset, true).await,
             Self::ProjectAlterNullability => stage_project(dataset, false).await,
             Self::Merge => stage_merge(dataset, true).await,
@@ -268,11 +311,13 @@ fn new_rows(start: i32) -> RecordBatch {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new("b", DataType::Int32, true),
             ArrowField::new("c", DataType::Int32, true),
+            ArrowField::new("d", DataType::Int32, true),
         ])),
         vec![
             Arc::new(Int32Array::from(vec![start, start + 1])),
             Arc::new(Int32Array::from(vec![start * 10, start * 10 + 1])),
             Arc::new(Int32Array::from(vec![start + 100, start + 101])),
+            Arc::new(Int32Array::from(vec![start + 200, start + 201])),
         ],
     )
     .unwrap()
@@ -398,24 +443,24 @@ async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>, fragment: usize) -> R
 /// fixture's own fragments: field `c`'s data is restated for fragment 0 while
 /// every other field keeps its existing file.
 ///
-/// `c` rather than `b` because `c` is the only field with a data file to
-/// itself. Swapping the file that `a` and `b` share for one holding just `b`
-/// would leave `a` with no file at all, and the fragment would read `a` back as
-/// null.
+/// `field` is `c` or `d`, the only two with a data file to themselves. Swapping
+/// the file that `a` and `b` share for one holding just `b` would leave `a` with
+/// no file at all, and the fragment would read `a` back as null.
 async fn stage_update_rewrite_columns(
     dataset: &Arc<Dataset>,
     fragment_index: usize,
+    field: &str,
 ) -> Result<Staged> {
     let mut fragment = dataset.fragments()[fragment_index].clone();
-    let field_c = dataset.schema().field("c").unwrap().id;
-    let replacement = write_value_file(dataset, "update_columns", &["c"], &[7, 7, 7]).await?;
-    // Replace the file carrying `c` rather than appending one, so the fragment
-    // keeps exactly one file per field.
+    let field_id = dataset.schema().field(field).unwrap().id;
+    let replacement = write_value_file(dataset, "update_columns", &[field], &[7, 7, 7]).await?;
+    // Replace the file carrying the field rather than appending one, so the
+    // fragment keeps exactly one file per field.
     let target = fragment
         .files
         .iter_mut()
-        .find(|file| file.fields.contains(&field_c))
-        .expect("the fixture gives `c` a data file of its own");
+        .find(|file| file.fields.contains(&field_id))
+        .expect("the fixture gives this field a data file of its own");
     *target = replacement;
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
@@ -423,7 +468,7 @@ async fn stage_update_rewrite_columns(
             removed_fragment_ids: vec![],
             updated_fragments: vec![fragment],
             new_fragments: vec![],
-            fields_modified: vec![field_c as u32],
+            fields_modified: vec![field_id as u32],
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -433,21 +478,25 @@ async fn stage_update_rewrite_columns(
     )))
 }
 
-/// The overlay this suite installs everywhere: fragment 0, field `b`, the last
+/// The overlay this suite installs everywhere: fragment 0, field `c`, the last
 /// row of the fragment. That row survives the `delete` scenario, so an overlay
 /// that disappears did so because it was dropped, not because its row went away.
 pub(super) const OVERLAY_VALUE: i32 = 42;
 
-async fn stage_data_overlay(dataset: &Arc<Dataset>, fragment_id: usize) -> Result<Staged> {
+async fn stage_data_overlay(
+    dataset: &Arc<Dataset>,
+    fragment_id: usize,
+    field: &str,
+) -> Result<Staged> {
     let fragment = dataset.get_fragment(fragment_id).unwrap();
     let last_offset = fragment.physical_rows().await? as u32 - 1;
-    let overlay_schema = dataset.schema().project(&["b"])?;
+    let overlay_schema = dataset.schema().project(&[field])?;
     let mut writer = fragment.write_overlay(&overlay_schema).await?;
 
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new(ROW_ADDR, DataType::UInt64, false),
-            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new(field, DataType::Int32, true),
         ])),
         vec![
             Arc::new(UInt64Array::from(vec![u64::from(
@@ -471,24 +520,29 @@ async fn stage_data_overlay(dataset: &Arc<Dataset>, fragment_id: usize) -> Resul
     )))
 }
 
-async fn stage_data_replacement(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
-    // `DataReplacement` requires the new file to carry exactly the fields of the
-    // file it replaces, so mirror fragment 0's first file.
-    let existing = &dataset.fragments()[fragment].files[0];
-    let names = existing
-        .fields
+/// Replace the data file holding `field` with one carrying different values.
+///
+/// The field's own file rather than the one `a` and `b` share: `DataReplacement`
+/// requires the new file to carry exactly the fields of the file it replaces, so
+/// targeting the shared file would overwrite `a` as well and leave the dataset
+/// with no usable identity column for the content oracle to compare on.
+async fn stage_data_replacement(
+    dataset: &Arc<Dataset>,
+    fragment: usize,
+    field: &str,
+) -> Result<Staged> {
+    let field_id = dataset.schema().field(field).unwrap().id;
+    let existing = dataset.fragments()[fragment]
+        .files
         .iter()
-        .map(|id| {
-            dataset
-                .schema()
-                .field_by_id(*id)
-                .expect("fragment file references a field in the schema")
-                .name
-                .clone()
-        })
-        .collect::<Vec<_>>();
-    let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-    let replacement = write_value_file(dataset, "replacement", &name_refs, &[5, 5, 5]).await?;
+        .find(|file| file.fields.contains(&field_id))
+        .expect("the fixture gives this field a data file of its own");
+    assert_eq!(
+        existing.fields.len(),
+        1,
+        "{field} must have a data file to itself for the replacement to be field-scoped",
+    );
+    let replacement = write_value_file(dataset, "replacement", &[field], &[5, 5, 5]).await?;
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::DataReplacement {
@@ -502,9 +556,11 @@ async fn stage_data_replacement(dataset: &Arc<Dataset>, fragment: usize) -> Resu
 /// read version, so a concurrent write of values falsifies it. Staged both ways
 /// because `false` is the only setting that reaches the global pre-check.
 async fn stage_project(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Result<Staged> {
-    // Drop the column added by the fixture, which is the only one whose data
-    // file can be pruned whole.
-    let schema = dataset.schema().project(&["a", "b"])?;
+    // Drop `c`, which holds a data file of its own and so can be pruned whole.
+    // `d` stays: dropping both would leave a merge with no field-scoped column
+    // to keep, and the point here is a projection that prunes one file rather
+    // than most of the schema.
+    let schema = dataset.schema().project(&["a", "b", "d"])?;
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::Project {
@@ -517,8 +573,9 @@ async fn stage_project(dataset: &Arc<Dataset>, preserves_nullability: bool) -> R
 /// See [`stage_project`] for `preserves_nullability`.
 async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Result<Staged> {
     // A merge restates every fragment against a schema; here it drops `c`'s
-    // data the way a merge that omits a column does.
-    let schema = dataset.schema().project(&["a", "b"])?;
+    // data the way a merge that omits a column does. See `stage_project` for
+    // why `d` stays.
+    let schema = dataset.schema().project(&["a", "b", "d"])?;
     let field_c = dataset.schema().field("c").unwrap().id;
     let fragments = dataset
         .fragments()
@@ -663,14 +720,20 @@ async fn write_value_file(
 
 /// The dataset every case starts from.
 ///
-/// Deliberately tiny — three rows per fragment, two fragments, three fields —
-/// so a case costs a few milliseconds. The shape is still rich enough for the
-/// invariants to bite: two fragments so a fragment-scoped conflict can be
-/// distinguished from a dataset-wide one, and a third column `c` living in its
-/// own data file so `project` and `merge` have a file to prune whole.
+/// Deliberately tiny — three rows per fragment, two fragments, four fields — so
+/// a case costs a few milliseconds. The shape is still the smallest one that
+/// lets every axis of the suite ask its question:
 ///
-/// Version 1 holds `a`/`b`; version 2 adds `c`. Cases stage against version 2,
-/// which gives `restore` a version to fall back to.
+/// - **Two fragments**, so [`Footprint::OtherFragment`] can point an operation
+///   somewhere `ours` never touches.
+/// - **`c` and `d`, each alone in its own data file**, so [`Footprint::Same`]
+///   and [`Footprint::OtherField`] differ at file granularity, and so `project`
+///   and `merge` have a file they can prune whole.
+/// - **`a` and `b` sharing the file written first**, which is why no scenario
+///   targets them: replacing that file to reach one orphans the other.
+///
+/// Version 1 holds `a`/`b`; versions 2 and 3 add `c` and `d`. Cases stage
+/// against the last, which gives `restore` a version to fall back to.
 pub(super) async fn fixture() -> Arc<Dataset> {
     let data = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
@@ -696,14 +759,20 @@ pub(super) async fn fixture() -> Arc<Dataset> {
         .execute(vec![data])
         .await
         .unwrap();
-    dataset
-        .add_columns(
-            NewColumnTransform::SqlExpressions(vec![("c".into(), "a + 100".into())]),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    // Two separate `add_columns` calls, because each one gives its column a data
+    // file to itself. `c` and `d` are the only fields a scenario can target
+    // without disturbing another: `a` and `b` share the file written above, so
+    // replacing it to reach one of them orphans the other.
+    for (name, expression) in [("c", "a + 100"), ("d", "a + 200")] {
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(name.into(), expression.into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
     Arc::new(dataset)
 }
 
