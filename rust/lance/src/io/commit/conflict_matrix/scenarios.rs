@@ -21,6 +21,7 @@ use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
+use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
 use crate::Result;
 use crate::dataset::transaction::{
@@ -73,32 +74,48 @@ impl Staged {
 pub(super) enum Scenario {
     Append,
     Delete,
+    /// A delete whose predicate covers every row of a fragment, so the fragment
+    /// is removed outright. That populates `deleted_fragment_ids` instead of
+    /// `updated_fragments`, which several conflict arms key on.
+    DeleteWholeFragment,
     UpdateRewriteRows,
     UpdateRewriteColumns,
     DataOverlay,
     DataReplacement,
     Project,
+    /// A projection that does not assert `preserves_nullability`, which is the
+    /// only thing `may_alter_nullability` keys on.
+    ProjectAlterNullability,
     Merge,
+    /// See [`Scenario::ProjectAlterNullability`].
+    MergeAlterNullability,
     CreateIndex,
     Rewrite,
     Overwrite,
     Restore,
+    /// A schema-metadata update. `updates_schema_or_field_metadata` keys on
+    /// schema or field metadata specifically, not on config entries.
+    UpdateConfig,
 }
 
 impl Scenario {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Append,
         Self::Delete,
+        Self::DeleteWholeFragment,
         Self::UpdateRewriteRows,
         Self::UpdateRewriteColumns,
         Self::DataOverlay,
         Self::DataReplacement,
         Self::Project,
+        Self::ProjectAlterNullability,
         Self::Merge,
+        Self::MergeAlterNullability,
         Self::CreateIndex,
         Self::Rewrite,
         Self::Overwrite,
         Self::Restore,
+        Self::UpdateConfig,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -106,16 +123,20 @@ impl Scenario {
         match self {
             Self::Append => "ap",
             Self::Delete => "dl",
+            Self::DeleteWholeFragment => "df",
             Self::UpdateRewriteRows => "ur",
             Self::UpdateRewriteColumns => "uc",
             Self::DataOverlay => "ov",
             Self::DataReplacement => "dr",
             Self::Project => "pj",
+            Self::ProjectAlterNullability => "pa",
             Self::Merge => "mg",
+            Self::MergeAlterNullability => "ma",
             Self::CreateIndex => "ci",
             Self::Rewrite => "rw",
             Self::Overwrite => "ow",
             Self::Restore => "rs",
+            Self::UpdateConfig => "cf",
         }
     }
 
@@ -123,16 +144,20 @@ impl Scenario {
         match self {
             Self::Append => "append",
             Self::Delete => "delete",
+            Self::DeleteWholeFragment => "delete_whole_fragment",
             Self::UpdateRewriteRows => "update_rewrite_rows",
             Self::UpdateRewriteColumns => "update_rewrite_columns",
             Self::DataOverlay => "data_overlay",
             Self::DataReplacement => "data_replacement",
             Self::Project => "project",
+            Self::ProjectAlterNullability => "project_alter_nullability",
             Self::Merge => "merge",
+            Self::MergeAlterNullability => "merge_alter_nullability",
             Self::CreateIndex => "create_index",
             Self::Rewrite => "rewrite",
             Self::Overwrite => "overwrite",
             Self::Restore => "restore",
+            Self::UpdateConfig => "update_config",
         }
     }
 
@@ -148,16 +173,20 @@ impl Scenario {
         match self {
             Self::Append => stage_append(dataset).await,
             Self::Delete => stage_delete(dataset).await,
+            Self::DeleteWholeFragment => stage_delete_whole_fragment(dataset).await,
             Self::UpdateRewriteRows => stage_update_rewrite_rows(dataset).await,
             Self::UpdateRewriteColumns => stage_update_rewrite_columns(dataset).await,
             Self::DataOverlay => stage_data_overlay(dataset).await,
             Self::DataReplacement => stage_data_replacement(dataset).await,
-            Self::Project => stage_project(dataset).await,
-            Self::Merge => stage_merge(dataset).await,
+            Self::Project => stage_project(dataset, true).await,
+            Self::ProjectAlterNullability => stage_project(dataset, false).await,
+            Self::Merge => stage_merge(dataset, true).await,
+            Self::MergeAlterNullability => stage_merge(dataset, false).await,
             Self::CreateIndex => stage_create_index(dataset).await,
             Self::Rewrite => stage_rewrite(dataset).await,
             Self::Overwrite => stage_overwrite(dataset).await,
             Self::Restore => stage_restore(dataset).await,
+            Self::UpdateConfig => stage_update_config(dataset).await,
         }
     }
 }
@@ -212,6 +241,63 @@ async fn stage_delete(dataset: &Arc<Dataset>) -> Result<Staged> {
         staged.transaction,
         staged.affected_rows,
     ))
+}
+
+/// A delete whose predicate covers every row of fragment 0, so the fragment is
+/// removed rather than gaining a deletion file.
+///
+/// `"a < 3"` rather than a literal `true`: the whole-dataset form takes a
+/// separate short-circuit in `DeleteBuilder` that reports no affected rows at
+/// all, whereas this keeps `affected_rows` populated and still empties the
+/// fragment. The assertion pins that shape, because a fixture change that left
+/// even one row alive would silently turn this back into [`stage_delete`].
+async fn stage_delete_whole_fragment(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let staged = DeleteBuilder::new(dataset.clone(), "a < 3")
+        .execute_uncommitted()
+        .await?;
+    let Operation::Delete {
+        deleted_fragment_ids,
+        updated_fragments,
+        ..
+    } = &staged.transaction.operation
+    else {
+        unreachable!("a delete in uncommitted form always carries Delete");
+    };
+    assert!(
+        !deleted_fragment_ids.is_empty() && updated_fragments.is_empty(),
+        "this scenario exists to remove a fragment outright, but it removed {deleted_fragment_ids:?} \
+         and updated {} fragments",
+        updated_fragments.len(),
+    );
+    Ok(Staged::with_affected_rows(
+        staged.transaction,
+        staged.affected_rows,
+    ))
+}
+
+/// A schema-metadata update.
+///
+/// Schema metadata rather than a config entry because
+/// `updates_schema_or_field_metadata` keys on the schema and field maps
+/// specifically — a plain config upsert leaves the pre-check against `Merge`
+/// unreached. Assembled directly: the production path commits as it goes, and
+/// the operation carries no data for a hand-built form to get wrong.
+async fn stage_update_config(dataset: &Arc<Dataset>) -> Result<Staged> {
+    Ok(Staged::new(Transaction::new_from_version(
+        dataset.manifest.version,
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry {
+                    key: "conflict_matrix".into(),
+                    value: Some("update_config".into()),
+                }],
+                replace: false,
+            }),
+            field_metadata_updates: HashMap::new(),
+        },
+    )))
 }
 
 /// A merge insert that matches the whole schema, which is the production
@@ -332,7 +418,11 @@ async fn stage_data_replacement(dataset: &Arc<Dataset>) -> Result<Staged> {
     )))
 }
 
-async fn stage_project(dataset: &Arc<Dataset>) -> Result<Staged> {
+/// `preserves_nullability` is the flag `may_alter_nullability` keys on: a
+/// projection that does not assert it is taken to have scanned for nulls at its
+/// read version, so a concurrent write of values falsifies it. Staged both ways
+/// because `false` is the only setting that reaches the global pre-check.
+async fn stage_project(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Result<Staged> {
     // Drop the column added by the fixture, which is the only one whose data
     // file can be pruned whole.
     let schema = dataset.schema().project(&["a", "b"])?;
@@ -340,12 +430,13 @@ async fn stage_project(dataset: &Arc<Dataset>) -> Result<Staged> {
         dataset.manifest.version,
         Operation::Project {
             schema,
-            preserves_nullability: true,
+            preserves_nullability,
         },
     )))
 }
 
-async fn stage_merge(dataset: &Arc<Dataset>) -> Result<Staged> {
+/// See [`stage_project`] for `preserves_nullability`.
+async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Result<Staged> {
     // A merge restates every fragment against a schema; here it drops `c`'s
     // data the way a merge that omits a column does.
     let schema = dataset.schema().project(&["a", "b"])?;
@@ -366,7 +457,7 @@ async fn stage_merge(dataset: &Arc<Dataset>) -> Result<Staged> {
         Operation::Merge {
             fragments,
             schema,
-            preserves_nullability: true,
+            preserves_nullability,
         },
     )))
 }

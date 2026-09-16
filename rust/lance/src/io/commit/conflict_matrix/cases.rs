@@ -32,19 +32,23 @@ use crate::Dataset;
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                       | ap dl ur uc ov dr pj mg ci rw ow rs
-append                 | L  L  L  L  L  L  L  L  L  L  X  X
-delete                 | L  R  L  R  !  R  !  R  L  R  X  X
-update_rewrite_rows    | L  L  R  R  R  R  !  R  L  R  X  X
-update_rewrite_columns | L  R  R  R  L  R  !  R  L  R  X  X
-data_overlay           | L  L  R  L  L  L  L  R  L  R  X  X
-data_replacement       | L  L  R  L  L  R  L  R  R  R  X  X
-project                | L  L  L  L  L  L  R  R  L  L  X  X
-merge                  | R  R  R  R  R  R  X  R  L  R  X  X
-create_index           | L  L  L  L  L  R  L  L  R  R  X  X
-rewrite                | L  R  R  R  R  R  L  R  R  R  X  X
-overwrite              | L  L  L  L  L  L  L  L  L  L  R  L
-restore                | L  L  L  L  L  L  L  L  L  L  L  L
+                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf
+append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L
+delete                    | L  R  R  L  R  !  R  !  !  R  R  L  R  X  X  L
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
+update_rewrite_rows       | L  L  R  R  R  R  R  !  R  R  R  L  R  X  X  L
+update_rewrite_columns    | L  R  R  R  R  L  R  !  R  R  R  L  R  X  X  L
+data_overlay              | L  L  R  R  L  L  L  L  R  R  R  L  R  X  X  L
+data_replacement          | L  L  X  R  L  L  R  L  R  R  R  R  R  X  X  L
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L
+merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
+merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
+create_index              | L  L  L  L  L  L  R  L  L  L  L  R  R  X  X  L
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  L  X
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -155,6 +159,13 @@ const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[
          https://github.com/lance-format/lance/issues/9217",
     ),
     (
+        Scenario::Delete,
+        Scenario::ProjectAlterNullability,
+        "delete reinstates a data file a concurrent project pruned, through the same \
+         apply arm as the pair above and covered by the same ignored test: \
+         https://github.com/lance-format/lance/issues/9217",
+    ),
+    (
         Scenario::UpdateRewriteRows,
         Scenario::Project,
         "update reinstates a data file a concurrent project pruned: \
@@ -218,16 +229,20 @@ async fn run(ours: Scenario, theirs: Scenario) -> (Outcome, Option<(Arc<Dataset>
 #[rstest]
 #[case::append(Scenario::Append)]
 #[case::delete(Scenario::Delete)]
+#[case::delete_whole_fragment(Scenario::DeleteWholeFragment)]
 #[case::update_rewrite_rows(Scenario::UpdateRewriteRows)]
 #[case::update_rewrite_columns(Scenario::UpdateRewriteColumns)]
 #[case::data_overlay(Scenario::DataOverlay)]
 #[case::data_replacement(Scenario::DataReplacement)]
 #[case::project(Scenario::Project)]
+#[case::project_alter_nullability(Scenario::ProjectAlterNullability)]
 #[case::merge(Scenario::Merge)]
+#[case::merge_alter_nullability(Scenario::MergeAlterNullability)]
 #[case::create_index(Scenario::CreateIndex)]
 #[case::rewrite(Scenario::Rewrite)]
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
+#[case::update_config(Scenario::UpdateConfig)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -271,16 +286,20 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[rstest]
 #[case::append(Scenario::Append)]
 #[case::delete(Scenario::Delete)]
+#[case::delete_whole_fragment(Scenario::DeleteWholeFragment)]
 #[case::update_rewrite_rows(Scenario::UpdateRewriteRows)]
 #[case::update_rewrite_columns(Scenario::UpdateRewriteColumns)]
 #[case::data_overlay(Scenario::DataOverlay)]
 #[case::data_replacement(Scenario::DataReplacement)]
 #[case::project(Scenario::Project)]
+#[case::project_alter_nullability(Scenario::ProjectAlterNullability)]
 #[case::merge(Scenario::Merge)]
+#[case::merge_alter_nullability(Scenario::MergeAlterNullability)]
 #[case::create_index(Scenario::CreateIndex)]
 #[case::rewrite(Scenario::Rewrite)]
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
+#[case::update_config(Scenario::UpdateConfig)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;
