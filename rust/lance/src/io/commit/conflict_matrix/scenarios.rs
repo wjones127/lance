@@ -98,6 +98,41 @@ pub(super) enum Scenario {
     UpdateConfig,
 }
 
+/// Which fragment a staged operation touches, relative to the fragment every
+/// `ours` in the matrix works on.
+///
+/// `ours` always targets fragment 0, so staging `theirs` at
+/// [`Footprint::Disjoint`] is the only way to ask "do these two conflict
+/// *because* of what they touch, or merely because of what they are?". Without
+/// the axis the matrix scores a conflict detector that rejects everything just
+/// as well as one that reasons about footprints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Footprint {
+    /// Fragment 0 — the same fragment `ours` works on.
+    Same,
+    /// Fragment 1, which no `ours` touches.
+    Disjoint,
+}
+
+impl Footprint {
+    pub const ALL: [Self; 2] = [Self::Same, Self::Disjoint];
+
+    /// The fixture fragment this footprint names.
+    fn fragment(self) -> usize {
+        match self {
+            Self::Same => 0,
+            Self::Disjoint => 1,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Disjoint => "disjoint",
+        }
+    }
+}
+
 impl Scenario {
     pub const ALL: [Self; 16] = [
         Self::Append,
@@ -169,21 +204,55 @@ impl Scenario {
         matches!(self, Self::Overwrite | Self::Restore)
     }
 
+    /// Whether this operation's conflict behaviour can depend on *which*
+    /// fragment it touches.
+    ///
+    /// The rest are dataset-scoped: an append mints fragments and inspects
+    /// none, a projection and a merge act on the schema, and overwrite, restore
+    /// and a config update replace or annotate whole-dataset state. Staging
+    /// them at a different fragment would produce the same transaction, so the
+    /// footprint axis would cost runtime and prove nothing.
+    pub fn is_fragment_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::Delete
+                | Self::DeleteWholeFragment
+                | Self::UpdateRewriteRows
+                | Self::UpdateRewriteColumns
+                | Self::DataOverlay
+                | Self::DataReplacement
+                | Self::CreateIndex
+                | Self::Rewrite
+        )
+    }
+
+    /// Stage against the fragment every `ours` in the matrix uses.
     pub async fn stage(self, dataset: &Arc<Dataset>) -> Result<Staged> {
+        self.stage_with(dataset, Footprint::Same).await
+    }
+
+    pub async fn stage_with(self, dataset: &Arc<Dataset>, footprint: Footprint) -> Result<Staged> {
+        debug_assert!(
+            footprint == Footprint::Same || self.is_fragment_scoped(),
+            "{} is dataset-scoped; staging it at {} would produce the same transaction",
+            self.name(),
+            footprint.name(),
+        );
+        let fragment = footprint.fragment();
         match self {
             Self::Append => stage_append(dataset).await,
-            Self::Delete => stage_delete(dataset).await,
-            Self::DeleteWholeFragment => stage_delete_whole_fragment(dataset).await,
-            Self::UpdateRewriteRows => stage_update_rewrite_rows(dataset).await,
-            Self::UpdateRewriteColumns => stage_update_rewrite_columns(dataset).await,
-            Self::DataOverlay => stage_data_overlay(dataset).await,
-            Self::DataReplacement => stage_data_replacement(dataset).await,
+            Self::Delete => stage_delete(dataset, fragment).await,
+            Self::DeleteWholeFragment => stage_delete_whole_fragment(dataset, fragment).await,
+            Self::UpdateRewriteRows => stage_update_rewrite_rows(dataset, fragment).await,
+            Self::UpdateRewriteColumns => stage_update_rewrite_columns(dataset, fragment).await,
+            Self::DataOverlay => stage_data_overlay(dataset, fragment).await,
+            Self::DataReplacement => stage_data_replacement(dataset, fragment).await,
             Self::Project => stage_project(dataset, true).await,
             Self::ProjectAlterNullability => stage_project(dataset, false).await,
             Self::Merge => stage_merge(dataset, true).await,
             Self::MergeAlterNullability => stage_merge(dataset, false).await,
-            Self::CreateIndex => stage_create_index(dataset).await,
-            Self::Rewrite => stage_rewrite(dataset).await,
+            Self::CreateIndex => stage_create_index(dataset, fragment).await,
+            Self::Rewrite => stage_rewrite(dataset, fragment).await,
             Self::Overwrite => stage_overwrite(dataset).await,
             Self::Restore => stage_restore(dataset).await,
             Self::UpdateConfig => stage_update_config(dataset).await,
@@ -233,8 +302,11 @@ async fn stage_overwrite(dataset: &Arc<Dataset>) -> Result<Staged> {
     Ok(Staged::new(transaction))
 }
 
-async fn stage_delete(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let staged = DeleteBuilder::new(dataset.clone(), "a = 0")
+/// A single-row delete on `fragment`. The fixture's fragment `n` holds
+/// `a = 3n..3n+2`, so the predicate picks that fragment's first row.
+async fn stage_delete(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
+    let predicate = format!("a = {}", fragment * 3);
+    let staged = DeleteBuilder::new(dataset.clone(), &predicate)
         .execute_uncommitted()
         .await?;
     Ok(Staged::with_affected_rows(
@@ -251,8 +323,10 @@ async fn stage_delete(dataset: &Arc<Dataset>) -> Result<Staged> {
 /// all, whereas this keeps `affected_rows` populated and still empties the
 /// fragment. The assertion pins that shape, because a fixture change that left
 /// even one row alive would silently turn this back into [`stage_delete`].
-async fn stage_delete_whole_fragment(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let staged = DeleteBuilder::new(dataset.clone(), "a < 3")
+async fn stage_delete_whole_fragment(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
+    let first = fragment * 3;
+    let predicate = format!("a >= {first} AND a < {}", first + 3);
+    let staged = DeleteBuilder::new(dataset.clone(), &predicate)
         .execute_uncommitted()
         .await?;
     let Operation::Delete {
@@ -303,8 +377,10 @@ async fn stage_update_config(dataset: &Arc<Dataset>) -> Result<Staged> {
 /// A merge insert that matches the whole schema, which is the production
 /// producer of `UpdateMode::RewriteRows`: matched rows are deleted in place and
 /// rewritten into a new fragment.
-async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let source = new_rows(1);
+async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
+    // `new_rows(n)` carries keys n and n+1, so starting at the fragment's second
+    // row keeps both matches inside it and inserts nothing.
+    let source = new_rows(fragment as i32 * 3 + 1);
     let reader = arrow_array::RecordBatchIterator::new(vec![Ok(source.clone())], source.schema());
     let staged = MergeInsertBuilder::try_new(dataset.clone(), vec!["a".into()])?
         .when_matched(crate::dataset::WhenMatched::UpdateAll)
@@ -326,8 +402,11 @@ async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>) -> Result<Staged> {
 /// itself. Swapping the file that `a` and `b` share for one holding just `b`
 /// would leave `a` with no file at all, and the fragment would read `a` back as
 /// null.
-async fn stage_update_rewrite_columns(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let mut fragment = dataset.fragments()[0].clone();
+async fn stage_update_rewrite_columns(
+    dataset: &Arc<Dataset>,
+    fragment_index: usize,
+) -> Result<Staged> {
+    let mut fragment = dataset.fragments()[fragment_index].clone();
     let field_c = dataset.schema().field("c").unwrap().id;
     let replacement = write_value_file(dataset, "update_columns", &["c"], &[7, 7, 7]).await?;
     // Replace the file carrying `c` rather than appending one, so the fragment
@@ -359,8 +438,8 @@ async fn stage_update_rewrite_columns(dataset: &Arc<Dataset>) -> Result<Staged> 
 /// that disappears did so because it was dropped, not because its row went away.
 pub(super) const OVERLAY_VALUE: i32 = 42;
 
-async fn stage_data_overlay(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let fragment = dataset.get_fragment(0).unwrap();
+async fn stage_data_overlay(dataset: &Arc<Dataset>, fragment_id: usize) -> Result<Staged> {
+    let fragment = dataset.get_fragment(fragment_id).unwrap();
     let last_offset = fragment.physical_rows().await? as u32 - 1;
     let overlay_schema = dataset.schema().project(&["b"])?;
     let mut writer = fragment.write_overlay(&overlay_schema).await?;
@@ -372,7 +451,7 @@ async fn stage_data_overlay(dataset: &Arc<Dataset>) -> Result<Staged> {
         ])),
         vec![
             Arc::new(UInt64Array::from(vec![u64::from(
-                RowAddress::new_from_parts(0, last_offset),
+                RowAddress::new_from_parts(fragment_id as u32, last_offset),
             )])),
             Arc::new(Int32Array::from(vec![OVERLAY_VALUE])),
         ],
@@ -392,10 +471,10 @@ async fn stage_data_overlay(dataset: &Arc<Dataset>) -> Result<Staged> {
     )))
 }
 
-async fn stage_data_replacement(dataset: &Arc<Dataset>) -> Result<Staged> {
+async fn stage_data_replacement(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
     // `DataReplacement` requires the new file to carry exactly the fields of the
     // file it replaces, so mirror fragment 0's first file.
-    let existing = &dataset.fragments()[0].files[0];
+    let existing = &dataset.fragments()[fragment].files[0];
     let names = existing
         .fields
         .iter()
@@ -413,7 +492,7 @@ async fn stage_data_replacement(dataset: &Arc<Dataset>) -> Result<Staged> {
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::DataReplacement {
-            replacements: vec![DataReplacementGroup(0, replacement)],
+            replacements: vec![DataReplacementGroup(fragment as u64, replacement)],
         },
     )))
 }
@@ -462,11 +541,17 @@ async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Res
     )))
 }
 
-async fn stage_create_index(dataset: &Arc<Dataset>) -> Result<Staged> {
+/// A BTree over `a`, covering only `fragment`.
+///
+/// Scoped rather than whole-dataset so the index has a footprint at all: the
+/// `fragment_bitmap` it carries is what the rewrite arms of
+/// `check_create_index_txn` compare against.
+async fn stage_create_index(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
     let mut owned = dataset.as_ref().clone();
     let params = ScalarIndexParams::new("btree".to_string());
     let index = CreateIndexBuilder::new(&mut owned, &["a"], IndexType::Scalar, &params)
         .name("a_idx".to_string())
+        .fragments(vec![fragment as u32])
         .execute_uncommitted()
         .await?;
     Ok(Staged::new(Transaction::new_from_version(
@@ -480,8 +565,8 @@ async fn stage_create_index(dataset: &Arc<Dataset>) -> Result<Staged> {
 
 /// Compaction of fragment 0 into a freshly written fragment holding the same
 /// rows. Written through `InsertBuilder` so the new fragment has real files.
-async fn stage_rewrite(dataset: &Arc<Dataset>) -> Result<Staged> {
-    let old = dataset.fragments()[0].clone();
+async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged> {
+    let old = dataset.fragments()[fragment].clone();
     let rows = dataset
         .scan()
         .with_fragments(vec![old.clone()])

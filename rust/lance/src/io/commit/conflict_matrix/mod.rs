@@ -52,6 +52,8 @@
 #[cfg(test)]
 mod cases;
 #[cfg(test)]
+mod footprint;
+#[cfg(test)]
 mod invariants;
 #[cfg(test)]
 mod oracle;

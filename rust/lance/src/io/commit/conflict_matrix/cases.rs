@@ -11,7 +11,7 @@ use rstest::rstest;
 
 use super::invariants;
 use super::oracle;
-use super::scenarios::{OVERLAY_VALUE, Scenario, Staged, fixture};
+use super::scenarios::{Footprint, OVERLAY_VALUE, Scenario, Staged, fixture};
 use super::{Isolation, Outcome};
 use crate::Dataset;
 
@@ -179,7 +179,7 @@ const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[
     ),
 ];
 
-fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
+pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     KNOWN_BUGS
         .iter()
         .find(|(o, t, _)| *o == ours && *t == theirs)
@@ -193,9 +193,16 @@ fn expectation(ours: Scenario, theirs: Scenario) -> Option<Outcome> {
 /// Run one ordered pair: stage `ours` against the fixture, land `theirs`
 /// underneath it, then commit `ours` so it has to rebase over `theirs`.
 ///
+/// `ours` always works on fragment 0; `footprint` says which fragment `theirs`
+/// touches, which is what the `footprint` module varies.
+///
 /// Returns the observed outcome and, when it landed, the dataset `theirs`
 /// produced alongside the one `ours` produced.
-async fn run(ours: Scenario, theirs: Scenario) -> (Outcome, Option<(Arc<Dataset>, Dataset)>) {
+pub(super) async fn run(
+    ours: Scenario,
+    theirs: Scenario,
+    footprint: Footprint,
+) -> (Outcome, Option<(Arc<Dataset>, Dataset)>) {
     let base = fixture().await;
 
     let staged: Staged = ours
@@ -204,7 +211,7 @@ async fn run(ours: Scenario, theirs: Scenario) -> (Outcome, Option<(Arc<Dataset>
         .unwrap_or_else(|e| panic!("staging {} failed: {e}", ours.name()));
 
     let concurrent = theirs
-        .stage(&base)
+        .stage_with(&base, footprint)
         .await
         .unwrap_or_else(|e| panic!("staging {} failed: {e}", theirs.name()));
     let after_theirs = Arc::new(
@@ -257,7 +264,7 @@ async fn matrix_row(#[case] ours: Scenario) {
             )
         });
         let context = format!("({} over {})", ours.name(), theirs.name());
-        let (outcome, landed) = run(ours, theirs).await;
+        let (outcome, landed) = run(ours, theirs, Footprint::Same).await;
         assert_eq!(
             outcome, expected,
             "{context}: expected {expected:?} but observed {outcome:?}",
@@ -270,6 +277,7 @@ async fn matrix_row(#[case] ours: Scenario) {
                 MATRIX_ISOLATION,
                 ours,
                 theirs,
+                Footprint::Same,
                 &after,
                 &context,
             ))
@@ -503,7 +511,7 @@ async fn discover() {
             let symbol = if known_bug(ours, theirs).is_some() {
                 '!'
             } else {
-                run(ours, theirs).await.0.symbol()
+                run(ours, theirs, Footprint::Same).await.0.symbol()
             };
             observed.insert((ours, theirs), symbol);
         }

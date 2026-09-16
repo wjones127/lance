@@ -44,7 +44,7 @@ use std::sync::Arc;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 
 use super::Isolation;
-use super::scenarios::{Scenario, fixture};
+use super::scenarios::{Footprint, Scenario, fixture};
 use crate::Dataset;
 
 /// Ordered pairs where a correct rebase legitimately differs from serial
@@ -73,6 +73,7 @@ pub(super) async fn check(
     isolation: Isolation,
     ours: Scenario,
     theirs: Scenario,
+    footprint: Footprint,
     rebased: &Dataset,
     context: &str,
 ) {
@@ -86,7 +87,7 @@ pub(super) async fn check(
         return;
     }
 
-    let Some(serial) = serial_execution(ours, theirs).await else {
+    let Some(serial) = serial_execution(ours, theirs, footprint).await else {
         // The pair cannot be run serially — `theirs` alone fails, or `ours`
         // cannot be staged against the result. That is not evidence about the
         // rebase, so there is nothing to compare.
@@ -106,9 +107,24 @@ pub(super) async fn check(
 
 /// Commit `theirs`, then stage and commit `ours` on top of the result, so
 /// nothing ever rebases.
-async fn serial_execution(ours: Scenario, theirs: Scenario) -> Option<Dataset> {
+///
+/// `theirs` is staged at the same footprint the rebased run used; staging it
+/// anywhere else would compare two different pairs of operations.
+async fn serial_execution(
+    ours: Scenario,
+    theirs: Scenario,
+    footprint: Footprint,
+) -> Option<Dataset> {
     let base = fixture().await;
-    let after_theirs = Arc::new(theirs.stage(&base).await.ok()?.commit(&base).await.ok()?);
+    let after_theirs = Arc::new(
+        theirs
+            .stage_with(&base, footprint)
+            .await
+            .ok()?
+            .commit(&base)
+            .await
+            .ok()?,
+    );
     ours.stage(&after_theirs)
         .await
         .ok()?
