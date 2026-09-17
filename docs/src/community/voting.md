@@ -90,7 +90,7 @@ such PRs are labeled `format-change` automatically. The
 blocks merging a `format-change` PR until all of the following hold:
 
 - **Three binding +1 votes.** Three PMC members have approved the PR, excluding
-  the proposer. Cast +1 by approving the PR. An approval counts whatever commit
+  the proposer. Cast +1 by approving the PR. An approval counts no matter what commit
   it was cast on, so a rebase or a typo fix does not send everyone back to
   re-vote.
 - **One +1 on the latest commit.** At least one of those approvals — from a PMC
