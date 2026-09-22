@@ -257,14 +257,16 @@ fn test_decode_inline_transaction_tolerates_unknown_operations() {
 }
 
 /// A transaction as a future Lance might write it: the `operation` oneof holds
-/// a field number this version does not know.
+/// a field number this version does not know. 199 is the top of the reserved
+/// operation range, the number least likely to be assigned; if it ever is, the
+/// `Unknown` assertions in these tests fail and a new number must be picked.
 #[derive(Clone, PartialEq, prost::Message)]
 struct FutureTransaction {
     #[prost(uint64, tag = "1")]
     read_version: u64,
     #[prost(string, tag = "2")]
     uuid: String,
-    #[prost(message, optional, tag = "116")]
+    #[prost(message, optional, tag = "199")]
     future_operation: Option<()>,
 }
 
@@ -414,6 +416,22 @@ async fn test_read_inline_transaction_from_deprecated_field() {
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert!(dataset.manifest.transaction_section.is_some());
     assert_eq!(dataset.read_transaction().await.unwrap().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_released_deprecated_field() {
+    use crate::utils::test::copy_test_data_to_tmp;
+
+    // Written by Lance v1.0.1, which stores the inline transaction in field 21.
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance").unwrap();
+    // Remove the external copies so only field 21 can supply the transactions.
+    std::fs::remove_dir_all(test_dir.std_path().join(TRANSACTIONS_DIR)).unwrap();
+
+    let dataset = Dataset::open(test_dir.path_str().as_str()).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert_eq!(tx.uuid, "87766aea-beb2-4942-8830-df51d2f17492");
+    assert_eq!(tx.read_version, 1);
 }
 
 #[test]

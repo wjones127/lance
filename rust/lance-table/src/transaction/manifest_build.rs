@@ -632,9 +632,11 @@ impl Transaction {
                 ));
             }
             Operation::Unknown { .. } => {
-                return Err(Error::not_supported(
-                    "Cannot commit an operation written by a newer version of Lance".to_string(),
-                ));
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be committed by this version",
+                    self.uuid
+                )));
             }
             Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());

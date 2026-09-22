@@ -1710,6 +1710,36 @@ mod tests {
         assert_eq!(manifest.config, config);
     }
 
+    #[rstest::rstest]
+    #[case::only_current(Some(22), None, Some(22))]
+    #[case::only_deprecated(None, Some(21), Some(21))]
+    #[case::current_wins_over_deprecated(Some(22), Some(21), Some(22))]
+    #[case::neither(None, None, None)]
+    fn test_transaction_section_field_precedence(
+        #[case] current: Option<u64>,
+        #[case] deprecated: Option<u64>,
+        #[case] expected: Option<usize>,
+    ) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int64, false)]);
+        let manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut pb_manifest = pb::Manifest::from(&manifest);
+        pb_manifest.transaction_section = current;
+        pb_manifest.transaction_section_deprecated = deprecated;
+
+        let manifest = Manifest::try_from(pb_manifest).unwrap();
+        assert_eq!(manifest.transaction_section, expected);
+
+        // Whatever was read, only the current field is ever written back.
+        let pb_manifest = pb::Manifest::from(&manifest);
+        assert_eq!(pb_manifest.transaction_section, expected.map(|p| p as u64));
+        assert_eq!(pb_manifest.transaction_section_deprecated, None);
+    }
+
     #[test]
     fn test_manifest_summary() {
         // Step 1: test empty manifest summary
