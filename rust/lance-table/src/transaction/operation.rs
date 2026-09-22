@@ -36,7 +36,6 @@ pub struct DataOverlayGroup {
 
 /// An operation on a dataset.
 #[derive(Debug, Clone, DeepSizeOf)]
-#[non_exhaustive]
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.

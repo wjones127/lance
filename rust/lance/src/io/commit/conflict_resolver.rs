@@ -223,7 +223,7 @@ impl<'a> TransactionRebase<'a> {
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
-            _ => Err(Error::not_supported(format!(
+            Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be rebased by this version",
                 transaction.uuid
@@ -350,7 +350,9 @@ impl<'a> TransactionRebase<'a> {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
             // An unrecognized operation cannot be checked: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -453,7 +455,7 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -710,7 +712,9 @@ impl<'a> TransactionRebase<'a> {
                     other_version,
                 ),
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -951,7 +955,7 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1149,7 +1153,9 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1203,7 +1209,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1234,7 +1242,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1398,7 +1408,7 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1516,7 +1526,9 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1555,7 +1567,9 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1584,7 +1598,9 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1612,7 +1628,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1644,7 +1662,9 @@ impl<'a> TransactionRebase<'a> {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
             // An unrecognized operation may touch anything: assume it conflicts.
-            _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+            Operation::Unknown { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
         }
     }
 
@@ -1705,7 +1725,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1783,7 +1805,9 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                _ => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1881,7 +1905,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
-            _ => Err(Error::not_supported(format!(
+            Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
                 self.transaction.uuid
@@ -5116,7 +5140,7 @@ mod tests {
                 Box::new(replacements.iter().map(|r| r.0))
             }
             Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
-            _ => unimplemented!("modified_fragment_ids for {operation}"),
+            Operation::Unknown { .. } => unimplemented!("modified_fragment_ids for {operation}"),
         }
     }
 
