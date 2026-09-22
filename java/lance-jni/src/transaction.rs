@@ -1217,6 +1217,10 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        unsupported => Err(Error::input_error(format!(
+            "Unsupported operation: {}",
+            unsupported.name()
+        ))),
     }
 }
 

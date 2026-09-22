@@ -1033,7 +1033,10 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
-            transaction_section: p.transaction_section.map(|i| i as usize),
+            transaction_section: p
+                .transaction_section
+                .or(p.transaction_section_deprecated)
+                .map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -1111,6 +1114,7 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            transaction_section_deprecated: None,
         }
     }
 }
