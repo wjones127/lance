@@ -280,7 +280,7 @@ fn future_transaction(uuid: &str) -> FutureTransaction {
 
 /// Rewrite the latest manifest of `dataset` in place so its inline transaction
 /// section holds `inline_tx`, stored in the deprecated field 21 if
-/// `deprecated_field` is set and in field 22 otherwise.
+/// `deprecated_field` is set and in field 23 otherwise.
 async fn rewrite_inline_transaction(
     dataset: &Dataset,
     inline_tx: &impl prost::Message,
@@ -1131,7 +1131,9 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     .transaction_properties(large_props("payload"))
     .build();
     let clone_uri = TempStrDir::default();
+    // Only the manifest is checked here, so skipping the file copy is fine.
     CommitBuilder::new(&clone_uri)
+        .with_deep_clone_files_copied()
         .execute(clone_tx.clone())
         .await
         .unwrap();

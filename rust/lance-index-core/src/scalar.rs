@@ -10,9 +10,10 @@ use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::Expr;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -53,6 +54,7 @@ pub enum BuiltinIndexType {
     RTree,
     Inverted,
     Fm,
+    MinHashLsh,
 }
 
 impl BuiltinIndexType {
@@ -67,6 +69,7 @@ impl BuiltinIndexType {
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
             Self::Fm => "fm",
+            Self::MinHashLsh => "minhashlsh",
         }
     }
 }
@@ -85,6 +88,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
             IndexType::Fm => Ok(Self::Fm),
+            IndexType::MinHashLsh => Ok(Self::MinHashLsh),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -173,6 +177,29 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
+    /// Read several record batches, returning one batch per entry of
+    /// `batch_numbers`, in the order requested.
+    ///
+    /// The default implementation issues one read per batch, costing a request
+    /// per batch, with in-flight requests capped at
+    /// [`get_num_compute_intensive_cpus`] rather than growing with the whole
+    /// request. Readers whose batches sit on predictable row ranges override
+    /// this to fold them into a single [`Self::read_ranges`] call, so that
+    /// neighbouring batches share a request.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        let futures: Vec<_> = batch_numbers
+            .iter()
+            .map(|n| self.read_record_batch(*n, batch_size))
+            .collect();
+        futures::stream::iter(futures)
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect()
+            .await
+    }
     /// Reads a global buffer by index.
     async fn read_global_buffer(&self, _index: u32) -> Result<Bytes> {
         Err(Error::not_supported(
