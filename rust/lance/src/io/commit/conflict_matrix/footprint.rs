@@ -88,7 +88,7 @@ impl Cell {
 /// Regenerate with the `discover_footprints` test below.
 const FOOTPRINT_MATRIX: &str = "\
                        | dl      df      ur      uc      ov      dr      ci      rw
-delete                 | R/-/L   R/-/L   L/-/L   R/R/L   !/!/!   R/R/L   L/-/L   R/-/L
+delete                 | R/-/L   R/-/L   L/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
 delete_whole_fragment  | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
 update_rewrite_rows    | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L
 update_rewrite_columns | R/-/L   R/-/L   R/-/L   R/R/L   R/L/L   R/R/L   L/-/L   R/-/L

@@ -40,8 +40,9 @@
 //! behaviour rather than from reading the match arms. A cell that is wrong
 //! today is *not* recorded here as an expectation — it is excluded from the
 //! matrix and written up as a separate `#[ignore]`d test asserting the correct
-//! behaviour, against a tracking issue. See [`cases`] for the two such cases
-//! this suite found.
+//! behaviour, against a tracking issue. Once the fix lands, that test stays as
+//! a regression test and the cell rejoins the matrix. See [`cases`] for the
+//! ones this suite found.
 //!
 //! # Why it lives here
 //!

@@ -14,7 +14,7 @@ use super::invariants;
 use super::oracle;
 use super::scenarios::{Footprint, OVERLAY_VALUE, Scenario, Staged, fixture};
 use super::{Isolation, Outcome};
-use crate::Dataset;
+use crate::{Dataset, Error};
 
 /// What each ordered pair does today, observed rather than derived, stated
 /// under [`Isolation::Legacy`].
@@ -35,21 +35,21 @@ use crate::Dataset;
 const MATRIX: &str = "\
                           | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf
 append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L
-delete                    | L  R  R  L  R  !  R  !  !  R  R  L  R  X  X  L
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L
 delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
-update_rewrite_rows       | L  L  R  R  R  R  R  !  R  R  R  L  R  X  X  L
-update_rewrite_columns    | L  R  R  R  R  R  R  !  R  R  R  L  R  X  X  L
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L
 data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L
-project                   | L  L  L  L  L  !  L  R  R  R  R  L  L  X  X  L
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L
 project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
 create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L
 rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  L  X
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -144,54 +144,14 @@ fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
 /// an expectation instead would make the matrix assert that the bug is still
 /// present, and the fix would then have to edit this table to land.
 ///
-/// When a fix lands, remove the pair from here, un-`#[ignore]` its test, and
-/// re-run `discover` to pick the cell back up.
-const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[
-    (
-        Scenario::Delete,
-        Scenario::DataOverlay,
-        "delete drops a concurrent overlay: \
-         https://github.com/lance-format/lance/issues/9216",
-    ),
-    (
-        Scenario::Delete,
-        Scenario::Project,
-        "delete reinstates a data file a concurrent project pruned: \
-         https://github.com/lance-format/lance/issues/9217",
-    ),
-    (
-        Scenario::Delete,
-        Scenario::ProjectAlterNullability,
-        "delete reinstates a data file a concurrent project pruned, through the same \
-         apply arm as the pair above and covered by the same ignored test: \
-         https://github.com/lance-format/lance/issues/9217",
-    ),
-    (
-        Scenario::UpdateRewriteRows,
-        Scenario::Project,
-        "update reinstates a data file a concurrent project pruned: \
-         https://github.com/lance-format/lance/issues/9217",
-    ),
-    (
-        Scenario::UpdateRewriteColumns,
-        Scenario::Project,
-        "update reinstates a data file a concurrent project pruned: \
-         https://github.com/lance-format/lance/issues/9217",
-    ),
-    (
-        Scenario::DataOverlay,
-        Scenario::Project,
-        "a project leaves behind the overlays of the columns it drops: \
-         https://github.com/lance-format/lance/issues/9313",
-    ),
-    (
-        Scenario::Project,
-        Scenario::DataOverlay,
-        "a project leaves behind the overlays of the columns it drops, in the other \
-         order and through the same apply arm: \
-         https://github.com/lance-format/lance/issues/9313",
-    ),
-];
+/// When a fix lands, remove the pair from here, un-`#[ignore]` its test, which
+/// stays as a regression test, and re-run `discover` to pick the cell back up.
+const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[(
+    Scenario::DataOverlay,
+    Scenario::Project,
+    "an overlay rebased over a project keeps a column the project dropped: \
+     https://github.com/lance-format/lance/issues/9724",
+)];
 
 pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     KNOWN_BUGS
@@ -390,16 +350,16 @@ fn matrix_is_total() {
 
 /// A `Delete` must not drop an overlay that landed concurrently.
 ///
-/// `Operation::Delete`'s apply replaces the fragment entry wholesale from a
+/// Regression test for <https://github.com/lance-format/lance/issues/9216>.
+/// `Operation::Delete`'s apply replaced the fragment entry wholesale from a
 /// post-image built at the read version, and — unlike `Operation::Update`'s arm
-/// — does not carry `overlays` forward. `check_delete_txn` explicitly permits a
-/// concurrent `DataOverlay`, so the pair is allowed to land and the overlay is
-/// silently lost. Ordering-dependent: overlay-after-delete is fine.
+/// — did not carry `overlays` forward. `check_delete_txn` explicitly permits a
+/// concurrent `DataOverlay`, so the pair landed and the overlay was silently
+/// lost. Ordering-dependent: overlay-after-delete was fine.
 ///
-/// The loss is observable from a plain scan, not just from the manifest: the
+/// The loss was observable from a plain scan, not just from the manifest: the
 /// overlaid cell reverts to its base value.
 #[tokio::test]
-#[ignore = "bug: https://github.com/lance-format/lance/issues/9216"]
 async fn delete_must_not_drop_a_concurrent_overlay() {
     let base = fixture().await;
     let staged = Scenario::Delete.stage(&base).await.unwrap();
@@ -424,14 +384,14 @@ async fn delete_must_not_drop_a_concurrent_overlay() {
 
 /// A `Delete` must not reinstate a data file a concurrent `Project` pruned.
 ///
+/// Regression test for <https://github.com/lance-format/lance/issues/9217>.
 /// Same mechanism as the overlay bug: the post-image was built before the
-/// `Project` landed, so a file the projection dropped whole comes back. The
-/// resulting manifest has a data file none of whose fields are in the schema,
-/// which also pushes `Manifest::max_field_id` back up over a field id the
+/// `Project` landed, so a file the projection dropped whole came back. The
+/// resulting manifest had a data file none of whose fields are in the schema,
+/// which also pushed `Manifest::max_field_id` back up over a field id the
 /// projection had retired — so a later write can mint an id that is already in
 /// a data file.
 #[tokio::test]
-#[ignore = "bug: https://github.com/lance-format/lance/issues/9217"]
 async fn delete_must_not_reinstate_a_pruned_data_file() {
     let base = fixture().await;
     let staged = Scenario::Delete.stage(&base).await.unwrap();
@@ -444,17 +404,19 @@ async fn delete_must_not_reinstate_a_pruned_data_file() {
         "precondition: the projection pruned `c`'s data file, leaving `a`/`b`'s and `d`'s",
     );
     let watermark = after_project.manifest.max_field_id();
-
-    let committed = staged.commit(&base).await.unwrap();
-    assert_eq!(
-        committed.fragments()[0].files.len(),
-        1,
-        "the delete reinstated the data file the projection pruned: fragment 0 carries {:?}",
-        committed.fragments()[0]
+    let file_fields = |dataset: &Dataset| {
+        dataset.fragments()[0]
             .files
             .iter()
             .map(|f| f.fields.clone())
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
+    };
+
+    let committed = staged.commit(&base).await.unwrap();
+    assert_eq!(
+        file_fields(&committed),
+        file_fields(&after_project),
+        "the delete reinstated the data file the projection pruned",
     );
     assert!(
         committed.manifest.max_field_id() <= watermark,
@@ -467,10 +429,9 @@ async fn delete_must_not_reinstate_a_pruned_data_file() {
 ///
 /// The same defect as [`delete_must_not_reinstate_a_pruned_data_file`], reached
 /// through `Operation::Update`'s apply instead of `Operation::Delete`'s: both
-/// install a post-image of the fragment built at the read version. Recorded
+/// installed a post-image of the fragment built at the read version. Recorded
 /// separately because fixing one arm does not fix the other.
 #[tokio::test]
-#[ignore = "bug: https://github.com/lance-format/lance/issues/9217"]
 async fn update_must_not_reinstate_a_pruned_data_file() {
     let base = fixture().await;
     let staged = Scenario::UpdateRewriteRows.stage(&base).await.unwrap();
@@ -505,17 +466,17 @@ async fn update_must_not_reinstate_a_pruned_data_file() {
 
 /// A `Project` must drop the overlays of the columns it drops.
 ///
-/// `Operation::Project`'s apply computes the surviving field ids and prunes the
-/// data files none of whose fields survive, but applies the same rule to
-/// `fragment.overlays` nowhere. An overlay supplying only dropped fields is left
-/// on the fragment, where nothing will read it and `cleanup` has no reason to
-/// believe it is dead.
+/// Regression test for <https://github.com/lance-format/lance/issues/9313>.
+/// `Operation::Project`'s apply computed the surviving field ids and pruned the
+/// data files none of whose fields survive, but applied the same rule to
+/// `fragment.overlays` nowhere. An overlay supplying only dropped fields was
+/// left on the fragment, where nothing would read it and `cleanup` had no
+/// reason to believe it was dead.
 ///
-/// Not a conflict-resolution defect — it reproduces with no concurrency, as
-/// written here — but it is what makes the two `data_overlay`/`project` cells
+/// Not a conflict-resolution defect — it reproduced with no concurrency, as
+/// written here — but it made the two `data_overlay`/`project` cells
 /// unassertable, so it is recorded with the rest.
 #[tokio::test]
-#[ignore = "bug: https://github.com/lance-format/lance/issues/9313"]
 async fn project_must_drop_the_overlays_of_dropped_columns() {
     let base = fixture().await;
     let after_overlay = Arc::new(
@@ -554,6 +515,49 @@ async fn project_must_drop_the_overlays_of_dropped_columns() {
                  {live:?}",
                 fragment.id,
                 overlay.data_file.fields,
+            );
+        }
+    }
+}
+
+/// A `DataOverlay` must not keep a column a concurrent `Project` dropped.
+///
+/// The `Project` and `Merge` apply arms prune overlays for the fields they
+/// drop, but the `DataOverlay` arm does not check that its own fields survive a
+/// schema change it was rebased over. So an overlay staged before the `Project`
+/// lands supplying only a dropped field. Either outcome is correct: a retryable
+/// conflict, or a commit without that overlay.
+#[tokio::test]
+#[ignore = "bug: https://github.com/lance-format/lance/issues/9724"]
+async fn overlay_must_not_keep_a_concurrently_dropped_column() {
+    let base = fixture().await;
+    let staged = Scenario::DataOverlay.stage(&base).await.unwrap();
+    Scenario::Project
+        .stage(&base)
+        .await
+        .unwrap()
+        .commit(&base)
+        .await
+        .unwrap();
+
+    let committed = match staged.commit(&base).await {
+        Err(Error::RetryableCommitConflict { .. }) => return,
+        result => result.unwrap(),
+    };
+    let live: Vec<i32> = committed
+        .manifest
+        .schema
+        .fields_pre_order()
+        .map(|field| field.id)
+        .collect();
+    for fragment in committed.fragments().iter() {
+        for overlay in fragment.overlays.iter() {
+            assert!(
+                overlay.data_file.fields.iter().any(|id| live.contains(id)),
+                "the overlay landed supplying fields {:?} on fragment {}, none of which are in \
+                 the schema {live:?} left by the concurrent projection",
+                overlay.data_file.fields,
+                fragment.id,
             );
         }
     }
