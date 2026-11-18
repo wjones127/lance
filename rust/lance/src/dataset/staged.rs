@@ -288,9 +288,17 @@ impl StagedTransaction {
     /// Calling this method pins a non-empty commit to [`Self::base_version`],
     /// even if the returned scanner is never polled.
     pub fn scan(&mut self) -> Result<Scanner> {
+        Ok(self.snapshot()?.scan())
+    }
+
+    /// The uncommitted snapshot, for callers that plan their own reads.
+    ///
+    /// Like [`Self::scan`], this pins a non-empty commit to
+    /// [`Self::base_version`].
+    pub fn snapshot(&mut self) -> Result<Arc<Dataset>> {
         let dataset = self.staged_dataset()?;
         self.state.requires_original_version = true;
-        Ok(dataset.scan())
+        Ok(dataset)
     }
 
     /// Append batches.
